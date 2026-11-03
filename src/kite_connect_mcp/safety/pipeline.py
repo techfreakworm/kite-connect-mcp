@@ -212,7 +212,8 @@ class WritePipeline:
             raise
         order_id = req.order_id
         if isinstance(response, dict):
-            order_id = str(response.get("order_id") or response.get("trigger_id") or order_id or "") or None
+            found = response.get("order_id") or response.get("trigger_id") or response.get("sip_id")
+            order_id = str(found or order_id or "") or None
         self.audit.write(
             "live_result",
             durable=True,

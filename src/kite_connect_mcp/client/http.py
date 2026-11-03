@@ -291,7 +291,8 @@ class KiteClient:
                 if not idempotent:
                     raise OutcomeUnknown(
                         f"no answer from Kite ({type(exc).__name__}); the request may have been executed. Check the "
-                        "order book (get_orders / get_gtts / get_alerts) before trying again",
+                        "matching book (get_orders, get_gtts, get_alerts, get_mf_orders or get_mf_sips) before "
+                        "trying again",
                         error_type="OutcomeUnknown",
                     ) from None
                 last_error = NetworkError(
