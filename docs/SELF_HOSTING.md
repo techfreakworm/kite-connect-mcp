@@ -179,7 +179,7 @@ few paths that should be public:
 | `/mcp` | Your MCP clients | Bearer token |
 | `/callback` | Your browser, redirected by Kite after you log in (path set by `KITE_MCP_CALLBACK_PATH`) | One-time `state` and `request_token`; the server checks them |
 | `/postback` | Kite, if you use postbacks (path set by `KITE_MCP_POSTBACK_PATH`; off by default) | SHA-256 checksum with your API secret |
-| `/health` | You, or an uptime monitor | None. It answers `{"status":"ok","version":...}`; leave it off the proxy if nothing outside needs it |
+| `/health` | You, or an uptime monitor | None. It answers `{"status":"ok"}`; leave it off the proxy if nothing outside needs it |
 
 Everything else should be a 404 from the proxy. The HTTP transport is stateless, so restarting or upgrading the server
 does not break your clients' sessions.

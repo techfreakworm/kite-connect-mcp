@@ -5,8 +5,9 @@ order placement 10/s, everything else 10/s; and at most 400 orders a minute. The
 `limit` calls in any `period` seconds, which (unlike a token bucket) can never burst past the limit at a window edge.
 The periods are 10% longer than Kite's to leave a margin for clock and network jitter.
 
-The limits are per API key at Kite, so another program using the same key shares them: a 429 can still happen, and the
-HTTP client backs off on it for reads (never for writes).
+Kite applies the limits per API key and, for orders, per client account (Zerodha's FAQ: 10 orders per second per
+trading account, whichever app sends them; invalid requests count too). Another program using the same key or account
+shares them, so a 429 can still happen; the HTTP client backs off on it for reads (never for writes).
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
 
 MARGIN = 1.1  # every window is this much longer than Kite's
+EPSILON_S = 1e-6  # waits shorter than this are rounding noise
 
 
 @dataclass(frozen=True)
@@ -50,11 +52,11 @@ class SlidingWindowLimiter:
     def _wait_needed(self, now: float) -> float:
         wait = 0.0
         for window, stamps in zip(self._windows, self._stamps, strict=True):
-            while stamps and now - stamps[0] >= window.period_s:
+            while stamps and now - stamps[0] >= window.period_s - EPSILON_S:
                 stamps.popleft()
             if len(stamps) >= window.limit:
                 wait = max(wait, window.period_s - (now - stamps[0]))
-        return wait
+        return wait if wait > EPSILON_S else 0.0  # a float-rounding leftover is not a wait (it could never elapse)
 
     async def acquire(self) -> float:
         """Wait until a call is allowed and record it. Returns how long it waited (seconds)."""

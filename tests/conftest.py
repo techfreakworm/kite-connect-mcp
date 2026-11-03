@@ -181,18 +181,34 @@ async def _no_sleep(_: float) -> None:
     return None
 
 
+class VirtualTime:
+    """A monotonic clock that only moves when something sleeps on it: rate limits are honoured without waiting."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def clock(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.now += max(1e-6, seconds)  # always move on, so no float-rounding leftover can stall a waiter
+
+
 @pytest.fixture
 def runtime_factory(fake_kite: FakeKite, settings_factory: Callable[..., Settings]):
+    from kite_connect_mcp.client.ratelimit import RateLimiter
     from kite_connect_mcp.server import build_runtime
 
     created = []
 
     def make(settings: Settings | None = None, **overrides: str | None):
+        virtual = VirtualTime()
         rt = build_runtime(
             settings or settings_factory(**overrides),
             transport=fake_kite.transport(),
             clock=lambda: FIXED_NOW,
             sleep=_no_sleep,
+            limiter=RateLimiter(clock=virtual.clock, sleep=virtual.sleep),
         )
         created.append(rt)
         return rt

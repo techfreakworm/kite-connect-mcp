@@ -32,7 +32,7 @@ from ..errors import KiteAPIError, OutcomeUnknown, SafetyRefusal
 from ..timeutil import now_ist
 from .audit import AuditLog
 from .confirm import ConfirmationStore
-from .policy import OrderLeg, evaluate, preauthorised
+from .policy import OrderLeg, added_value, evaluate, preauthorised
 
 log = logging.getLogger(__name__)
 
@@ -193,17 +193,21 @@ class WritePipeline:
             self.audit.write("refused", **base, reasons=reasons)
             raise SafetyRefusal("refused by the safety policy", reasons)
 
-        value = req.daily_value
-        if value is None:
-            value = sum((leg.value or Decimal(0) for leg in req.legs), Decimal(0))
+        value = (
+            Decimal(0)
+            if req.risk_reducing
+            else added_value(req.legs, counts_as_order=req.counts_as_order, daily_value=req.daily_value)
+        )
+        orders = req.order_count if req.counts_as_order and not req.risk_reducing else 0
+        counted = {"counts": bool(orders or value), "order_count": orders, "value_inr": value}
         self.audit.write("live_intent", durable=True, **base, value_inr=value, order_id=req.order_id)
         ticket = WriteTicket(req.method, req.path, req.digest, issuer=_TICKET_ISSUER)
         try:
             response = await self.client.write(
                 req.method, req.path, ticket, params=req.params, data=req.data, json_body=req.json_body
             )
-        except OutcomeUnknown as exc:
-            self.audit.write("live_unknown", durable=True, **base, error=str(exc))
+        except OutcomeUnknown as exc:  # it may have happened: count it, so the caps err on the safe side
+            self.audit.write("live_unknown", durable=True, **base, **counted, error=str(exc))
             raise
         except KiteAPIError as exc:
             self.audit.write(
@@ -218,9 +222,7 @@ class WritePipeline:
             "live_result",
             durable=True,
             **base,
-            counts=req.counts_as_order and not req.risk_reducing,
-            order_count=req.order_count,
-            value_inr=value,
+            **counted,
             order_id=order_id if req.tool != "modify_order" else req.order_id,
             response=response,
         )

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .config import Settings, load_env_file
+from .config import Settings, load_env_file, unknown_variables
 from .errors import ConfigError, KiteMCPError
 
 log = logging.getLogger("kite_connect_mcp")
@@ -26,9 +26,13 @@ def _settings(args: argparse.Namespace, **overrides: str | None) -> Settings:
     env = dict(os.environ)
     if getattr(args, "env_file", None):
         env = load_env_file(Path(args.env_file), env)
-    for key, value in overrides.items():
-        if value is not None:
-            env[key] = str(value)
+        for key, text in env.items():  # e.g. HTTPS_PROXY from the file must reach the HTTP client too
+            os.environ.setdefault(key, text)
+    for key, override in overrides.items():
+        if override is not None:
+            env[key] = str(override)
+    for name in unknown_variables(env):
+        print(f"kite-connect-mcp: warning: {name} is not a setting this server reads (a typo?)", file=sys.stderr)
     return Settings.from_env(env)
 
 
@@ -192,7 +196,10 @@ def cmd_audit(args: argparse.Namespace) -> int:
     settings = _settings(args)
     from .safety.audit import AuditLog
 
-    day = dt.date.fromisoformat(args.date) if args.date else None
+    try:
+        day = dt.date.fromisoformat(args.date) if args.date else None
+    except ValueError:
+        raise ConfigError(f"--date must be YYYY-MM-DD, not {args.date!r}") from None
     for event in AuditLog(settings.audit_dir).read(day, limit=args.limit):
         print(json.dumps(event, default=str))
     return 0

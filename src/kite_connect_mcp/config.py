@@ -44,12 +44,12 @@ DEFAULT_TICKER_URL = "wss://ws.kite.trade"
 DEFAULT_PORT = 8765
 
 _TRUE = {"1", "true", "yes", "on"}
-_FALSE = {"0", "false", "no", "off", ""}
+_FALSE = {"0", "false", "no", "off"}
 
 
 def _bool(env: Mapping[str, str], name: str, default: bool, problems: list[str]) -> bool:
     raw = env.get(name)
-    if raw is None:
+    if raw is None or not raw.strip():  # unset or empty: the default (an empty value must not switch a feature off)
         return default
     value = raw.strip().lower()
     if value in _TRUE:
@@ -125,13 +125,22 @@ def _read_secret_file(path: str, name: str, problems: list[str]) -> str | None:
     except OSError as exc:
         problems.append(f"{name}: cannot read {file}: {exc.strerror}")
         return None
-    if mode & 0o077:
+    if mode & 0o077 and not _container_secret(file):
         problems.append(f"{name}: {file} is readable by group/others (mode {mode:o}); run chmod 600")
         return None
     if not value or re.search(r"\s", value):
         problems.append(f"{name}: {file} is empty or holds more than one value")
         return None
     return value
+
+
+def _container_secret(file: Path) -> bool:
+    """Docker / Kubernetes secret mounts (/run/secrets/...) are world-readable by design inside a single-purpose
+    container, so the mode check would refuse them; anywhere else group/other access is refused."""
+    try:
+        return file.resolve().is_relative_to("/run/secrets")
+    except OSError:
+        return False
 
 
 def _secret(env: Mapping[str, str], name: str, problems: list[str]) -> str | None:
@@ -347,6 +356,8 @@ class Settings:
             )
         if self.allow_unauthenticated_http and self.host not in ("127.0.0.1", "localhost", "::1"):
             problems.append("KITE_MCP_ALLOW_UNAUTHENTICATED_HTTP=true is only allowed with a loopback KITE_MCP_HOST")
+        if self.public_url is not None and not re.fullmatch(r"https?://[^/\s]+(/\S*)?", self.public_url):
+            problems.append("KITE_MCP_PUBLIC_URL must be a full URL such as https://kite.example.com")
         if self.bearer_token is not None and len(self.bearer_token) < 32:
             problems.append("KITE_MCP_BEARER_TOKEN must be at least 32 characters (try: openssl rand -hex 32)")
         if self.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
@@ -362,6 +373,68 @@ class Settings:
         if not self.api_secret:
             raise ConfigError("KITE_API_SECRET (or KITE_API_SECRET_FILE) is not set; it is needed to log in")
         return self.api_secret
+
+
+KNOWN_VARIABLES = frozenset(
+    {
+        "KITE_API_KEY",
+        "KITE_API_SECRET",
+        "KITE_ACCESS_TOKEN",
+        "KITE_TOKEN_FILE",
+        "KITE_API_BASE_URL",
+        "KITE_LOGIN_URL",
+        "KITE_TICKER_URL",
+        "KITE_MCP_AUTH_MODE",
+        "KITE_MCP_ALLOWED_USER_ID",
+        "KITE_MCP_LOGIN_LINK_TTL_S",
+        "KITE_MCP_HTTP_TIMEOUT_S",
+        "KITE_MCP_STATE_DIR",
+        "KITE_MCP_CACHE_DIR",
+        "KITE_MCP_TRANSPORT",
+        "KITE_MCP_HOST",
+        "KITE_MCP_PORT",
+        "KITE_MCP_PUBLIC_URL",
+        "KITE_MCP_BEARER_TOKEN",
+        "KITE_MCP_ALLOW_UNAUTHENTICATED_HTTP",
+        "KITE_MCP_ALLOWED_HOSTS",
+        "KITE_MCP_CALLBACK_PATH",
+        "KITE_MCP_POSTBACK_PATH",
+        "KITE_MCP_READ_ONLY",
+        "KITE_MCP_TRADING_MODE",
+        "KITE_MCP_LIVE_CONFIRMATION",
+        "KITE_MCP_CONFIRMATION_TTL_S",
+        "KITE_MCP_MAX_ORDER_VALUE",
+        "KITE_MCP_MAX_DAILY_VALUE",
+        "KITE_MCP_MAX_ORDERS_PER_DAY",
+        "KITE_MCP_MAX_QUANTITY",
+        "KITE_MCP_ALLOWED_INSTRUMENTS",
+        "KITE_MCP_ALLOWED_EXCHANGES",
+        "KITE_MCP_ALLOWED_PRODUCTS",
+        "KITE_MCP_ALLOWED_VARIETIES",
+        "KITE_MCP_ALLOWED_ORDER_TYPES",
+        "KITE_MCP_ALLOWED_TRANSACTION_TYPES",
+        "KITE_MCP_ALLOW_MF_WRITES",
+        "KITE_MCP_KILL_SWITCH_FILE",
+        "KITE_MCP_TOOLSETS",
+        "KITE_MCP_EXCLUDED_TOOLS",
+        "KITE_MCP_TICKER_ENABLED",
+        "KITE_MCP_TICKER_MAX_SUBSCRIPTIONS",
+        "KITE_MCP_LOG_LEVEL",
+    }
+)
+_FILE_VARIANTS = {"KITE_API_KEY_FILE", "KITE_API_SECRET_FILE", "KITE_ACCESS_TOKEN_FILE", "KITE_MCP_BEARER_TOKEN_FILE"}
+
+
+def unknown_variables(env: Mapping[str, str] | None = None) -> list[str]:
+    """KITE_* names in the environment that this server does not read: almost always a typo."""
+    env = os.environ if env is None else env
+    return sorted(
+        name
+        for name in env
+        if (name.startswith("KITE_MCP_") or name.startswith("KITE_"))
+        and name not in KNOWN_VARIABLES
+        and name not in _FILE_VARIANTS
+    )
 
 
 def load_env_file(path: Path, env: dict[str, str] | None = None, *, override: bool = False) -> dict[str, str]:

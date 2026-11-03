@@ -65,10 +65,11 @@ def evaluate(
         verdict.violations.append(f"the kill switch is on ({settings.kill_switch_file} exists): every write is refused")
     for leg in legs:
         _allowed(settings.allowed_exchanges, leg.exchange, "exchange", verdict)
-        _allowed(settings.allowed_products, leg.product, "product", verdict)
-        _allowed(settings.allowed_varieties, leg.variety, "variety", verdict, lower=True)
-        _allowed(settings.allowed_order_types, leg.order_type, "order_type", verdict)
-        _allowed(settings.allowed_transaction_types, leg.transaction_type, "transaction_type", verdict)
+        if not risk_reducing:  # cancelling an SL-M stop must work even when only LIMIT orders may be placed
+            _allowed(settings.allowed_products, leg.product, "product", verdict)
+            _allowed(settings.allowed_varieties, leg.variety, "variety", verdict, lower=True)
+            _allowed(settings.allowed_order_types, leg.order_type, "order_type", verdict)
+            _allowed(settings.allowed_transaction_types, leg.transaction_type, "transaction_type", verdict)
         allowed = settings.allowed_instruments
         if allowed is not None and leg.instrument is not None and leg.instrument not in allowed:
             verdict.violations.append(f"instrument {leg.instrument} is not in KITE_MCP_ALLOWED_INSTRUMENTS")
@@ -88,19 +89,30 @@ def evaluate(
                 f"order value ₹{leg.value:,.2f} is above the per-order cap ₹{settings.max_order_value:,.2f} "
                 "(KITE_MCP_MAX_ORDER_VALUE)"
             )
-    if counts_as_order and not risk_reducing:
-        if usage.orders + order_count > settings.max_orders_per_day:
-            verdict.violations.append(
-                f"{usage.orders} live orders today; {order_count} more would pass the daily limit of "
-                f"{settings.max_orders_per_day} (KITE_MCP_MAX_ORDERS_PER_DAY)"
-            )
-        added = daily_value if daily_value is not None else sum((leg.value or Decimal(0) for leg in legs), Decimal(0))
-        if usage.value + added > settings.max_daily_value:
-            verdict.violations.append(
-                f"₹{usage.value:,.2f} placed live today; ₹{added:,.2f} more would pass the daily cap "
-                f"₹{settings.max_daily_value:,.2f} (KITE_MCP_MAX_DAILY_VALUE)"
-            )
+    if risk_reducing:
+        return verdict
+    if counts_as_order and usage.orders + order_count > settings.max_orders_per_day:
+        verdict.violations.append(
+            f"{usage.orders} live orders today; {order_count} more would pass the daily limit of "
+            f"{settings.max_orders_per_day} (KITE_MCP_MAX_ORDERS_PER_DAY)"
+        )
+    added = added_value(legs, counts_as_order=counts_as_order, daily_value=daily_value)
+    if added > 0 and usage.value + added > settings.max_daily_value:
+        verdict.violations.append(
+            f"₹{usage.value:,.2f} placed live today; ₹{added:,.2f} more would pass the daily cap "
+            f"₹{settings.max_daily_value:,.2f} (KITE_MCP_MAX_DAILY_VALUE)"
+        )
     return verdict
+
+
+def added_value(legs: list[OrderLeg], *, counts_as_order: bool, daily_value: Decimal | None) -> Decimal:
+    """What a write adds to today's live value: `daily_value` when the tool knows it (a modification's increase, an
+    OCO's larger leg), else the legs' values for a write that creates orders, else nothing."""
+    if daily_value is not None:
+        return max(Decimal(0), daily_value)
+    if counts_as_order:
+        return sum((leg.value or Decimal(0) for leg in legs), Decimal(0))
+    return Decimal(0)
 
 
 def preauthorised(settings: Settings, legs: list[OrderLeg]) -> bool:

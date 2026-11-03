@@ -3,9 +3,12 @@
     <state_dir>/audit/audit-YYYY-MM-DD.jsonl      folder 700, files 600, append-only
 
 Events: dry_run, refused, confirmation_issued, live_intent (written and fsynced BEFORE the request is sent),
-live_result, live_error, live_unknown. Each carries the call id, the tool, the exact request (method, path, payload),
-the checks and, for live calls, Kite's answer. No credential is ever written (the payload holds order parameters only;
-the Authorization header is added later by the HTTP client and never seen here).
+live_result, live_error, live_unknown. live_result and live_unknown carry `counts`, `order_count` and `value_inr`:
+what they add to today's usage (an unknown outcome is counted as if it happened, so the caps err on the safe side).
+
+Each event carries the call id, the tool, the exact request (method, path, payload), the checks and, for live calls,
+Kite's answer. No credential is ever written (the payload holds order parameters only; the Authorization header is
+added later by the HTTP client and never seen here).
 
 Today's usage for the daily caps is computed from the log itself, so a restart never resets the caps.
 """
@@ -24,7 +27,7 @@ from typing import Any
 
 from ..timeutil import ist_date, now_ist
 
-COUNTED = "live_result"
+COUNTED = ("live_result", "live_unknown")  # an unknown outcome may have happened: it counts toward the caps
 
 
 @dataclass
@@ -71,7 +74,7 @@ class AuditLog:
         """Live writes that count toward the daily caps (successful live_result events marked `counts`)."""
         usage = Usage()
         for event in self._iter(day or ist_date(self._clock())):
-            if event.get("event") != COUNTED or not event.get("counts"):
+            if event.get("event") not in COUNTED or not event.get("counts"):
                 continue
             usage.orders += int(event.get("order_count", 1) or 0)
             try:
@@ -85,7 +88,7 @@ class AuditLog:
         return sum(
             1
             for e in self._iter(day or ist_date(self._clock()))
-            if e.get("event") == COUNTED and e.get("tool") == "modify_order" and e.get("order_id") == order_id
+            if e.get("event") in COUNTED and e.get("tool") == "modify_order" and e.get("order_id") == order_id
         )
 
     def _iter(self, day: dt.date) -> Iterator[dict[str, Any]]:

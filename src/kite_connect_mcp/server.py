@@ -169,7 +169,9 @@ def build_http_app(server: MCPServer, rt: Runtime) -> ASGIApp:
 
     @server.custom_route("/health", methods=["GET"], include_in_schema=False)
     async def health(_: Request) -> Response:
-        return JSONResponse({"status": "ok", "version": __version__}, headers={"Cache-Control": "no-store"})
+        return JSONResponse(
+            {"status": "ok"}, headers={"Cache-Control": "no-store"}
+        )  # no version: nothing to fingerprint
 
     for hook in rt.extras.get("http_routes", []):  # login callback, postbacks: added by their modules
         hook(server)

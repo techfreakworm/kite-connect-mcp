@@ -420,3 +420,48 @@ def test_env_file_loader(tmp_path):
 def test_token_paths(settings_factory, tmp_path: Path):
     s = settings_factory(KITE_TOKEN_FILE=None)
     assert s.token_file == s.state_dir / "access_token.json"
+
+
+def test_an_empty_boolean_keeps_its_default(settings_factory):
+    assert settings_factory(KITE_MCP_TICKER_ENABLED="").ticker_enabled is True
+    assert settings_factory(KITE_MCP_READ_ONLY="  ").read_only is False
+
+
+def test_public_url_needs_a_scheme(settings_factory):
+    with pytest.raises(ConfigError, match="KITE_MCP_PUBLIC_URL"):
+        settings_factory(KITE_MCP_PUBLIC_URL="kite.example.com")
+    assert settings_factory(KITE_MCP_PUBLIC_URL="https://kite.example.com").public_url == "https://kite.example.com"
+
+
+def test_unknown_variables_are_reported(base_env):
+    from kite_connect_mcp.config import unknown_variables
+
+    env = {**base_env, "KITE_MCP_TRADNG_MODE": "live", "KITE_API_SECRET_FILE": "/x", "OTHER": "1"}
+    assert unknown_variables(env) == ["KITE_MCP_TRADNG_MODE"]
+
+
+def test_container_secret_mounts_may_be_world_readable(base_env, tmp_path, monkeypatch):
+    import kite_connect_mcp.config as config
+
+    secret = tmp_path / "api_secret"
+    secret.write_text("abc123\n")
+    secret.chmod(0o444)
+    env = {**base_env, "KITE_API_SECRET_FILE": str(secret)}
+    env.pop("KITE_API_SECRET")
+    with pytest.raises(ConfigError, match="chmod 600"):
+        Settings.from_env(env)
+    monkeypatch.setattr(config, "_container_secret", lambda file: True)
+    assert Settings.from_env(env).api_secret == "abc123"
+
+
+async def test_limiter_never_stalls_on_float_rounding():
+    """Virtual time that only moves by the requested sleep: 2.2 - 1.1 is not exactly 1.1 in floating point."""
+    now = [0.0]
+
+    async def sleep(seconds: float) -> None:
+        now[0] += seconds  # exactly what was asked, nothing more
+
+    limiter = SlidingWindowLimiter((Window(10, 1.1), Window(400, 66.0)), clock=lambda: now[0], sleep=sleep)
+    for _ in range(100):
+        await limiter.acquire()
+    assert now[0] >= 9 * 1.1 - 1e-6

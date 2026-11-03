@@ -323,3 +323,83 @@ async def test_order_reads_and_pagination(mcp_factory, fake_kite):
     page = tool_json(await call(server, "get_orders", {"status": "open", "limit": 2}))
     assert page["total"] == 4 and page["count"] == 2 and page["next_offset"] == 2
     assert [o["order_id"] for o in page["items"]] == ["7", "5"]
+
+
+async def test_a_modification_that_raises_the_value_is_held_to_the_daily_cap(mcp_factory, fake_kite):
+    kite_with_margins(fake_kite)
+    fake_kite.on(
+        "GET",
+        "/orders/333",
+        [
+            {
+                "order_id": "333",
+                "status": "OPEN",
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "transaction_type": "BUY",
+                "order_type": "LIMIT",
+                "product": "CNC",
+                "quantity": 2,
+                "price": 1500.0,
+            }
+        ],
+    )
+    fake_kite.on("PUT", "/orders/regular/333", {"order_id": "333"})
+    server, _, rt = mcp_factory(**LIVE, KITE_MCP_MAX_DAILY_VALUE="2000")
+    bigger = tool_json(await call(server, "modify_order", {"order_id": "333", "quantity": 4}))  # +3000 > 2000
+    assert any("daily cap" in v for v in bigger["checks"]["violations"])
+    smaller = tool_json(await call(server, "modify_order", {"order_id": "333", "quantity": 3}))  # +1500 <= 2000
+    assert smaller["checks"]["ok"]
+    tool_json(
+        await call(
+            server,
+            "modify_order",
+            {"order_id": "333", "quantity": 3, "dry_run": False, "confirmation_token": smaller["confirmation_token"]},
+        )
+    )
+    usage = rt.audit.usage()
+    assert usage.orders == 0  # a modification is not a new order
+    assert usage.value == 1500
+
+
+async def test_an_unknown_outcome_counts_toward_the_caps(mcp_factory, fake_kite):
+    kite_with_margins(fake_kite)
+
+    def timeout(request):
+        raise httpx2.ReadTimeout("slow", request=request)
+
+    fake_kite.on("POST", "/orders/regular", handler=timeout)
+    server, _, rt = mcp_factory(**LIVE)
+    token = tool_json(await call(server, "place_order", LIMIT_BUY))["confirmation_token"]
+    await call(server, "place_order", {**LIMIT_BUY, "dry_run": False, "confirmation_token": token})
+    usage = rt.audit.usage()
+    assert usage.orders == 1 and usage.value == 3000
+
+
+async def test_cancelling_is_not_blocked_by_order_type_or_side_allow_lists(mcp_factory, fake_kite):
+    fake_kite.on(
+        "GET",
+        "/orders/444",
+        [
+            {
+                "order_id": "444",
+                "status": "TRIGGER PENDING",
+                "exchange": "NSE",
+                "tradingsymbol": "INFY",
+                "transaction_type": "SELL",
+                "order_type": "SL-M",
+                "product": "CNC",
+                "quantity": 2,
+                "trigger_price": 1400.0,
+            }
+        ],
+    )
+    server, _, _ = mcp_factory(
+        **LIVE,
+        KITE_MCP_ALLOWED_ORDER_TYPES="LIMIT",
+        KITE_MCP_ALLOWED_TRANSACTION_TYPES="BUY",
+        KITE_MCP_ALLOWED_EXCHANGES="BSE",
+    )
+    preview = tool_json(await call(server, "cancel_order", {"order_id": "444"}))
+    violations = preview["checks"]["violations"]
+    assert violations == ["exchange NSE is not in the allow-list (BSE)"]  # the exchange list still applies
