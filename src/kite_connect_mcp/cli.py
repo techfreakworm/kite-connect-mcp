@@ -242,9 +242,24 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--limit", type=int, default=50)
     audit.set_defaults(func=cmd_audit)
 
-    login = sub.add_parser("login", help="managed mode: print a login link, or exchange a request_token")
-    login.add_argument("--request-token", help="the request_token from the redirect URL after logging in")
-    login.add_argument("--listen", action="store_true", help="wait for the redirect on the local callback server")
+    login = sub.add_parser(
+        "login",
+        help="managed mode: print a login link, or exchange a request_token",
+        description="Managed mode only. Prints a one-time Kite login link on stdout (everything else goes to stderr). "
+        "Open it and log in at Kite; Kite then redirects to the redirect URL registered for your app.",
+    )
+    login.add_argument(
+        "--request-token",
+        help="finish the login with the request_token from the redirect URL's address bar (the whole URL also works; "
+        "put it in quotes)",
+    )
+    login.add_argument(
+        "--listen",
+        action="store_true",
+        help="print the link, then wait up to 10 minutes on KITE_MCP_HOST:KITE_MCP_PORT for Kite's redirect. This only "
+        "works if your Kite app's redirect URL is http://127.0.0.1:<port><callback path> (default "
+        "http://127.0.0.1:8765/callback). Not needed when `serve --transport http` is already running.",
+    )
     login.set_defaults(func=cmd_login)
 
     logout = sub.add_parser("logout", help="managed mode: end the Kite session and delete the token file")
