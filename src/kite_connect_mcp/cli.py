@@ -60,10 +60,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         settings.transport,
     )
     if settings.transport == "stdio":
-        try:
-            server.run("stdio")
-        finally:
-            asyncio.run(rt.aclose())
+        import anyio
+
+        from .server import run_stdio
+
+        anyio.run(run_stdio, server, rt)
         return 0
 
     import uvicorn
@@ -82,7 +83,6 @@ def cmd_serve(args: argparse.Namespace) -> int:
         forwarded_allow_ips="127.0.0.1",
         timeout_graceful_shutdown=10,
     )
-    asyncio.run(rt.aclose())
     return 0
 
 

@@ -1,9 +1,11 @@
 name: CI
 
+# Pull requests run CI here. Pushes to main run the same jobs inside release.yml (workflow_call), before anything is
+# published, so main is never tested twice.
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read

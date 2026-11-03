@@ -7,7 +7,7 @@ import contextlib
 import datetime as dt
 import hmac
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -180,13 +180,34 @@ def build_http_app(server: MCPServer, rt: Runtime) -> ASGIApp:
         host=settings.host,
         transport_security=transport_security(settings),
     )
-    return BearerAuth(app, settings.bearer_token)
+    return RuntimeLifespan(BearerAuth(app, settings.bearer_token), rt)
 
 
-@contextlib.asynccontextmanager
-async def runtime_lifespan(rt: Runtime) -> AsyncIterator[Runtime]:
+class RuntimeLifespan:
+    """Close the runtime (HTTP client, ticker) when the ASGI server shuts down, inside the server's own event loop."""
+
+    def __init__(self, app: ASGIApp, rt: Runtime):
+        self.app = app
+        self.rt = rt
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "lifespan":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message: Any) -> None:
+            if message.get("type") == "lifespan.shutdown.complete":
+                with contextlib.suppress(Exception):
+                    await self.rt.aclose()
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+async def run_stdio(server: MCPServer, rt: Runtime) -> None:
+    """Serve MCP over stdin/stdout until the client goes away, then close the runtime in the same loop."""
     try:
-        yield rt
+        await server.run_stdio_async()
     finally:
         await rt.aclose()
 

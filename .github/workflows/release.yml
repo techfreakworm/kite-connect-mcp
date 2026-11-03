@@ -1,62 +1,83 @@
-# Release: push a tag vX.Y.Z (matching src/kite_connect_mcp/__init__.py) to publish
-#   1. tests on 3.11-3.13
-#   2. sdist + wheel -> PyPI via Trusted Publishing (OIDC; no stored token)
-#   3. multi-arch image -> ghcr.io/techfreakworm/kite-connect-mcp (GITHUB_TOKEN)
-#   4. server.json -> the official MCP Registry (GitHub OIDC; no stored token)
-#   5. a GitHub release with the built files
+# Release on every push to main, after CI passes.
 #
-# One-time setup on PyPI (by the project owner): add a "pending publisher" at https://pypi.org/manage/account/publishing/
-# with project kite-connect-mcp, owner techfreakworm, repository kite-connect-mcp, workflow release.yml, environment pypi.
+#   ci        the CI workflow (lint, tests on 3.11-3.13, secret scan), called as a reusable workflow
+#   plan      reads the version from src/kite_connect_mcp/__init__.py (server.json must agree) and decides:
+#               X.Y.Z.devN            -> development version, nothing is published
+#               already on PyPI       -> nothing to do (bump the version to release)
+#               otherwise             -> release it
+#   build     sdist + wheel, twine check
+#   pypi      PyPI Trusted Publishing (OIDC, environment "pypi"; no stored token)
+#   release   tag vX.Y.Z on the released commit + a GitHub release with the built files
+#   ghcr      multi-arch image ghcr.io/techfreakworm/kite-connect-mcp:X.Y.Z (GITHUB_TOKEN)
+#   registry  server.json -> the official MCP Registry over GitHub OIDC, unless that version is already there
+#
+# To release: set the same final version in src/kite_connect_mcp/__init__.py and server.json, add a CHANGELOG entry,
+# merge to main. Pre-releases like 0.2.0rc1 are published as PyPI pre-releases.
 name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.12", "3.13"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev]"
-      - run: ruff check . && ruff format --check . && mypy
-      - run: pytest -q
+  ci:
+    uses: ./.github/workflows/ci.yml
 
-  build:
+  plan:
+    needs: ci
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ steps.plan.outputs.version }}
+      release: ${{ steps.plan.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        name: Decide whether this commit is a release
+        run: |
+          version=$(python3 -c "import re,pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('src/kite_connect_mcp/__init__.py').read_text()).group(1))")
+          server=$(python3 -c "import json; d=json.load(open('server.json')); print(d['version'], *[p['version'] for p in d['packages']])")
+          for v in $server; do
+            if [ "$v" != "$version" ]; then echo "::error::server.json version $v does not match the package version $version"; exit 1; fi
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *dev* ]]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$version is a development version: nothing is published"
+          elif curl -fsS -o /dev/null "https://pypi.org/pypi/kite-connect-mcp/$version/json"; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::kite-connect-mcp $version is already on PyPI: bump the version to release"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::releasing kite-connect-mcp $version"
+          fi
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - id: version
-        name: Check the tag matches the package version
-        run: |
-          pkg=$(python -c "import re,pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('src/kite_connect_mcp/__init__.py').read_text()).group(1))")
-          tag="${GITHUB_REF_NAME#v}"
-          if [ "$pkg" != "$tag" ]; then echo "tag $tag does not match package version $pkg" >&2; exit 1; fi
-          srv=$(python -c "import json; print(json.load(open('server.json'))['version'])")
-          if [ "$srv" != "$tag" ]; then echo "server.json version $srv does not match tag $tag" >&2; exit 1; fi
-          echo "version=$pkg" >> "$GITHUB_OUTPUT"
       - run: pip install build twine && python -m build && twine check --strict dist/*
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
+          if-no-files-found: error
 
   pypi:
-    needs: [test, build]
+    needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -70,8 +91,32 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
+  release:
+    needs: [plan, pypi]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Tag and create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then echo "release v$VERSION exists"; exit 0; fi
+          prerelease=""
+          if [[ "$VERSION" =~ (a|b|rc)[0-9]+$ ]]; then prerelease="--prerelease"; fi
+          gh release create "v$VERSION" dist/* --target "$GITHUB_SHA" --title "v$VERSION" $prerelease \
+            --notes "Install: \`uvx kite-connect-mcp\` or \`pip install kite-connect-mcp==$VERSION\`. Docker: \`ghcr.io/${GITHUB_REPOSITORY}:$VERSION\`. Changes: [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/v$VERSION/CHANGELOG.md)."
+
   ghcr:
-    needs: [test, build]
+    needs: [plan, pypi]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -90,8 +135,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ needs.plan.outputs.version }}
+            type=raw,value=latest
           labels: |
             io.modelcontextprotocol.server.name=io.github.techfreakworm/kite-connect-mcp
       - uses: docker/build-push-action@v6
@@ -102,45 +147,39 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-  mcp-registry:
-    needs: [pypi]
+  registry:
+    needs: [plan, pypi]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     env:
       MCP_PUBLISHER_VERSION: v1.8.7
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      - name: Skip if this version is already in the MCP Registry
+        id: check
+        run: |
+          found=$(curl -fsS "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.techfreakworm/kite-connect-mcp&version=latest" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(any((s.get('server',s).get('version')=='$VERSION') for s in d.get('servers',[])))" || echo False)
+          echo "skip=$found" >> "$GITHUB_OUTPUT"
       - name: Install mcp-publisher (pinned)
+        if: steps.check.outputs.skip != 'True'
         run: |
           os=$(uname -s | tr '[:upper:]' '[:lower:]')
           arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
           curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_${os}_${arch}.tar.gz" | tar xz mcp-publisher
-      - name: Wait for the PyPI release to be visible
+      - name: Wait until PyPI serves the release
+        if: steps.check.outputs.skip != 'True'
         run: |
           for i in $(seq 1 30); do
-            curl -fsS "https://pypi.org/pypi/kite-connect-mcp/${GITHUB_REF_NAME#v}/json" >/dev/null && exit 0
+            curl -fsS -o /dev/null "https://pypi.org/pypi/kite-connect-mcp/$VERSION/json" && exit 0
             sleep 10
           done
-          echo "the PyPI release did not appear" >&2; exit 1
-      - run: ./mcp-publisher login github-oidc
-      - run: ./mcp-publisher publish
-
-  github-release:
-    needs: [pypi]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-      - name: Create the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" \
-            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md). Install: \`uvx kite-connect-mcp\` or \`pip install kite-connect-mcp\`; image: \`ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME#v}\`."
+          echo "::error::PyPI does not serve kite-connect-mcp $VERSION yet"; exit 1
+      - if: steps.check.outputs.skip != 'True'
+        run: ./mcp-publisher login github-oidc
+      - if: steps.check.outputs.skip != 'True'
+        run: ./mcp-publisher publish
