@@ -216,7 +216,7 @@ async def test_write_timeout_is_outcome_unknown(runtime_factory, fake_kite):
     )
     with pytest.raises(OutcomeUnknown) as info:
         await rt.client.write("POST", "/orders/regular", ticket, data=data)
-    assert "order book" in str(info.value)
+    assert "get_orders" in str(info.value) and "before trying again" in str(info.value)
 
 
 async def test_write_connect_error_is_not_sent(runtime_factory, fake_kite):

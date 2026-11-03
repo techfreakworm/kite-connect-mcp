@@ -214,7 +214,7 @@ async def test_outcome_unknown_is_audited_and_never_retried(mcp_factory, fake_ki
     server, _, rt = mcp_factory(**LIVE)
     token = tool_json(await call(server, "place_order", LIMIT_BUY))["confirmation_token"]
     result = await call(server, "place_order", {**LIMIT_BUY, "dry_run": False, "confirmation_token": token})
-    assert result.is_error and "order book" in tool_text(result)
+    assert result.is_error and "before trying again" in tool_text(result)
     assert len(fake_kite.writes()) == 1
     assert [e["event"] for e in rt.audit.read()][-2:] == ["live_intent", "live_unknown"]
 
