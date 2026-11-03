@@ -8,26 +8,22 @@
 
 from __future__ import annotations
 
+import importlib.util
 import pathlib
 
 from mcp import Client
 
 from conftest import tool_text
 
-# minimal valid arguments per write tool (dry run is the default, so none of these may send anything)
-SAMPLE_ARGS: dict[str, dict] = {
-    "place_order": {
-        "exchange": "NSE",
-        "tradingsymbol": "INFY",
-        "transaction_type": "BUY",
-        "quantity": 1,
-        "product": "CNC",
-        "order_type": "LIMIT",
-        "price": 1500.0,
-    },
-    "modify_order": {"order_id": "111", "price": 1490.0},
-    "cancel_order": {"order_id": "111"},
-}
+# minimal valid arguments per write tool, one file per tool module: tests/samples/<module>.py with SAMPLE_ARGS = {...}
+# (dry run is the default, so none of these may send anything)
+SAMPLE_ARGS: dict[str, dict] = {}
+for _path in sorted((pathlib.Path(__file__).parent / "samples").glob("*.py")):
+    _spec = importlib.util.spec_from_file_location(f"samples_{_path.stem}", _path)
+    assert _spec is not None and _spec.loader is not None
+    _module = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_module)
+    SAMPLE_ARGS.update(_module.SAMPLE_ARGS)
 
 
 def answer_everything(fake):

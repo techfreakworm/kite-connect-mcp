@@ -40,6 +40,7 @@ def build_runtime(
     clock: Callable[[], dt.datetime] = now_ist,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     limiter: RateLimiter | None = None,
+    ticker_connect: Callable[..., Any] | None = None,
 ) -> Runtime:
     token_file = TokenFile(settings.token_file, writable=settings.auth_mode == "managed")
     tokens = TokenProvider(token_file=token_file, env_token=settings.access_token, clock=clock)
@@ -47,7 +48,16 @@ def build_runtime(
     audit = AuditLog(settings.audit_dir, clock=clock)
     confirmations = ConfirmationStore(settings.confirmation_ttl_s, wall=clock)
     pipeline = WritePipeline(settings, client, audit, confirmations, clock=clock)
-    return Runtime(settings, tokens, client, audit, confirmations, pipeline, clock=clock)
+    rt = Runtime(settings, tokens, client, audit, confirmations, pipeline, clock=clock)
+    # the heavier components: cheap to construct, they load / connect lazily on first use
+    from .auth.login import LoginManager
+    from .instruments import InstrumentStore
+    from .ticker.manager import TickerManager
+
+    rt.instruments = InstrumentStore(settings, client, clock=clock)
+    rt.ticker = TickerManager(settings, tokens, clock=clock, connect=ticker_connect)
+    rt.login = LoginManager(settings, client, tokens, audit, clock=clock)
+    return rt
 
 
 def instructions(settings: Settings) -> str:

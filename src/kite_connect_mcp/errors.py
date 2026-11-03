@@ -21,6 +21,11 @@ class NotLoggedIn(KiteMCPError):
     """There is no usable access token: log in first (or wait for the external login to refresh the token file)."""
 
 
+class InstrumentsUnavailable(KiteMCPError):
+    """The instrument master could not be loaded (no cached dump and Kite unreachable). Distinct from "this symbol is
+    not in the instrument list", which is a plain None from InstrumentStore.lookup."""
+
+
 class SafetyRefusal(KiteMCPError):
     """The safety policy refused a write. `reasons` lists every violated rule."""
 
