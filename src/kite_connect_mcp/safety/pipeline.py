@@ -199,8 +199,12 @@ class WritePipeline:
             else added_value(req.legs, counts_as_order=req.counts_as_order, daily_value=req.daily_value)
         )
         orders = req.order_count if req.counts_as_order and not req.risk_reducing else 0
-        counted = {"counts": bool(orders or value), "order_count": orders, "value_inr": value}
-        self.audit.write("live_intent", durable=True, **base, value_inr=value, order_id=req.order_id)
+        notional = sum((leg.value for leg in req.legs if leg.value is not None), Decimal(0))
+        # value_inr: what this adds to today's caps; notional_inr: the legs' full value, for the record
+        counted = {"counts": bool(orders or value), "order_count": orders, "value_inr": value, "notional_inr": notional}
+        self.audit.write(
+            "live_intent", durable=True, **base, value_inr=value, notional_inr=notional, order_id=req.order_id
+        )
         ticket = WriteTicket(req.method, req.path, req.digest, issuer=_TICKET_ISSUER)
         try:
             response = await self.client.write(

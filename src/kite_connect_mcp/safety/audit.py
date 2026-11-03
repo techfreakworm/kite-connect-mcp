@@ -4,7 +4,8 @@
 
 Events: dry_run, refused, confirmation_issued, live_intent (written and fsynced BEFORE the request is sent),
 live_result, live_error, live_unknown. live_result and live_unknown carry `counts`, `order_count` and `value_inr`:
-what they add to today's usage (an unknown outcome is counted as if it happened, so the caps err on the safe side).
+what they add to today's usage (an unknown outcome is counted as if it happened, so the caps err on the safe side),
+and `notional_inr`, the full value of the legs (e.g. a conversion's notional, which adds nothing to the caps).
 
 Each event carries the call id, the tool, the exact request (method, path, payload), the checks and, for live calls,
 Kite's answer. No credential is ever written (the payload holds order parameters only; the Authorization header is
