@@ -2,6 +2,7 @@
 #
 #   ci        the CI workflow (lint, tests on 3.11-3.13, secret scan), called as a reusable workflow
 #   plan      reads the version from src/kite_connect_mcp/__init__.py (server.json must agree) and decides:
+#               repo variable RELEASE_ENABLED != true -> publishing is switched off, nothing is published
 #               X.Y.Z.devN            -> development version, nothing is published
 #               already on PyPI       -> nothing to do (bump the version to release)
 #               otherwise             -> release it
@@ -41,6 +42,8 @@ jobs:
       - uses: actions/checkout@v4
       - id: plan
         name: Decide whether this commit is a release
+        env:
+          RELEASE_ENABLED: ${{ vars.RELEASE_ENABLED }}
         run: |
           version=$(python3 -c "import re,pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('src/kite_connect_mcp/__init__.py').read_text()).group(1))")
           server=$(python3 -c "import json; d=json.load(open('server.json')); print(d['version'], *[p['version'] for p in d['packages']])")
@@ -48,7 +51,10 @@ jobs:
             if [ "$v" != "$version" ]; then echo "::error::server.json version $v does not match the package version $version"; exit 1; fi
           done
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [[ "$version" == *dev* ]]; then
+          if [ "${RELEASE_ENABLED:-}" != "true" ]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::publishing is off (repo variable RELEASE_ENABLED is not 'true'): nothing is published"
+          elif [[ "$version" == *dev* ]]; then
             echo "release=false" >> "$GITHUB_OUTPUT"
             echo "::notice::$version is a development version: nothing is published"
           elif curl -fsS -o /dev/null "https://pypi.org/pypi/kite-connect-mcp/$version/json"; then
