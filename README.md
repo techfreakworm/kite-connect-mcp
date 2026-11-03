@@ -25,7 +25,7 @@ The full evaluation and reasoning are in [docs/DECISION.md](docs/DECISION.md).
 ## What you need
 
 - A Zerodha account, and a Kite Connect app from the [developer console](https://developers.kite.trade).
-  - **Connect (paid, ₹500/month per app)** includes live quotes, the WebSocket and historical candles.
+  - **Connect (paid, ₹500/month per API key)** includes live quotes, the WebSocket and historical candles.
   - **Personal (free)** covers orders, GTTs, alerts, portfolio and margins, but no market data. Market-data tools
     return a clear "needs the paid plan" error.
 - Python 3.11+ (or Docker).
@@ -47,9 +47,12 @@ export KITE_API_KEY=your_api_key
 export KITE_API_SECRET_FILE=~/.config/kite-connect-mcp/api_secret
 
 kite-connect-mcp check-config   # validates settings, never prints credentials
-kite-connect-mcp login          # prints the Kite login link (managed mode)
+kite-connect-mcp login --listen # prints the Kite login link and waits for the redirect (managed mode)
 kite-connect-mcp status         # session and safety status
 ```
+
+For `login --listen`, register `http://127.0.0.1:8765/callback` as your app's redirect URL. Every setting is listed in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 Add it to an MCP client, e.g. Claude Desktop (`claude_desktop_config.json`) or any client that launches stdio servers:
 
@@ -81,7 +84,7 @@ a reverse proxy with TLS, bearer-token auth, and the login callback.
 | Kill switch | a file; a tool can switch it **on**, only a person can switch it off |
 | Audit log | every dry run, refusal, live send and result, as JSON lines; the intent is fsynced *before* sending |
 | Rate limits | kept under Kite's 1/s (quotes), 3/s (historical), 10/s (orders and the rest), 400 orders/min |
-| Retries | reads back off and retry; **writes are never retried**. A timeout is reported as "outcome unknown: check the order book" |
+| Retries | reads back off and retry; **writes are never retried**. A timeout is reported as an unknown outcome: check the order book before trying again |
 
 Details: [docs/SAFETY.md](docs/SAFETY.md).
 

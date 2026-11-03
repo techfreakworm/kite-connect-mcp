@@ -1,0 +1,52 @@
+# Keep the build context small and keep secrets and local state out of it. The Dockerfile copies only
+# pyproject.toml, README.md, LICENSE and src/.
+
+# version control and tooling
+.git
+.gitignore
+.github
+.claude
+.playwright-mcp
+
+# Python environments and caches
+.venv
+venv
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+build
+dist
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+coverage.xml
+htmlcov
+
+# secrets and local state: never part of an image
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+*token*.json
+*token*.txt
+access_token*
+.secrets
+secrets
+state
+cache
+*.jsonl
+*.sqlite
+*.sqlite3
+*.db
+KILL_SWITCH
+
+# not needed to build the wheel
+tests
+docs
+deploy
+scripts
+docker-compose*.yml

@@ -1,0 +1,112 @@
+# nginx in front of kite-connect-mcp, with a Let's Encrypt certificate from certbot.
+# Walkthrough: docs/SELF_HOSTING.md.
+#
+# Install as /etc/nginx/conf.d/kite-connect-mcp.conf. Files in conf.d are included inside the http {} block, which
+# the upstream {} block below needs. Replace kite.example.com everywhere. Remove the "listen [::]" lines if the
+# server has no IPv6.
+#
+# nginx will not start with the second server block until the certificate files exist, so do it in this order:
+#   1. Point the DNS record of kite.example.com at this server and open ports 80 and 443 in the firewall.
+#   2. sudo mkdir -p /var/www/certbot
+#      Install this file with ONLY the upstream and the first server block (port 80), then: sudo systemctl reload nginx
+#      sudo certbot certonly --webroot -w /var/www/certbot -d kite.example.com
+#   3. Add the second server block (port 443), then: sudo nginx -t && sudo systemctl reload nginx
+#      certbot renews the certificate on its own; the webroot location below answers its challenges.
+#   4. In the kite-connect-mcp settings: KITE_MCP_PUBLIC_URL=https://kite.example.com
+#      (so the Host-header check accepts requests from this hostname).
+#
+# Only the paths listed here are forwarded; everything else gets a 404 from nginx and never reaches the server.
+# The server itself checks the bearer token on /mcp; /callback and /postback check their own inputs.
+
+upstream kite_connect_mcp {
+    server 127.0.0.1:8765;
+    keepalive 4;
+}
+
+# --- port 80: certificate challenges, and a redirect to https for everything else ---
+server {
+    listen 80;
+    listen [::]:80;
+    server_name kite.example.com;
+
+    access_log off;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# --- port 443 ---
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name kite.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/kite.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/kite.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:kite_tls:5m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    server_tokens off;
+
+    # No access log, on purpose: the /callback URL carries one-time values (request_token, state). nginx's error
+    # log can still quote the request line when the upstream is down, so keep /var/log/nginx private and rotate it.
+    access_log off;
+
+    # an MCP request, a login redirect or a postback is a few kilobytes at most
+    client_max_body_size 1m;
+
+    # settings shared by every proxied location
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # --- MCP over Streamable HTTP, protected by the bearer token (exactly /mcp, or anything below /mcp/) ---
+    location ~ ^/mcp(?:/|$) {
+        proxy_pass http://kite_connect_mcp;
+        # replies can be streamed (Server-Sent Events): send them on as they come
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # --- the Kite login redirect (the app's redirect URL is https://kite.example.com/callback) ---
+    location = /callback {
+        limit_except GET {
+            deny all;
+        }
+        proxy_pass http://kite_connect_mcp;
+    }
+
+    # --- optional: Kite order postbacks. Needs KITE_MCP_POSTBACK_PATH=/postback on the server and
+    # https://kite.example.com/postback as the app's postback URL. Delete this block if you do not use them. ---
+    location = /postback {
+        limit_except POST {
+            deny all;
+        }
+        proxy_pass http://kite_connect_mcp;
+    }
+
+    # --- optional: health check (the answer includes the version number). Delete this block unless something
+    # outside the server polls it. ---
+    location = /health {
+        limit_except GET {
+            deny all;
+        }
+        proxy_pass http://kite_connect_mcp;
+    }
+
+    # everything else
+    location / {
+        return 404;
+    }
+}

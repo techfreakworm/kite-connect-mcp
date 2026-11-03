@@ -1,0 +1,48 @@
+# Optional evening logout, MANAGED auth mode only: ends the Kite API session (DELETE /session/token) and deletes the
+# token file, so the day's access token stops working before it would expire at 06:00 IST on its own.
+# Triggered by kite-connect-mcp-logout.timer; you can also run it by hand: sudo systemctl start kite-connect-mcp-logout
+#
+# Do NOT install this in external auth mode: there another program owns the token and this server never logs it out
+# (the command refuses). The next morning you log in again, as every day.
+#
+# Same user, settings file and folders as kite-connect-mcp.service; see that file for the assumptions.
+
+[Unit]
+Description=kite-connect-mcp evening logout (managed auth mode only)
+Documentation=https://github.com/techfreakworm/kite-connect-mcp/blob/main/docs/SELF_HOSTING.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=kite-mcp
+Group=kite-mcp
+EnvironmentFile=/etc/kite-connect-mcp/kite-connect-mcp.env
+WorkingDirectory=/var/lib/kite-connect-mcp
+ExecStart=/opt/kite-connect-mcp/venv/bin/kite-connect-mcp logout --yes
+TimeoutStartSec=60s
+UMask=0077
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kite-connect-mcp /var/cache/kite-connect-mcp
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=

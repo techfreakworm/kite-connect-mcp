@@ -1,0 +1,45 @@
+# Example Docker Compose file for kite-connect-mcp. Copy it to docker-compose.yml and adapt it.
+# The full walkthrough is in docs/SELF_HOSTING.md.
+#
+#   1. Create kite-connect-mcp.env next to this file (mode 600) with only the settings you need, one KEY=VALUE per
+#      line, no quotes and no inline comments. A minimal file:
+#
+#         KITE_API_KEY=your_api_key
+#         KITE_API_SECRET=your_api_secret
+#         KITE_MCP_BEARER_TOKEN=<output of: openssl rand -hex 32>
+#         KITE_MCP_PUBLIC_URL=https://kite.example.com
+#         KITE_MCP_ALLOWED_USER_ID=AB1234
+#
+#      Do not copy .env.example into it wholesale: it sets KITE_MCP_TRANSPORT=stdio and KITE_MCP_HOST=127.0.0.1,
+#      which would override what the image needs (http on 0.0.0.0).
+#   2. docker compose up -d --build
+#   3. docker compose logs -f kite-connect-mcp
+#
+# The port is published on the loopback address only. Put a TLS reverse proxy (deploy/caddy or deploy/nginx) in front
+# of it; never publish 8765 on a public interface. The image refuses to start without a bearer token.
+
+services:
+  kite-connect-mcp:
+    build: .
+    image: kite-connect-mcp:local
+    container_name: kite-connect-mcp
+    restart: unless-stopped
+    env_file:
+      - ./kite-connect-mcp.env
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      # the token, the audit log, the kill-switch file and the instrument cache; keep it across upgrades
+      - kite-connect-mcp-data:/var/lib/kite-connect-mcp
+    # the server writes only under the volume (and /tmp)
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # the image defines the HEALTHCHECK (GET /health on the loopback address inside the container)
+
+volumes:
+  kite-connect-mcp-data:

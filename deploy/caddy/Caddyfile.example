@@ -1,0 +1,90 @@
+# Caddy in front of kite-connect-mcp, with automatic HTTPS (Let's Encrypt or ZeroSSL).
+# Walkthrough: docs/SELF_HOSTING.md.
+#
+#   1. Point the DNS record of kite.example.com at this server and open ports 80 and 443 in the firewall
+#      (Caddy needs both to obtain and renew the certificate).
+#   2. Replace kite.example.com below, copy this file to /etc/caddy/Caddyfile, then: sudo systemctl reload caddy
+#   3. In the kite-connect-mcp settings: KITE_MCP_PUBLIC_URL=https://kite.example.com
+#      (so the Host-header check accepts requests from this hostname).
+#
+# Only the paths listed here are forwarded; everything else gets a 404 from Caddy and never reaches the server.
+# The server itself checks the bearer token on /mcp; /callback and /postback check their own inputs.
+#
+# --- global options ---
+{
+	# The /callback URL carries one-time values (request_token, state). Without a `log` directive in the site block
+	# Caddy writes no access log, but its error log (stderr, so the journal) names the full request URI whenever the
+	# server is down. This redacts those two values there. If you already have a global options block, merge this in.
+	log {
+		format filter {
+			wrap json
+			request>uri query {
+				replace request_token REDACTED
+				replace state REDACTED
+			}
+		}
+	}
+}
+
+kite.example.com {
+	# an MCP request, a login redirect or a postback is a few kilobytes at most
+	request_body {
+		max_size 1MB
+	}
+
+	# --- MCP over Streamable HTTP, protected by the bearer token ---
+	@mcp path /mcp /mcp/*
+	handle @mcp {
+		reverse_proxy 127.0.0.1:8765 {
+			# replies can be streamed (Server-Sent Events): send them on as they come
+			flush_interval -1
+		}
+	}
+
+	# --- the Kite login redirect (the app's redirect URL is https://kite.example.com/callback) ---
+	@callback {
+		method GET
+		path /callback
+	}
+	handle @callback {
+		reverse_proxy 127.0.0.1:8765
+	}
+
+	# --- optional: Kite order postbacks. Needs KITE_MCP_POSTBACK_PATH=/postback on the server and
+	# https://kite.example.com/postback as the app's postback URL. Delete this block if you do not use them. ---
+	@postback {
+		method POST
+		path /postback
+	}
+	handle @postback {
+		reverse_proxy 127.0.0.1:8765
+	}
+
+	# --- optional: health check (the answer includes the version number). Delete this block unless something
+	# outside the server polls it. ---
+	@health {
+		method GET
+		path /health
+	}
+	handle @health {
+		reverse_proxy 127.0.0.1:8765
+	}
+
+	# everything else
+	handle {
+		respond "Not found" 404
+	}
+
+	# No access log, on purpose. If you want one, redact the same two values; add this block here:
+	#
+	#   log {
+	#       output file /var/log/caddy/kite-access.log
+	#       format filter {
+	#           wrap json
+	#           request>uri query {
+	#               replace request_token REDACTED
+	#               replace state REDACTED
+	#           }
+	#       }
+	#   }
+}

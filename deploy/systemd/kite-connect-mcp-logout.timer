@@ -1,0 +1,24 @@
+# Runs kite-connect-mcp-logout.service every evening (managed auth mode only).
+#
+#   sudo cp deploy/systemd/kite-connect-mcp-logout.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now kite-connect-mcp-logout.timer
+#   systemctl list-timers kite-connect-mcp-logout.timer
+#
+# Pick a time after your last session of the day: NSE and BSE close in the afternoon, but the MCX evening session
+# runs late. Check the calendar expression with: systemd-analyze calendar '*-*-* 22:30:00 Asia/Kolkata'
+
+[Unit]
+Description=Evening Kite logout for kite-connect-mcp (managed auth mode only)
+Documentation=https://github.com/techfreakworm/kite-connect-mcp/blob/main/docs/SELF_HOSTING.md
+
+[Timer]
+# IST, whatever the server's own time zone is
+OnCalendar=*-*-* 22:30:00 Asia/Kolkata
+AccuracySec=1min
+# a logout that was missed because the machine was off is not worth running late
+Persistent=false
+Unit=kite-connect-mcp-logout.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,73 @@
+# kite-connect-mcp: the MCP server for the Zerodha Kite Connect API, as a hardened system service.
+#
+# Install (details and the one-time setup of the user, the folders and the settings file: docs/SELF_HOSTING.md):
+#
+#   sudo cp deploy/systemd/kite-connect-mcp.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now kite-connect-mcp
+#   journalctl -u kite-connect-mcp -f
+#
+# Assumes:
+#   - the program is installed in a virtualenv owned by root: /opt/kite-connect-mcp/venv
+#   - a system user and group "kite-mcp" exist
+#   - /etc/kite-connect-mcp/kite-connect-mcp.env holds the settings (see docs/CONFIGURATION.md), including
+#       KITE_MCP_STATE_DIR=/var/lib/kite-connect-mcp
+#       KITE_MCP_CACHE_DIR=/var/cache/kite-connect-mcp
+#     If you move those two folders, change ReadWritePaths= below to match.
+#   - the server listens on 127.0.0.1:8765 and a TLS reverse proxy (deploy/caddy or deploy/nginx) faces the internet
+#
+# `--transport http` on the command line wins over KITE_MCP_TRANSPORT, so a settings file copied from .env.example
+# (which says "stdio") cannot switch the service into stdio mode.
+
+[Unit]
+Description=kite-connect-mcp (MCP server for the Zerodha Kite Connect API)
+Documentation=https://github.com/techfreakworm/kite-connect-mcp/blob/main/docs/SELF_HOSTING.md
+After=network-online.target
+Wants=network-online.target
+# give up after 5 failed starts within 5 minutes (a bad setting would otherwise restart forever)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=kite-mcp
+Group=kite-mcp
+EnvironmentFile=/etc/kite-connect-mcp/kite-connect-mcp.env
+WorkingDirectory=/var/lib/kite-connect-mcp
+ExecStart=/opt/kite-connect-mcp/venv/bin/kite-connect-mcp serve --transport http
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+# files the server creates (token, audit log, kill switch, cache) are private to the service user
+UMask=0077
+
+# --- sandbox ---------------------------------------------------------------------------------------------------
+# The server reads /etc/kite-connect-mcp and writes only the two folders in ReadWritePaths=.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kite-connect-mcp /var/cache/kite-connect-mcp
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+# MemoryDenyWriteExecute=true is deliberately not set: some Python builds and extension modules need
+# writable-and-executable memory, and the failure would only show up at run time.
+
+[Install]
+WantedBy=multi-user.target
