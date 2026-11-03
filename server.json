@@ -1,0 +1,61 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.techfreakworm/kite-connect-mcp",
+  "title": "Kite Connect MCP",
+  "description": "Zerodha Kite Connect v3 for AI agents: orders (dry-run by default), GTT, alerts, portfolio, quotes",
+  "repository": {
+    "url": "https://github.com/techfreakworm/kite-connect-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "kite-connect-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "KITE_API_KEY",
+          "description": "API key of your Kite Connect app (developers.kite.trade)",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "KITE_API_SECRET",
+          "description": "API secret of your Kite Connect app, needed for the daily login (or use KITE_API_SECRET_FILE)",
+          "isSecret": true
+        },
+        {
+          "name": "KITE_MCP_AUTH_MODE",
+          "description": "managed (this server owns the daily login) or external (read a token file another program writes)",
+          "default": "managed"
+        },
+        {
+          "name": "KITE_TOKEN_FILE",
+          "description": "Path of the access-token file (default: ~/.local/state/kite-connect-mcp/access_token.json)"
+        },
+        {
+          "name": "KITE_MCP_TRADING_MODE",
+          "description": "dry_run (default: writes are only previewed) or live (writes need a confirmation token)",
+          "default": "dry_run"
+        },
+        {
+          "name": "KITE_MCP_READ_ONLY",
+          "description": "true hides every tool that can change the account",
+          "default": "false"
+        }
+      ]
+    }
+  ]
+}

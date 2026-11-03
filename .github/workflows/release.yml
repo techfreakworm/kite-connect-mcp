@@ -1,0 +1,146 @@
+# Release: push a tag vX.Y.Z (matching src/kite_connect_mcp/__init__.py) to publish
+#   1. tests on 3.11-3.13
+#   2. sdist + wheel -> PyPI via Trusted Publishing (OIDC; no stored token)
+#   3. multi-arch image -> ghcr.io/techfreakworm/kite-connect-mcp (GITHUB_TOKEN)
+#   4. server.json -> the official MCP Registry (GitHub OIDC; no stored token)
+#   5. a GitHub release with the built files
+#
+# One-time setup on PyPI (by the project owner): add a "pending publisher" at https://pypi.org/manage/account/publishing/
+# with project kite-connect-mcp, owner techfreakworm, repository kite-connect-mcp, workflow release.yml, environment pypi.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: ruff check . && ruff format --check . && mypy
+      - run: pytest -q
+
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: version
+        name: Check the tag matches the package version
+        run: |
+          pkg=$(python -c "import re,pathlib; print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('src/kite_connect_mcp/__init__.py').read_text()).group(1))")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$pkg" != "$tag" ]; then echo "tag $tag does not match package version $pkg" >&2; exit 1; fi
+          srv=$(python -c "import json; print(json.load(open('server.json'))['version'])")
+          if [ "$srv" != "$tag" ]; then echo "server.json version $srv does not match tag $tag" >&2; exit 1; fi
+          echo "version=$pkg" >> "$GITHUB_OUTPUT"
+      - run: pip install build twine && python -m build && twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/kite-connect-mcp
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  ghcr:
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            io.modelcontextprotocol.server.name=io.github.techfreakworm/kite-connect-mcp
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  mcp-registry:
+    needs: [pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      MCP_PUBLISHER_VERSION: v1.8.7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mcp-publisher (pinned)
+        run: |
+          os=$(uname -s | tr '[:upper:]' '[:lower:]')
+          arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_${os}_${arch}.tar.gz" | tar xz mcp-publisher
+      - name: Wait for the PyPI release to be visible
+        run: |
+          for i in $(seq 1 30); do
+            curl -fsS "https://pypi.org/pypi/kite-connect-mcp/${GITHUB_REF_NAME#v}/json" >/dev/null && exit 0
+            sleep 10
+          done
+          echo "the PyPI release did not appear" >&2; exit 1
+      - run: ./mcp-publisher login github-oidc
+      - run: ./mcp-publisher publish
+
+  github-release:
+    needs: [pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" \
+            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md). Install: \`uvx kite-connect-mcp\` or \`pip install kite-connect-mcp\`; image: \`ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME#v}\`."
