@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kite-connect-mcp"
+dynamic = ["version"]
+description = "Self-hostable MCP server for the full Zerodha Kite Connect v3 API, with dry-run-by-default order safety"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Mayank Gupta" }]
+requires-python = ">=3.11"
+keywords = ["mcp", "zerodha", "kite", "kiteconnect", "trading", "model-context-protocol"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Financial and Insurance Industry",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+  "mcp>=2.3,<3",
+  "httpx2>=2.16",
+  "pydantic>=2.10",
+  "starlette>=1.0",
+  "uvicorn>=0.30",
+  "websockets>=13",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=1.0", "ruff>=0.15", "mypy>=1.15"]
+
+[project.scripts]
+kite-connect-mcp = "kite_connect_mcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/techfreakworm/kite-connect-mcp"
+Issues = "https://github.com/techfreakworm/kite-connect-mcp/issues"
+
+[tool.hatch.version]
+path = "src/kite_connect_mcp/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kite_connect_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/kite_connect_mcp", "tests", "docs", "deploy", "README.md", "LICENSE", "CHANGELOG.md", ".env.example"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q -p no:cacheprovider"
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "RUF", "SIM", "PT"]
+ignore = [
+  "S101",   # assert is fine in tests and for invariants
+  "S105",   # 'token' in names is not a hard-coded password
+  "S106",
+  "S107",
+  "RUF001", # unicode in strings (₹) is intended
+  "RUF002",
+  "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B011", "PT011", "PT018", "PT022", "RUF012", "RUF059"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/kite_connect_mcp"]
+strict_optional = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+ignore_missing_imports = true

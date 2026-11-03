@@ -1,0 +1,42 @@
+# Secrets and credentials: never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*token*.json
+*token*.txt
+access_token*
+.secrets/
+secrets/
+# Local operator notes and PII patterns used by scripts/prepush_check.sh
+.local/
+.pii-patterns
+.pii-secret-files
+
+# Runtime state written by the server (token store, audit log, caches)
+state/
+cache/
+*.jsonl
+*.sqlite
+*.sqlite3
+*.db
+
+# Python and tooling
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+.claude/
+.playwright-mcp/
