@@ -1,13 +1,19 @@
 # kite-connect-mcp
 
+<!-- mcp-name: io.github.techfreakworm/kite-connect-mcp -->
+
+[![CI](https://github.com/techfreakworm/kite-connect-mcp/actions/workflows/release.yml/badge.svg)](https://github.com/techfreakworm/kite-connect-mcp/actions/workflows/release.yml)
+[![PyPI](https://img.shields.io/pypi/v/kite-connect-mcp)](https://pypi.org/project/kite-connect-mcp/)
+[![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue)](LICENSE)
+
 A self-hostable [Model Context Protocol](https://modelcontextprotocol.io) server for the
 [Zerodha Kite Connect v3 API](https://kite.trade/docs/connect/v3/). Run it on your own machine or server with
 your own Kite Connect app, and let an AI assistant read your account, market data and orders. Every write is a
 **dry run by default**.
 
-> **Status: alpha, under active development.** The core (HTTP client, token store, safety pipeline, order tools)
-> is in place and tested. The remaining tool groups are being added; see [CHANGELOG.md](CHANGELOG.md).
-> This is not affiliated with or endorsed by Zerodha.
+> **Status: beta (0.x).** Every Kite Connect v3 capability is covered and tested offline against a fake Kite;
+> expect rough edges against the real API and report them. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+> This project is not affiliated with or endorsed by Zerodha.
 
 ## Why another Kite MCP server?
 
@@ -38,9 +44,10 @@ secret, the redirect and postback URLs, the subscription, and the static IP.
 ## Quick start (local, stdio)
 
 ```bash
-# install (from GitHub; no PyPI release yet)
-uv tool install git+https://github.com/techfreakworm/kite-connect-mcp
-# or: pipx install git+https://github.com/techfreakworm/kite-connect-mcp
+# install
+uv tool install kite-connect-mcp        # or: pipx install kite-connect-mcp  /  pip install kite-connect-mcp
+# or run without installing:  uvx kite-connect-mcp --help
+# or the image:               docker pull ghcr.io/techfreakworm/kite-connect-mcp
 
 # configure: credentials from env vars or files (mode 600)
 export KITE_API_KEY=your_api_key
@@ -102,11 +109,25 @@ login.
 
 ## Tools
 
-Tool names follow the official server where one exists, so prompts carry over: `get_profile`, `get_margins`,
-`get_holdings`, `get_positions`, `place_order`, `modify_order`, `cancel_order`, `get_orders`, `get_trades`,
-`get_gtts`, `place_gtt_order`, `get_quotes`, `get_ltp`, `get_ohlc`, `get_historical_data`, `search_instruments`, …
-The full reference with every parameter is [docs/TOOLS.md](docs/TOOLS.md). `kite-connect-mcp tools` lists what
-your configuration exposes.
+58 tools in 11 toolsets (53 by default: the mutual-fund writes are opt-in). Tool names follow the official server
+where one exists, so prompts carry over. Pick toolsets with `KITE_MCP_TOOLSETS` and hide single tools with
+`KITE_MCP_EXCLUDED_TOOLS`; `kite-connect-mcp tools` lists what your configuration exposes.
+
+| Toolset | Tools |
+|---|---|
+| session | `session_status`, `login`, `complete_login`, `logout` |
+| account | `get_profile`, `get_margins` |
+| orders | `place_order`, `modify_order`, `cancel_order`, `get_orders`, `get_order_history`, `get_trades`, `get_order_trades` |
+| gtt | `get_gtts`, `get_gtt`, `place_gtt_order`, `modify_gtt_order`, `delete_gtt_order` |
+| alerts | `get_alerts`, `get_alert`, `get_alert_history`, `create_alert` (simple and ATO), `modify_alert`, `delete_alerts` |
+| portfolio | `get_holdings`, `get_positions`, `get_auctions`, `convert_position`, `authorise_holdings` |
+| market | `get_quotes`, `get_ohlc`, `get_ltp`, `get_historical_data`, `search_instruments`, `get_instrument`, `get_instruments_status`, `refresh_instruments` |
+| margins | `get_order_margins`, `get_basket_margins`, `get_order_charges` |
+| mf | `get_mf_holdings`, `get_mf_orders`, `get_mf_sips`, `search_mf_instruments`; opt-in: `place_mf_order`, `cancel_mf_order`, `place_mf_sip`, `modify_mf_sip`, `cancel_mf_sip` |
+| ticker | `ticker_subscribe`, `ticker_unsubscribe`, `ticker_get_ticks`, `ticker_status`, `ticker_order_updates`, `ticker_stop` |
+| safety | `get_safety_status`, `get_audit_log`, `engage_kill_switch` |
+
+Every argument of every tool is in [docs/TOOLS.md](docs/TOOLS.md).
 
 ## Development
 

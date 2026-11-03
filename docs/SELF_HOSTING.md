@@ -129,13 +129,13 @@ variables. Look for "MCP servers" in the client's settings.
 ```bash
 # Claude Code, directly over HTTP (the header is stored in Claude Code's config file)
 claude mcp add --transport http kite https://kite.example.com/mcp \
-  --header "Authorization: Bearer $KITE_MCP_BEARER"
+  --header "Authorization: Bearer $MCP_BEARER"
 ```
 
 For a client that can only start local programs, bridge with `mcp-remote` (it needs Node.js):
 
 ```bash
-npx mcp-remote https://kite.example.com/mcp --header "Authorization: Bearer ${KITE_MCP_BEARER}"
+npx mcp-remote https://kite.example.com/mcp --header "Authorization: Bearer ${MCP_BEARER}"
 ```
 
 In a client's JSON configuration, with the token in the environment variable:
@@ -146,8 +146,8 @@ In a client's JSON configuration, with the token in the environment variable:
     "kite": {
       "command": "npx",
       "args": ["-y", "mcp-remote", "https://kite.example.com/mcp",
-               "--header", "Authorization: Bearer ${KITE_MCP_BEARER}"],
-      "env": { "KITE_MCP_BEARER": "your_bearer_token" }
+               "--header", "Authorization: Bearer ${MCP_BEARER}"],
+      "env": { "MCP_BEARER": "your_bearer_token" }
     }
   }
 }
