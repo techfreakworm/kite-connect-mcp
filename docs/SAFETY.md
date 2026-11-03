@@ -151,12 +151,15 @@ Details that matter:
 
 - `autoslice=true` counts as **10** orders against the daily count, because Kite may split the order into up to 10. The
   value is the full quantity.
-- **Cancellations** skip the value, quantity and daily checks (cancelling reduces risk) but still need confirmation, and
-  the allow-lists and the kill switch still apply to them. If you set `KITE_MCP_ALLOWED_ORDER_TYPES=LIMIT`, the server
-  will refuse to cancel an `SL-M` order. Allow every order type you may need to cancel.
-- **Modifications** are checked against the per-order cap using the new value, and against the allow-lists and the
-  quantity cap. They do not add to the daily value or count, so a modification can raise an order's size without
-  touching the daily caps. Exclude `modify_order` (`KITE_MCP_EXCLUDED_TOOLS=modify_order`) if that matters to you.
+- **Cancellations and deletions** (cancel an order, delete a GTT or alerts, cancel an MF order or SIP) skip the value,
+  quantity and daily checks, because they reduce risk. They still need confirmation, and the kill switch still refuses
+  them. Only the **exchange and instrument** allow-lists apply to them, so you can still cancel an `SL-M` stop with
+  `KITE_MCP_ALLOWED_ORDER_TYPES=LIMIT` set. Cancelling a stop-loss can increase your risk, which is why it is still a
+  confirmed write.
+- **Modifications** are checked against the per-order cap using the new value, against the allow-lists and against the
+  quantity cap. They do not count as new orders, but any **increase** in value is added to the day's value and checked
+  against the daily cap (a GTT modification likewise adds its increase over the stored trigger, and an ATO alert
+  modification its whole new basket).
 - The other tools that create or change orders (GTTs, and alerts that trigger orders) are valued with the same rules.
 
 ## 7. The 25-modification limit
@@ -180,8 +183,8 @@ Six optional lists narrow what the server will send. Each is comma-separated; un
 | `KITE_MCP_ALLOWED_TRANSACTION_TYPES` | side | `BUY` |
 
 A write that falls outside a list is refused, and the message names the list. It shows in a dry run as a violation, so
-no confirmation token is issued. The lists apply to every order a write creates or changes, and to cancellations (see
-above).
+no confirmation token is issued. The lists apply to every order a write creates or changes; cancellations and
+deletions are judged by the exchange and instrument lists only (see above).
 
 ## 9. The kill switch
 
@@ -236,10 +239,13 @@ in a tool cannot, by itself, send an unreviewed write.
 | `dry_run` | A dry run that issued no token | `ok`, `violations`, `warnings`, `legs` |
 | `confirmation_issued` | A dry run that issued a token | same as `dry_run` |
 | `refused` | A live attempt was blocked (policy, mode, token, read-only) | `reasons` |
-| `live_intent` | The policy passed. **Written and fsynced before the request is sent** | `value_inr`, `order_id` |
-| `live_result` | Kite accepted the request | `counts`, `order_count`, `value_inr`, `order_id`, `response` |
+| `live_intent` | The policy passed. **Written and fsynced before the request is sent** | `value_inr`, `notional_inr`, `order_id` |
+| `live_result` | Kite accepted the request | `counts`, `order_count`, `value_inr`, `notional_inr`, `order_id`, `response` |
 | `live_error` | Kite answered with an error | `error_type`, `status`, `error` |
-| `live_unknown` | No answer (timeout, dropped connection): the write may have happened | `error` |
+| `live_unknown` | No answer (timeout, dropped connection): the write may have happened | `counts`, `order_count`, `value_inr`, `notional_inr`, `error` |
+
+`value_inr` is what a write adds to today's usage (for a modification, its increase; for a conversion or a cancel,
+nothing); `notional_inr` is the full value of its legs, kept for the record.
 | `kill_switch_engaged` | `engage_kill_switch` ran | `reason` |
 
 The `call_id` ties a `live_intent` to its `live_result`, `live_error` or `live_unknown`. A `live_intent` with no outcome
@@ -265,11 +271,11 @@ Read it with `kite-connect-mcp audit [--date YYYY-MM-DD] [--limit N]`, with the 
   with backoff.
 - **Writes are never retried.** If the connection could not even be made, the write was not sent and the error says so.
   If the request may have left (a timeout, a dropped connection), the outcome is **unknown**: the tool reports "no
-  answer from Kite; the request may have been executed. Check the order book (get_orders / get_gtts / get_alerts)
-  before trying again", and the audit log gets a `live_unknown`. An HTTP 429 or 5xx answer to a write is reported as it
+  answer from Kite; the request may have been executed. Check the matching book (get_orders, get_gtts, get_alerts,
+  get_mf_orders or get_mf_sips) before trying again", and the audit log gets a `live_unknown`. An HTTP 429 or 5xx answer to a write is reported as it
   is (audited as `live_error`), also without a retry; after a 5xx, check the order book before you send it again.
-- **Unknown outcomes are not counted** in the daily caps, because nothing confirms that the order exists. Check the order
-  book and reconcile by hand.
+- **Unknown outcomes are counted** in the daily caps as if they happened, so the caps err on the safe side. Check the
+  order book and reconcile by hand: an order that never reached Kite still uses up its share of the day's caps.
 
 ## 14. Sessions, credentials and external mode
 
@@ -298,7 +304,8 @@ Be clear-eyed about the limits of this layer.
   order counts at the last price when you asked for the preview, which can move before you confirm. Derivatives count
   at `quantity × price`, which is not the margin used and not the maximum loss. A short position can lose more than it
   cost to open. MCX, CDS and BCD values are not estimated at all (those orders are dry-run only).
-- **Unknown outcomes and modifications are not counted** toward the daily caps (see above).
+- **A SELL limit is valued at its limit price**, even though it can fill higher, and a SIP's later instalments run on
+  Kite's schedule, outside these caps (only the first instalment or lump sum is checked).
 - **Anyone with shell access to the machine** can edit the settings, switch on live trading, delete the kill switch,
   delete the audit log (which resets the daily caps) or read the access token and call Kite directly, bypassing this
   server completely. Protect the account that runs it and the folders it uses.
