@@ -49,6 +49,8 @@ MAX_CANDLES = 2000  # the most candles one answer carries (the newest ones); ~25
 MAX_REQUESTS = 40  # the most historical requests one call makes: at 3 per second this bounds it to about 15 seconds
 CANDLE_COLUMNS = ["date", "open", "high", "low", "close", "volume"]
 INSTRUMENT_HELP = 'EXCHANGE:TRADINGSYMBOL (e.g. "NSE:INFY", "NSE:NIFTY 50", "NFO:NIFTY25NOVFUT")'
+# A model that has just read `"instrument_token": 408065` tends to send it back as a JSON number: take both forms.
+InstrumentOrToken = Annotated[str, Field(min_length=1, max_length=60)] | Annotated[int, Field(gt=0, lt=2**32)]
 
 
 def instrument_store(rt: Runtime) -> InstrumentStore:
@@ -294,12 +296,8 @@ def register(reg: Registrar) -> None:
     @reg.tool("get_historical_data", title="Historical candles", toolset="market", kind="read")
     async def get_historical_data(
         instrument: Annotated[
-            str,
-            Field(
-                min_length=1,
-                max_length=60,
-                description=f"{INSTRUMENT_HELP} or a numeric instrument_token (e.g. 408065)",
-            ),
+            InstrumentOrToken,
+            Field(description=f"{INSTRUMENT_HELP} or a numeric instrument_token (e.g. 408065)"),
         ],
         interval: Annotated[Interval, Field(description="candle size: minute, 3minute ... 60minute, or day")],
         from_date: Annotated[
@@ -348,7 +346,7 @@ def register(reg: Registrar) -> None:
         require(start <= now, f"from_date {from_date} is in the future (now: {now:%Y-%m-%d %H:%M} IST)")
         require(start <= requested_end, f"from_date {from_date} is after to_date {to_date}")
         end = min(requested_end, now)
-        token, label = await history_target(rt, instrument, continuous=continuous)
+        token, label = await history_target(rt, str(instrument), continuous=continuous)
         want = min(limit or MAX_CANDLES, MAX_CANDLES)
         candles, complete = await fetch_candles(
             rt, token, interval, start, end, continuous=continuous, oi=oi, want=want
@@ -422,15 +420,16 @@ def register(reg: Registrar) -> None:
     @reg.tool("get_instrument", title="Instrument details", toolset="market", kind="read")
     async def get_instrument(
         instrument: Annotated[
-            str, Field(min_length=1, max_length=60, description=f"{INSTRUMENT_HELP} or a numeric instrument_token")
+            InstrumentOrToken, Field(description=f"{INSTRUMENT_HELP} or a numeric instrument_token (e.g. 408065)")
         ],
     ) -> Any:
         """One instrument from Kite's daily instrument list: key, instrument_token, exchange_token, tradingsymbol, name,
         exchange, segment, instrument_type (EQ, FUT, CE, PE), expiry, strike, lot_size, tick_size (INR) and last_price
         (from the daily dump, not live). Use it to check the lot size and tick size before an order."""
-        found = await find_instrument(rt, instrument)
+        text = str(instrument).strip()
+        found = await find_instrument(rt, text)
         if found is None:
-            raise ToolInputError(f"{instrument.strip()} is not in today's instrument list (use search_instruments)")
+            raise ToolInputError(f"{text} is not in today's instrument list (use search_instruments)")
         return found.as_dict()
 
     @reg.tool("get_instruments_status", title="Instrument list status", toolset="market", kind="read")

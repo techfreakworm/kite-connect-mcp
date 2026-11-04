@@ -155,7 +155,7 @@ The fills that one order produced.
 
 | Argument | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `order_id` | string | yes |  |  |
+| `order_id` | string | yes |  | the order_id (see get_orders) |
 
 ### `place_order`: Place an order (dry run by default)
 
@@ -610,7 +610,7 @@ Connect plan; historical requests are limited to 3 per second. Output is large (
 
 | Argument | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `instrument` | string | yes |  | EXCHANGE:TRADINGSYMBOL (e.g. "NSE:INFY", "NSE:NIFTY 50", "NFO:NIFTY25NOVFUT") or a numeric instrument_token (e.g. 408065) |
+| `instrument` | string \| integer | yes |  | EXCHANGE:TRADINGSYMBOL (e.g. "NSE:INFY", "NSE:NIFTY 50", "NFO:NIFTY25NOVFUT") or a numeric instrument_token (e.g. 408065) |
 | `interval` | `minute` \| `3minute` \| `5minute` \| `10minute` \| `15minute` \| `30minute` \| `60minute` \| `day` | yes |  | candle size: minute, 3minute ... 60minute, or day |
 | `from_date` | string | yes |  | start (IST): "YYYY-MM-DD" (from 00:00:00) or "YYYY-MM-DD HH:MM:SS" |
 | `to_date` | string | yes |  | end (IST, inclusive): "YYYY-MM-DD" (up to 23:59:59 of that day) or "YYYY-MM-DD HH:MM:SS"; a time in the future means now |
@@ -650,7 +650,7 @@ exchange, segment, instrument_type (EQ, FUT, CE, PE), expiry, strike, lot_size, 
 
 | Argument | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `instrument` | string | yes |  | EXCHANGE:TRADINGSYMBOL (e.g. "NSE:INFY", "NSE:NIFTY 50", "NFO:NIFTY25NOVFUT") or a numeric instrument_token |
+| `instrument` | string \| integer | yes |  | EXCHANGE:TRADINGSYMBOL (e.g. "NSE:INFY", "NSE:NIFTY 50", "NFO:NIFTY25NOVFUT") or a numeric instrument_token (e.g. 408065) |
 
 ### `get_instruments_status`: Instrument list status
 

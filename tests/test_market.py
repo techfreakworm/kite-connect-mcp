@@ -478,6 +478,11 @@ async def test_numeric_tokens_work_with_or_without_the_instrument_list(make_serv
     server, _, _ = make_server()
     answer = tool_json(await call(server, "get_historical_data", history_args(instrument=f" {INFY_TOKEN} ")))
     assert answer["instrument"] == "NSE:INFY"
+    # a JSON number works too (models often send the token they just read as one); found live against Kite
+    answer = tool_json(await call(server, "get_historical_data", history_args(instrument=INFY_TOKEN)))
+    assert answer["instrument"] == "NSE:INFY" and answer["instrument_token"] == INFY_TOKEN and answer["count"] == 10
+    for bad in (0, -5, 2**32):
+        assert (await call(server, "get_historical_data", history_args(instrument=bad))).is_error, bad
 
 
 async def test_unknown_symbols_and_an_unavailable_list_get_clear_errors(make_server, fake_kite):
@@ -571,6 +576,10 @@ async def test_get_instrument_by_symbol_or_token(make_server, fake_kite):
     assert by_symbol["key"] == "NFO:NIFTY26NOVFUT" and by_symbol["lot_size"] == 75 and by_symbol["tick_size"] == 0.05
     by_token = tool_json(await call(server, "get_instrument", {"instrument": str(NIFTY_FUT_TOKEN)}))
     assert by_token == by_symbol
+    by_number = tool_json(await call(server, "get_instrument", {"instrument": NIFTY_FUT_TOKEN}))
+    assert by_number == by_symbol
+    for bad in (0, 2**32, 999):
+        assert (await call(server, "get_instrument", {"instrument": bad})).is_error, bad
     index = tool_json(await call(server, "get_instrument", {"instrument": "NSE:NIFTY 50"}))
     assert index["segment"] == "INDICES" and index["expiry"] is None
     for missing in ("NSE:NOSUCH", "999", "INFY"):

@@ -11,8 +11,10 @@ A self-hostable [Model Context Protocol](https://modelcontextprotocol.io) server
 your own Kite Connect app, and let an AI assistant read your account, market data and orders. Every write is a
 **dry run by default**.
 
-> **Status: beta (0.x).** Every Kite Connect v3 capability is covered and tested offline against a fake Kite;
-> expect rough edges against the real API and report them. Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+> **Status: beta (0.x).** Every Kite Connect v3 capability is covered and tested offline against a fake Kite. The
+> read tools, the margin and charge calculators and the ticker have also been checked against the live API; live
+> writes (orders, GTTs, alerts, mutual funds) have not, so expect rough edges there and report them. Changes are
+> listed in [CHANGELOG.md](CHANGELOG.md).
 > This project is not affiliated with or endorsed by Zerodha.
 
 ## Why another Kite MCP server?

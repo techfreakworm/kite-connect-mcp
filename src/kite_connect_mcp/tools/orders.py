@@ -108,7 +108,7 @@ def register(reg: Registrar) -> None:
 
     @reg.tool("get_order_trades", title="Trades of an order", toolset="orders", kind="read")
     async def get_order_trades(
-        order_id: Annotated[str, Field(min_length=1, max_length=64)],
+        order_id: Annotated[str, Field(min_length=1, max_length=64, description="the order_id (see get_orders)")],
     ) -> Any:
         """The fills that one order produced."""
         return await rt.client.get(f"/orders/{order_id}/trades")

@@ -3,6 +3,17 @@
 All notable changes are listed here. Versions follow [semantic versioning](https://semver.org); while the version
 is 0.x, minor releases may change tool arguments.
 
+## 0.1.1 (2026-11-04)
+
+Checked against the live Kite API (read-only): every read tool, the calculators, and the WebSocket ticker across
+NSE, BSE, NFO, CDS and MCX, with ticker prices matching REST quotes.
+
+### Fixed
+
+- `get_historical_data` and `get_instrument` now take an instrument token as a JSON number (`408065`) as well as a
+  string. Both were documented to take a numeric token, but a number was rejected as not a string.
+- `get_order_trades` describes its `order_id` argument.
+
 ## 0.1.0 (2026-11-04)
 
 The first release: every Kite Connect v3 capability, behind a write-safety layer.
