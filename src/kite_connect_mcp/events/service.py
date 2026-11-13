@@ -23,7 +23,6 @@ import asyncio
 import contextlib
 import datetime as dt
 import fcntl
-import hashlib
 import logging
 import os
 from collections.abc import Callable, Mapping
@@ -44,8 +43,9 @@ from .model import (
     router_event,
     selftest_event,
     session_event,
+    token_fingerprint,
 )
-from .poll import Poller
+from .poll import Poller, in_poll_window, last_closed_poll_day
 from .router import Router
 from .store import EventStore, StoreError
 
@@ -194,9 +194,8 @@ class EventService:
     def note_token_rejected(self, access_token: str) -> int | None:
         """Kite refused this token: one `token_rejected` event per token (the id comes from a fingerprint of it; the
         token itself is never stored)."""
-        fingerprint = hashlib.sha256(access_token.encode("utf-8", "replace")).hexdigest()
         now = self.clock()
-        body = session_event("token_rejected", seed=fingerprint, received_at=now)
+        body = session_event("token_rejected", seed=token_fingerprint(access_token), received_at=now)
         return self._insert(body, order_id=None, consumers=self.config.matching(body), now=now)
 
     def record_selftest(self, order_id: str) -> int | None:
@@ -337,18 +336,6 @@ class EventService:
                 os.close(fd)  # closing the file releases the lock too
 
 
-def last_closed_poll_day(settings: Settings, now: dt.datetime) -> dt.date | None:
-    """The most recent poll day whose poll window has closed by `now`: today once its window has ended, else the poll
-    day before (Friday, on a weekend or a Monday morning). None when no day is a poll day."""
-    local = to_ist(now)
-    first = 0 if local.time() >= settings.order_poll_window[1] else 1
-    for back in range(first, first + 7):
-        day = local.date() - dt.timedelta(days=back)
-        if day.weekday() in settings.order_poll_days:
-            return day
-    return None
-
-
 def _day_of(stamp: str | None) -> dt.date | None:
     """The IST date of a time kept in meta (baseline_done holds an ISO time; a bare date reads as that day), None when
     there is none or it cannot be read."""
@@ -374,13 +361,12 @@ def describe_status(
     out["store"] = str(store.path)
     if consumer_names is not None:
         out["configured_consumers"] = consumer_names
-    local = to_ist(now)
     start, end = settings.order_poll_window
     out["poll"] = {
         "interval_s": settings.order_poll_interval_s,
         "window": f"{start:%H:%M}-{end:%H:%M}",
         "days": sorted(settings.order_poll_days),
-        "in_window_now": local.weekday() in settings.order_poll_days and start <= local.time() < end,
+        "in_window_now": in_poll_window(settings, now),
     }
     due = last_closed_poll_day(settings, now)
     ok = out["after_close_ok"]

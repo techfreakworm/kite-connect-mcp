@@ -177,6 +177,8 @@ class TokenFile:
         except OSError as exc:
             log.warning("cannot read the token file %s: %s", self.path, exc.strerror)
             return None
+        except UnicodeDecodeError:  # not UTF-8 (a UTF-16 file, say): no usable token, cached like any other such file
+            text = ""
         record = parse_token_file(text, dt.datetime.fromtimestamp(st.st_mtime, IST))
         if record is None:
             log.warning("the token file %s does not hold a usable token", self.path)

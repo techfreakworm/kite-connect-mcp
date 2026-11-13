@@ -352,6 +352,19 @@ def test_token_file_is_reread_when_it_changes(tmp_path):
     assert provider.current().access_token == "secondtoken002"
 
 
+def test_a_token_file_that_is_not_utf8_holds_no_token(tmp_path, caplog):
+    path = tmp_path / "t.json"
+    path.write_bytes(json.dumps({"access_token": FAKE_TOKEN}).encode("utf-16"))  # a BOM and UTF-16, say
+    path.chmod(0o600)
+    provider = TokenProvider(token_file=TokenFile(path, writable=False), clock=lambda: FIXED_NOW)
+    assert provider.current() is None
+    assert provider.current() is None
+    assert provider.status()["logged_in"] is False
+    (line,) = [r.getMessage() for r in caplog.records if "token file" in r.getMessage()]  # read once, then cached
+    assert "does not hold a usable token" in line
+    assert FAKE_TOKEN not in caplog.text
+
+
 def test_expired_token_is_not_used(tmp_path):
     path = write_token_file(tmp_path / "t.json", logged_in_at=FIXED_NOW - dt.timedelta(days=2))
     provider = TokenProvider(token_file=TokenFile(path, writable=False), clock=lambda: FIXED_NOW)

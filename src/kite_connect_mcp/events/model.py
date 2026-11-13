@@ -348,6 +348,12 @@ def order_event(
     }
 
 
+def token_fingerprint(access_token: str) -> str:
+    """A stand-in for an access token that is safe to keep and compare (its SHA-256, in hex): the seed of the token's
+    session events, and how the poll tells a new token from the one it saw. Never the token itself."""
+    return hashlib.sha256(access_token.encode("utf-8", "replace")).hexdigest()
+
+
 def session_event(name: str, *, seed: str, received_at: dt.datetime) -> dict[str, Any]:
     """`seed` makes the id: the same seed (e.g. a fingerprint of one token) gives the same event, stored once."""
     if name not in SESSION_TEXT:

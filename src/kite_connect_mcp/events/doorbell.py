@@ -5,9 +5,9 @@ The route therefore only rings: it keeps the order id on disk (`doorbells`), and
 Kite (GET /orders/{order_id}, the last row of its history) and stores Kite's answer, as source "postback". A forged or
 replayed postback can cause one read, plus retries while Kite fails (at most MAX_TRIES failed reads).
 
-Without a valid token nothing is read: the doorbells wait, and the first poll that has a token runs them (a new login
-starts a poll at once). The token the worker checks is the one it sends, so a rejection is reported for the token Kite
-refused.
+Without a valid token nothing is read: the doorbells wait, and the poll that a new login starts at once runs them first
+(so does the poll at startup; the other polls leave them to this worker's own round). The token the worker checks is
+the one it sends, so a rejection is reported for the token Kite refused.
 
 Each doorbell is settled on its own. A failed read (an error from Kite, an answer that is not an order history, a bug)
 keeps the doorbell for a later round, counts a try, and the round moves on to the next one; only a rejected token,
