@@ -26,7 +26,7 @@ def store(tmp_path):
 
 def add(store, order_id, price, consumers=("notify",), now=T0):
     view = OrderView.from_row(order_row(order_id=order_id, price=price))
-    body = order_event(view, change="placed", source="poll", received_at=now, tag_labels={})
+    body = order_event(view, change="placed", source="poll", received_at=now, tag_labels={}, previous_event_id="")
     with store.write() as con:
         return store.insert_event(con, body, order_id=order_id, consumers=consumers, order_key=order_id, now=now)
 

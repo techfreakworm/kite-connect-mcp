@@ -25,7 +25,7 @@ def store(tmp_path):
 
 def add(store, row, change="placed", *, consumers=(), now=FIXED_NOW):
     view = OrderView.from_row(row)
-    body = order_event(view, change=change, source="poll", received_at=now, tag_labels={})
+    body = order_event(view, change=change, source="poll", received_at=now, tag_labels={}, previous_event_id="")
     with store.write() as con:
         seq = store.insert_event(
             con, body, order_id=view.order_id, consumers=consumers, order_key=view.order_id, now=now
@@ -165,7 +165,7 @@ def test_an_event_brings_one_pending_delivery_per_consumer(store):
 
 def test_a_write_that_raises_leaves_nothing(store):
     view = OrderView.from_row(order_row())
-    body = order_event(view, change="placed", source="poll", received_at=FIXED_NOW, tag_labels={})
+    body = order_event(view, change="placed", source="poll", received_at=FIXED_NOW, tag_labels={}, previous_event_id="")
 
     def crash():
         with store.write() as con:
@@ -350,7 +350,7 @@ def test_a_read_only_open_of_a_file_without_the_schema_is_refused(tmp_path):
 
 def test_an_event_that_breaks_a_rule_is_an_error_not_a_duplicate(store):
     view = OrderView.from_row(order_row())
-    body = order_event(view, change="placed", source="poll", received_at=FIXED_NOW, tag_labels={})
+    body = order_event(view, change="placed", source="poll", received_at=FIXED_NOW, tag_labels={}, previous_event_id="")
     with pytest.raises(StoreError, match="NOT NULL"), store.write() as con:
         store.insert_event(
             con, {**body, "source": None}, order_id=ORDER_ID, consumers=(), order_key=ORDER_ID, now=FIXED_NOW

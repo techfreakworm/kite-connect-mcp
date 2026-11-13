@@ -328,9 +328,10 @@ def order_event(
     source: str,
     received_at: dt.datetime,
     tag_labels: Mapping[str, str] | None,
-    previous_event_id: str = "",
+    previous_event_id: str,
 ) -> dict[str, Any]:
-    """`previous_event_id` is Previous.event_id of the state the change was judged against ("" for a first sight)."""
+    """`previous_event_id` is Previous.event_id of the state the change was judged against ("" for a first sight). It
+    has no default: left out, a state the order goes back to would get its earlier event's id and be dropped."""
     if change not in CHANGES:
         raise ValueError(f"unknown change {change!r}")
     if source not in ORDER_SOURCES:

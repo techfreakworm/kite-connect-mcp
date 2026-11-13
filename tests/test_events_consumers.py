@@ -62,7 +62,14 @@ def refused(path, phrase):
 
 
 def event(row, change="filled", source="postback"):
-    return order_event(OrderView.from_row(row), change=change, source=source, received_at=FIXED_NOW, tag_labels={})
+    return order_event(
+        OrderView.from_row(row),
+        change=change,
+        source=source,
+        received_at=FIXED_NOW,
+        tag_labels={},
+        previous_event_id="",
+    )
 
 
 def test_no_file_means_no_consumers():

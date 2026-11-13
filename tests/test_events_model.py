@@ -205,7 +205,9 @@ def test_every_change_has_a_text():
 
 def test_the_order_event_body():
     view = OrderView.from_row(filled_row())
-    body = order_event(view, change="filled", source="postback", received_at=FIXED_NOW, tag_labels={})
+    body = order_event(
+        view, change="filled", source="postback", received_at=FIXED_NOW, tag_labels={}, previous_event_id=""
+    )
     assert body["kind"] == "order" and body["source"] == "postback" and body["change"] == "filled"
     assert body["state_id"] == view.state_id()
     assert len(body["event_id"]) == 32 and int(body["event_id"], 16) >= 0
@@ -213,6 +215,13 @@ def test_the_order_event_body():
     assert body["order"]["order_id"] == ORDER_ID
     assert order_key(body) == ORDER_ID
     assert "AB1234" not in json.dumps(body)
+
+
+def test_the_previous_event_id_cannot_be_left_out():
+    """Left out, it would give a state the order goes back to the id of its earlier event: dropped as stored already."""
+    view = OrderView.from_row(order_row())
+    with pytest.raises(TypeError, match="previous_event_id"):
+        order_event(view, change="placed", source="poll", received_at=FIXED_NOW, tag_labels={})
 
 
 def test_session_router_and_selftest_bodies():
