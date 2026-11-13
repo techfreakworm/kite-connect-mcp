@@ -3,16 +3,22 @@ program, a consumers file and an event service on a runtime wired to FakeKite.""
 
 from __future__ import annotations
 
+import atexit
 import datetime as dt
 import json
 import os
+import shlex
+import shutil
 import sys
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from conftest import FIXED_NOW
+
+if TYPE_CHECKING:
+    from kite_connect_mcp.events.service import EventService
 
 ORDER_ID = "250101000000001"
 
@@ -90,11 +96,13 @@ def _python_wrapper() -> str:
     """A consumer program for the tests: a tiny script in a private temp folder that runs this interpreter.
 
     The consumers file refuses a program in a folder others can write (events/trust.py check_owned_file), and the
-    interpreter of a virtualenv or a CI tool cache may sit in such a folder; a script in a mkdtemp folder never does."""
+    interpreter of a virtualenv or a CI tool cache may sit in such a folder; a script in a mkdtemp folder never does.
+    The folder is removed when the test run ends."""
     folder = tempfile.mkdtemp(prefix="kite-events-tests-")
+    atexit.register(shutil.rmtree, folder, True)
     path = os.path.join(folder, "python")
     with open(path, "w", encoding="utf-8") as handle:
-        handle.write(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        handle.write(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
     os.chmod(path, 0o700)
     return path
 
@@ -129,9 +137,10 @@ def make_service(
     tag_labels: dict[str, str] | None = None,
     clock: Callable[[], dt.datetime] | None = None,
     **env: str | None,
-):
+) -> tuple[EventService, Any]:
     """(service, runtime): an EventService on a runtime wired to FakeKite, with its store in tmp_path. The runtime is
-    built with KITE_MCP_EVENTS off, so nothing else creates a service on the same store."""
+    built with KITE_MCP_EVENTS off, so nothing else creates a service on the same store. The caller closes the store;
+    the service_factory fixture (conftest.py) does it at teardown."""
     from kite_connect_mcp.events.service import EventService
 
     env.setdefault("KITE_MCP_EVENTS_DB", str(tmp_path / "events.sqlite3"))

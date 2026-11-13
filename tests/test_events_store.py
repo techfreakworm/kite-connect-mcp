@@ -13,7 +13,7 @@ import pytest
 from conftest import FIXED_NOW
 from events_helpers import ORDER_ID, filled_row, order_row
 from kite_connect_mcp.events.model import OrderView, judge, order_event, session_event
-from kite_connect_mcp.events.store import MAX_EVENTS_LIMIT, EventStore, StoreError
+from kite_connect_mcp.events.store import MAX_EVENTS_LIMIT, EventStore, StoreError, iso
 
 
 @pytest.fixture
@@ -81,6 +81,7 @@ def test_doorbells(store):
     assert store.doorbells()[0] == (ORDER_ID, 1)
     store.doorbell_done(ORDER_ID)
     assert store.doorbells() == [("250101000000002", 0)]
+    assert store.counters()["postback_accepted"]["count"] == 3  # every ring is counted, a repeat too
 
 
 def test_counters(store):
@@ -380,6 +381,30 @@ def test_a_nested_write_is_refused_and_rolls_back_the_block(store):
     assert store.previous(ORDER_ID) is None and store.counters() == {}
     store.bump("postback_refused", FIXED_NOW)  # the store still works
     assert store.counters()["postback_refused"]["count"] == 1
+
+
+def test_a_counter_bumped_inside_a_write_is_kept_or_rolled_back_with_the_block(store):
+    with store.write() as con:
+        store.bump("selftest_received", FIXED_NOW, con=con)
+        store.bump("selftest_received", FIXED_NOW, "a note", con=con)
+    assert store.counters()["selftest_received"] == {"count": 2, "last_at": iso(FIXED_NOW), "note": "a note"}
+
+    def failing_block():
+        with store.write() as con:
+            store.bump("selftest_received", FIXED_NOW, con=con)
+            raise RuntimeError("the rest of the block failed")
+
+    with pytest.raises(RuntimeError):
+        failing_block()
+    assert store.counters()["selftest_received"]["count"] == 2
+
+
+def test_a_ring_that_cannot_be_counted_keeps_no_doorbell(store):
+    with store.write() as con:
+        con.execute("DROP TABLE counters")
+    with pytest.raises(StoreError):
+        store.ring(ORDER_ID, FIXED_NOW)
+    assert store.doorbells() == []
 
 
 def test_events_limit_is_bounded(store):

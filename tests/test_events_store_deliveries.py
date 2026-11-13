@@ -194,6 +194,25 @@ def test_the_summary_of_an_empty_store(store):
     assert out["counters"] == {} and out["baseline_done"] is None and out["after_close_ok"] is None
 
 
+def test_the_summary_lists_the_consumers_it_is_given_even_with_no_deliveries(store):
+    add(store, "1", 100, consumers=("notify",))
+    store.finish_delivery("notify", 1, "done", T0)
+    consumers = store.summary(["quiet", "notify"])["consumers"]
+    assert list(consumers) == ["quiet", "notify"]  # in the order given
+    assert consumers["quiet"] == {
+        "pending": 0,
+        "retrying": 0,
+        "delayed": 0,
+        "failed": 0,
+        "done": 0,
+        "skipped": 0,
+        "last_done_at": None,
+        "last_error": None,
+    }
+    assert consumers["notify"]["done"] == 1
+    assert list(store.summary()["consumers"]) == ["notify"]
+
+
 def test_the_summary_details_and_a_read_only_store(store):
     for order_id in ("1", "2", "3", "4"):
         add(store, order_id, 100)

@@ -23,7 +23,7 @@ import json
 import os
 import sqlite3
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -97,6 +97,15 @@ def _body(row: sqlite3.Row) -> dict[str, Any]:
     body: dict[str, Any] = json.loads(row["body"])
     body["seq"] = row["seq"]
     return body
+
+
+def _bump(con: sqlite3.Connection, name: str, now: dt.datetime, note: str | None = None) -> None:
+    """Add one to counter `name` in the write that `con` belongs to. A new `note` replaces the last; None keeps it."""
+    con.execute(
+        "INSERT INTO counters (name, value, last_at, note) VALUES (?, 1, ?, ?) ON CONFLICT(name) DO UPDATE SET "
+        "value = counters.value + 1, last_at = excluded.last_at, note = coalesce(excluded.note, counters.note)",
+        (name, iso(now), note),
+    )
 
 
 def _schema_version(con: sqlite3.Connection) -> str | None:
@@ -365,12 +374,15 @@ class EventStore:
     # --- doorbells ------------------------------------------------------------------------------------------------
 
     def ring(self, order_id: str, now: dt.datetime) -> None:
+        """Keep a doorbell for `order_id` (one per order, however often it rings) and count the ring in
+        `postback_accepted`, in one transaction: on a StoreError neither is kept."""
         with self.write() as con:
             con.execute(
                 "INSERT INTO doorbells (order_id, first_rung_at, tries) VALUES (?, ?, 0) "
                 "ON CONFLICT(order_id) DO NOTHING",
                 (order_id, iso(now)),
             )
+            _bump(con, "postback_accepted", now)
 
     def doorbells(self) -> list[tuple[str, int]]:
         """(order_id, tries), oldest first."""
@@ -387,13 +399,16 @@ class EventStore:
 
     # --- counters -------------------------------------------------------------------------------------------------
 
-    def bump(self, name: str, now: dt.datetime, note: str | None = None) -> None:
-        with self.write() as con:
-            con.execute(
-                "INSERT INTO counters (name, value, last_at, note) VALUES (?, 1, ?, ?) ON CONFLICT(name) DO UPDATE SET "
-                "value = counters.value + 1, last_at = excluded.last_at, note = coalesce(excluded.note, counters.note)",
-                (name, iso(now), note),
-            )
+    def bump(
+        self, name: str, now: dt.datetime, note: str | None = None, *, con: sqlite3.Connection | None = None
+    ) -> None:
+        """Add one to counter `name`. A new `note` replaces the last one; None keeps it. With `con`, inside that
+        write(), so the count is kept or rolled back with what the block writes; without, in a write of its own."""
+        if con is not None:
+            _bump(con, name, now, note)
+            return
+        with self.write() as own:
+            _bump(own, name, now, note)
 
     def counters(self) -> dict[str, dict[str, Any]]:
         rows = self._read("SELECT name, value, last_at, note FROM counters ORDER BY name")
@@ -527,13 +542,15 @@ class EventStore:
 
     # --- status ---------------------------------------------------------------------------------------------------
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self, consumers: Iterable[str] = ()) -> dict[str, Any]:
         """Counts for `events status` (no payloads): deliveries per consumer, doorbells, counters, the last seq.
-        `pending` counts every pending delivery, the retrying ones too; `retrying` and `delayed` are subsets of it."""
-        consumers: dict[str, dict[str, Any]] = {}
+        `pending` counts every pending delivery, the retrying ones too; `retrying` and `delayed` are subsets of it.
+        Each consumer named in `consumers` (the configured ones) is listed first, in that order, with zeros when it has
+        no deliveries yet; a consumer with deliveries but no longer configured follows."""
+        listed: dict[str, dict[str, Any]] = {}
 
         def entry(name: str) -> dict[str, Any]:
-            return consumers.setdefault(
+            return listed.setdefault(
                 name,
                 {
                     "pending": 0,
@@ -547,6 +564,8 @@ class EventStore:
                 },
             )
 
+        for name in consumers:
+            entry(name)
         for r in self._read(
             "SELECT consumer, status, attempts > 0 AS retrying, delayed_sent, count(*) AS n FROM deliveries "
             "GROUP BY consumer, status, retrying, delayed_sent"
@@ -573,7 +592,7 @@ class EventStore:
             "doorbells_waiting": len(self.doorbells()),
             "baseline_done": self.meta("baseline_done"),
             "after_close_ok": self.meta("after_close_ok"),
-            "consumers": consumers,
+            "consumers": listed,
             "paused": self.paused(),
         }
 

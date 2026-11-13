@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import pytest
 
 from conftest import FIXED_NOW
 from events_helpers import ORDER_ID, PY, Clock, filled_row, make_service, order_row
 from kite_connect_mcp.errors import ConfigError
-from kite_connect_mcp.events.model import digest
-from kite_connect_mcp.events.store import StoreError
+from kite_connect_mcp.events.model import OrderView, order_event
+from kite_connect_mcp.events.service import REFUSALS
+from kite_connect_mcp.events.store import StoreError, iso
+from kite_connect_mcp.timeutil import IST
 
 NOTIFY = {
     "name": "notify",
@@ -20,11 +23,13 @@ NOTIFY = {
 FILLS = {"name": "fills", "command": [PY, "-c", "pass"], "match": {"changes": ["filled"], "tags": ["mytag"]}}
 
 
+SELFTEST_ID = "selftest-0a1b2c3d4e5f"
+
+
 @pytest.fixture
-def svc(runtime_factory, tmp_path):
-    service, _ = make_service(runtime_factory, tmp_path, consumers=[NOTIFY, FILLS], tag_labels={"mytag": "my strategy"})
-    yield service
-    service.store.close()
+def svc(service_factory):
+    service, _ = service_factory(consumers=[NOTIFY, FILLS], tag_labels={"mytag": "my strategy"})
+    return service
 
 
 def deliveries(svc, consumer):
@@ -136,11 +141,7 @@ def test_ring_and_refused(svc):
     assert svc.store.doorbells() == [(ORDER_ID, 0)]
     assert svc.store.counters()["postback_accepted"]["count"] == 1
     svc.refused("bad checksum")
-    assert svc.store.counters()["postback_refused"] == {
-        "count": 1,
-        "last_at": svc.store.counters()["postback_refused"]["last_at"],
-        "note": "bad checksum",
-    }
+    assert svc.store.counters()["postback_refused"] == {"count": 1, "last_at": iso(FIXED_NOW), "note": "bad checksum"}
 
 
 def test_listeners_are_told_about_new_events_and_doorbells(svc):
@@ -170,7 +171,7 @@ def test_ring_fails_loudly_when_the_store_cannot_write(svc):
     svc.store.close()
     with pytest.raises(StoreError):
         svc.ring(ORDER_ID)
-    svc.refused("anything")  # never raises
+    svc.refused("bad checksum")  # never raises for the store
 
 
 def test_a_service_needs_a_store(runtime_factory, tmp_path):
@@ -178,47 +179,188 @@ def test_a_service_needs_a_store(runtime_factory, tmp_path):
         make_service(runtime_factory, tmp_path, KITE_MCP_EVENTS_DB=None)
 
 
-def test_the_account_pin(runtime_factory, tmp_path):
-    open_svc, _ = make_service(runtime_factory, tmp_path / "a")
+def test_the_account_pin(service_factory, tmp_path):
+    open_svc, _ = service_factory(tmp_path / "a")
     assert open_svc.user_allowed("ZZ9999") and open_svc.user_allowed(None)
-    pinned, _ = make_service(runtime_factory, tmp_path / "b", KITE_MCP_ALLOWED_USER_ID="ab1234")
+    pinned, _ = service_factory(tmp_path / "b", KITE_MCP_ALLOWED_USER_ID="ab1234")
     assert pinned.user_allowed("AB1234") and pinned.user_allowed(" ab1234 ")
     assert not pinned.user_allowed("ZZ9999") and not pinned.user_allowed(None) and not pinned.user_allowed(5)
-    open_svc.store.close()
-    pinned.store.close()
 
 
-def test_the_status(runtime_factory, tmp_path):
+def test_the_status(service_factory):
     clock = Clock()
-    svc, _ = make_service(runtime_factory, tmp_path, consumers=[NOTIFY], clock=clock)
-    svc.ingest_order(order_row(), source="poll")
+    svc, _ = service_factory(consumers=[NOTIFY], clock=clock)
+    seq = svc.ingest_order(order_row(), source="poll")
     out = svc.status()
     assert out["consumers"]["notify"]["pending"] == 1
     assert out["configured_consumers"] == ["notify"]
     assert out["store"] == str(svc.store.path)
-    assert digest("x") not in str(out)
+    shown = json.dumps(out)
+    assert ORDER_ID not in shown and svc.store.event(seq)["event_id"] not in shown  # no ids of orders or events
     assert out["poll"] == {"interval_s": 60, "window": "09:00-16:00", "days": [0, 1, 2, 3, 4], "in_window_now": True}
-    assert "warning" not in out
-    svc.store.close()
+    assert "warning" not in out  # the service has not polled yet: no close was missed
 
 
-def test_the_status_lists_a_configured_consumer_with_no_deliveries_yet(runtime_factory, tmp_path):
-    svc, _ = make_service(runtime_factory, tmp_path, consumers=[NOTIFY, FILLS])
+def test_the_status_lists_a_configured_consumer_with_no_deliveries_yet(service_factory):
+    svc, _ = service_factory(consumers=[NOTIFY, FILLS])
     svc.ingest_order(order_row(), source="poll")  # for notify only
     out = svc.status()
     assert out["configured_consumers"] == ["notify", "fills"]
     assert out["consumers"]["fills"]["pending"] == 0 and out["consumers"]["fills"]["last_error"] is None
-    svc.store.close()
 
 
-def test_the_status_warns_when_no_poll_succeeded_after_the_close(runtime_factory, tmp_path):
-    clock = Clock(FIXED_NOW.replace(hour=16, minute=30))  # a Wednesday, after the poll window
-    svc, _ = make_service(runtime_factory, tmp_path, clock=clock)
+def at(day: int, hour: int, minute: int = 0) -> dt.datetime:
+    """A moment of November 2026 in IST: the 4th is a Wednesday, the 6th a Friday, the 9th a Monday."""
+    return dt.datetime(2026, 11, day, hour, minute, tzinfo=IST)
+
+
+def test_the_status_warns_when_no_poll_succeeded_after_the_close(service_factory):
+    clock = Clock(at(4, 16, 30))  # a Wednesday, after the poll window
+    svc, _ = service_factory(clock=clock)
+    svc.store.set_meta("baseline_done", "2026-11-04")  # the service polled today
     out = svc.status()
     assert not out["poll"]["in_window_now"]
-    assert "no successful poll after the close" in out["warning"]
+    assert out["warning"] == (
+        "no successful poll after the close on Wed 2026-11-04: fills after the last poll may be missing"
+    )
     svc.store.set_meta("after_close_ok", "2026-11-04")
     assert "warning" not in svc.status()
-    clock.now = dt.datetime(2026, 11, 7, 17, 0, tzinfo=FIXED_NOW.tzinfo)  # a Saturday: no poll is due
+    clock.now = at(7, 17)  # a Saturday: Friday's close is the last one, and no poll after it succeeded
+    assert "Fri 2026-11-06" in svc.status()["warning"]
+
+
+def test_a_missed_friday_close_stays_in_the_warning_until_a_later_close_is_polled(service_factory):
+    clock = Clock()
+    svc, _ = service_factory(clock=clock)
+    svc.store.set_meta("baseline_done", "2026-11-02")
+    svc.store.set_meta("after_close_ok", "2026-11-05")  # Thursday's after-close poll worked, Friday's did not
+    friday = "no successful poll after the close on Fri 2026-11-06: fills after the last poll may be missing"
+    clock.now = at(6, 15, 59)  # Friday, before its window closes: Thursday's close is the last one, and it was polled
     assert "warning" not in svc.status()
-    svc.store.close()
+    for moment in (at(6, 16), at(6, 17), at(7, 12), at(8, 23, 59), at(9, 0, 1), at(9, 10), at(9, 15, 59)):
+        clock.now = moment  # Friday after the close, the weekend, Monday until its own window closes
+        assert svc.status().get("warning") == friday, moment
+    clock.now = at(9, 16)  # Monday's window has closed: Monday's after-close poll is the one missing now
+    assert "Mon 2026-11-09" in svc.status()["warning"]
+    svc.store.set_meta("after_close_ok", "2026-11-09")
+    assert "warning" not in svc.status()
+    clock.now = at(9, 10)
+    svc.store.set_meta("after_close_ok", "2026-11-06")  # had Friday's poll worked, Monday morning would be quiet
+    assert "warning" not in svc.status()
+
+
+def test_the_warning_follows_the_configured_poll_days(service_factory):
+    clock = Clock(at(4, 10))  # a Wednesday, inside the window
+    svc, _ = service_factory(clock=clock, KITE_MCP_ORDER_POLL_DAYS="mon,wed,fri")
+    svc.store.set_meta("baseline_done", "2026-10-26")
+    svc.store.set_meta("after_close_ok", "2026-10-30")  # the Friday before
+    assert "Mon 2026-11-02" in svc.status()["warning"]  # Tuesday is not a poll day: Monday's close is the last one
+    svc.store.set_meta("after_close_ok", "2026-11-02")
+    assert "warning" not in svc.status()
+
+
+def test_no_warning_before_the_service_has_polled(service_factory):
+    svc, _ = service_factory(clock=Clock(at(6, 17)))
+    assert svc.store.meta("baseline_done") is None and svc.store.meta("after_close_ok") is None
+    assert "warning" not in svc.status()
+
+
+# --- each counter is written with what it counts --------------------------------------------------------------------
+
+
+def drop_table(svc, table):
+    with svc.store.write() as con:
+        con.execute(f"DROP TABLE {table}")
+
+
+def count_rows(svc, table):
+    return svc.store._read(f"SELECT count(*) FROM {table}")[0][0]
+
+
+@pytest.mark.parametrize("table", ["counters", "doorbells"])
+def test_a_ring_keeps_its_doorbell_and_its_count_together_or_neither(svc, table):
+    rung = []
+    svc.on_doorbell(lambda: rung.append(1))
+    drop_table(svc, table)
+    with pytest.raises(StoreError):
+        svc.ring(ORDER_ID)
+    assert rung == []
+    if table != "doorbells":
+        assert svc.store.doorbells() == []  # a StoreError means nothing was kept
+    if table != "counters":
+        assert "postback_accepted" not in svc.store.counters()
+
+
+@pytest.mark.parametrize("table", ["counters", "events"])
+def test_a_selftest_is_counted_and_stored_together_or_neither(svc, table):
+    told = []
+    svc.on_event(lambda: told.append(1))
+    drop_table(svc, table)
+    with pytest.raises(StoreError):
+        svc.record_selftest(SELFTEST_ID)
+    assert told == []
+    if table != "events":
+        assert count_rows(svc, "events") == 0
+    if table != "counters":
+        assert "selftest_received" not in svc.store.counters()
+
+
+def test_a_repeated_selftest_is_counted_each_time_and_stored_once(svc):
+    """selftest_received counts verified selftest postbacks, as postback_accepted counts every ring."""
+    told = []
+    svc.on_event(lambda: told.append(1))
+    assert svc.record_selftest(SELFTEST_ID) == 1
+    assert svc.record_selftest(SELFTEST_ID) is None
+    assert svc.store.counters()["selftest_received"]["count"] == 2
+    assert svc.store.last_seq() == 1 and told == [1]
+
+
+def test_a_selftest_with_a_bad_id_raises_and_counts_nothing(svc):
+    for bad in (ORDER_ID, "selftest-", "selftest-no good"):
+        with pytest.raises(ValueError, match="self-test"):
+            svc.record_selftest(bad)
+    assert "selftest_received" not in svc.store.counters() and svc.store.last_seq() == 0
+
+
+@pytest.mark.parametrize("bad", ["", "no good", "../orders", "x" * 65, None, 5])
+def test_ring_refuses_what_is_not_an_order_id(svc, bad):
+    rung = []
+    svc.on_doorbell(lambda: rung.append(1))
+    with pytest.raises(ValueError, match="order id"):
+        svc.ring(bad)
+    assert svc.store.doorbells() == [] and "postback_accepted" not in svc.store.counters() and rung == []
+
+
+def test_refused_takes_only_the_known_reasons(svc):
+    assert REFUSALS == (
+        "no API secret",
+        "body over the cap",
+        "body not JSON",
+        "body not a JSON object",
+        "bad checksum",
+        "bad order id",
+        "another account",
+    )
+    for reason in REFUSALS:
+        svc.refused(reason)
+    with pytest.raises(ValueError, match="REFUSALS"):
+        svc.refused("user AB1234 sent this")  # text from a request never reaches the status
+    out = svc.store.counters()["postback_refused"]
+    assert out["count"] == len(REFUSALS) and out["note"] == "another account"
+
+
+def test_an_event_stored_already_brings_the_order_state_up_to_date(svc):
+    """judge() drops a change reported twice; an event with the same id is found only when the order's state row is
+    behind its events, and then the state catches up."""
+    view = OrderView.from_row(order_row())
+    body = order_event(view, change="placed", source="poll", received_at=FIXED_NOW, tag_labels={}, previous_event_id="")
+    with svc.store.write() as con:
+        svc.store.insert_event(con, body, order_id=ORDER_ID, consumers=[], order_key=ORDER_ID, now=FIXED_NOW)
+    assert svc.store.previous(ORDER_ID) is None
+    told = []
+    svc.on_event(lambda: told.append(1))
+    assert svc.ingest_order(order_row(), source="poll") is None
+    assert svc.store.previous(ORDER_ID).event_id == body["event_id"]
+    assert svc.store.last_seq() == 1 and told == []
+    seq = svc.ingest_order(filled_row(), source="poll")  # the next change chains to that event
+    assert svc.store.event(seq)["change"] == "filled"

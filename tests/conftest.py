@@ -5,6 +5,7 @@ Kite call goes to FakeKite, an in-memory stand-in for api.kite.trade.
     settings_factory    Settings from a test environment (temporary state/cache dirs, a valid token file)
     runtime_factory     a Runtime wired to fake_kite, with a fixed clock and no real sleeping
     mcp_factory         (server, registrar, runtime) for in-process MCP tests via `mcp.Client(server)`
+    service_factory     (event service, runtime) from tests/events_helpers.py make_service; closes its stores
 """
 
 from __future__ import annotations
@@ -226,6 +227,25 @@ def mcp_factory(runtime_factory):
         return server, reg, rt
 
     return make
+
+
+@pytest.fixture
+def service_factory(runtime_factory, tmp_path: Path):
+    """make_service (tests/events_helpers.py) in `folder` (tmp_path by default), with the store of every service it
+    made closed at teardown. A failed assert would otherwise leave the SQLite connection open, and on Python 3.13 its
+    ResourceWarning hides the real failure."""
+    from events_helpers import make_service
+
+    made: list[Any] = []
+
+    def make(folder: Path | None = None, **kwargs: Any) -> tuple[Any, Any]:
+        service, rt = make_service(runtime_factory, folder or tmp_path, **kwargs)
+        made.append(service)
+        return service, rt
+
+    yield make
+    for service in made:
+        service.store.close()
 
 
 def tool_text(result: Any) -> str:
