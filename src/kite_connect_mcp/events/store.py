@@ -181,8 +181,10 @@ class EventStore:
 
     def _open(self, timeout_s: float) -> sqlite3.Connection:
         if self.readonly:
-            if not self.path.exists():
-                raise StoreError(f"no event store at {self.path} (has the event service run?)")
+            try:  # not Path.exists(): a folder it cannot enter is an OSError (cannot open), not a missing store
+                self.path.stat()
+            except (FileNotFoundError, NotADirectoryError):
+                raise StoreError(f"no event store at {self.path} (has the event service run?)") from None
             con = sqlite3.connect(
                 f"{self.path.resolve().as_uri()}?mode=ro",
                 uri=True,

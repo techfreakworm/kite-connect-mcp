@@ -276,7 +276,7 @@ def test_status_verify_closes_the_client_in_its_own_loop(no_service, capsys, mon
 def test_tools_does_not_build_the_event_service(no_service, capsys):
     assert cli.main(["tools"]) == 0
     out = capsys.readouterr().out
-    assert "get_order_events" in out and "(hidden: the event store" in out  # no store yet: hidden, and not created
+    assert "get_order_events" in out and "(hidden: no event store at" in out  # no store yet: hidden, and not created
     assert not _store_path(no_service).exists()
 
 

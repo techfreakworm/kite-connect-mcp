@@ -94,9 +94,12 @@ class Runtime:
             if self.ticker is not None:
                 await self.ticker.stop()
             await self.client.aclose()
-        finally:
-            for close in self.closers:
-                close()
+        finally:  # newest first, each on its own: one that fails neither skips the rest nor hides an error above
+            for close in reversed(self.closers):
+                try:
+                    close()
+                except Exception:
+                    log.exception("closing what a tool module opened failed")
 
 
 @dataclass(frozen=True)

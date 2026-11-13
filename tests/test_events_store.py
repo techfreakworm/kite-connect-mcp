@@ -142,6 +142,21 @@ def test_a_read_only_store(store, tmp_path):
     reader.close()
     with pytest.raises(StoreError, match="no event store"):
         EventStore(tmp_path / "missing.sqlite3", readonly=True)
+    (tmp_path / "a-file").write_text("")
+    with pytest.raises(StoreError, match="no event store"):
+        EventStore(tmp_path / "a-file" / "events.sqlite3", readonly=True)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can enter any folder")
+def test_a_store_in_a_folder_it_cannot_enter_is_out_of_reach_not_missing(store):
+    """Path.exists() raises here on Python 3.12 and says False on 3.13: neither must read as "no event store"."""
+    store.close()
+    store.path.parent.chmod(0)
+    try:
+        with pytest.raises(StoreError, match=r"cannot open the event store .*Permission denied"):
+            EventStore(store.path, readonly=True)
+    finally:
+        store.path.parent.chmod(0o700)
 
 
 def test_a_write_that_fails_is_a_store_error(store):

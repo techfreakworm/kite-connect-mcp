@@ -2,8 +2,9 @@
 
 In the serving process (KITE_MCP_EVENTS=true) the tools read the service's own store. Any other MCP process (a stdio
 client, say) can read the same store read-only by naming it in KITE_MCP_EVENTS_DB; that store is opened once, when the
-tools are registered, and closed with the runtime. Without a store the tools are hidden, and say why. They only read a
-local file: they never call Kite and never change anything."""
+tools are registered, and closed with the runtime. Such a reader shows no poll status: that comes from the serving
+process's settings. Without a store the tools are hidden, and say why; a store that is missing or cannot be opened
+hides these two tools, never the server. They only read a local file: they never call Kite and never change anything."""
 
 from __future__ import annotations
 
@@ -19,17 +20,17 @@ from ._base import Registrar, Runtime, require
 LOCAL_READ = ToolAnnotations(read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 TOOLS = ("get_order_events", "get_event_status")
 MAX_EVENTS = 200
+MAX_SEQ = 2**63 - 1  # SQLite's largest integer
 
 
 def _store_of(rt: Runtime) -> tuple[EventStore | None, str]:
-    """(the store the tools read, "") or (None, why there is none). A store opened here is closed by rt.aclose()."""
+    """(the store the tools read, "") or (None, why there is none). A store opened here is closed by rt.aclose().
+    EventStore says why it cannot open one (missing, out of reach, another schema version) as a StoreError."""
     settings = rt.settings
     if rt.events is not None:
         return rt.events.store, ""
     if settings.events_db is None:
         return None, "no event store: set KITE_MCP_EVENTS=true, or KITE_MCP_EVENTS_DB to read another server's store"
-    if not settings.events_db.exists():
-        return None, f"the event store {settings.events_db} does not exist yet (has the event service run?)"
     try:
         store = EventStore(settings.events_db, readonly=True)
     except StoreError as exc:
@@ -60,14 +61,18 @@ def register(reg: Registrar) -> None:
     ) -> Any:
         """Recent order events from the event store: fills, partial fills, cancellations, rejections, new and modified
         orders (from postbacks and the order-book poll), session events such as a rejected token, and delivery alerts.
-        Each event has a one-line `text`. Oldest first."""
+        Each event has a one-line `text`. Oldest first. `last_seq` is the seq of the newest event stored: to page
+        forward, pass the last event's seq as after_seq; a page that ends at last_seq is the last one."""
         require(1 <= limit <= MAX_EVENTS, f"limit must be between 1 and {MAX_EVENTS}")
-        require(after_seq >= 0, "after_seq must be 0 or more")
-        return {"events": store.events(order_id=order_id, after_seq=after_seq, limit=limit)}
+        require(0 <= after_seq <= MAX_SEQ, f"after_seq must be between 0 and {MAX_SEQ}")
+        events = store.events(order_id=order_id, after_seq=after_seq, limit=limit)
+        return {"events": events, "last_seq": store.last_seq()}  # read after the events: never below their seqs
 
     @reg.tool("get_event_status", title="Order event status", toolset="events", kind="read", annotations=LOCAL_READ)
     async def get_event_status() -> Any:
         """The health of the order events: the last postback and how many were refused, the last poll and its error,
-        doorbells waiting, each consumer's pending, delayed and failed deliveries, and paused consumers."""
-        names = [c.name for c in rt.events.config.consumers] if rt.events is not None else None
-        return describe_status(store, rt.settings, rt.clock(), names)
+        doorbells waiting, each consumer's pending, delayed and failed deliveries, and paused consumers. Only the
+        serving process shows its poll settings and the after-close warning."""
+        if rt.events is None:  # a reader: the poll settings that matter are the serving process's
+            return describe_status(store, rt.settings, rt.clock(), with_poll=False)
+        return describe_status(store, rt.settings, rt.clock(), [c.name for c in rt.events.config.consumers])

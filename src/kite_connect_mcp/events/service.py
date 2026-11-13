@@ -478,9 +478,17 @@ def _day_of(stamp: str | None) -> dt.date | None:
 
 
 def describe_status(
-    store: EventStore, settings: Settings, now: dt.datetime, consumer_names: list[str] | None = None
+    store: EventStore,
+    settings: Settings,
+    now: dt.datetime,
+    consumer_names: list[str] | None = None,
+    *,
+    with_poll: bool = True,
 ) -> dict[str, Any]:
     """What `events status` and `get_event_status` show. No payloads, no ids of orders.
+
+    `poll` and `warning` come from the poll settings in `settings`. A process that only reads another's store
+    (with_poll=False) may not share them, so it leaves both out and points to the serving process instead.
 
     `warning` is set while no poll has succeeded after the most recent close of the poll window (meta after_close_ok
     is older than last_closed_poll_day), so a failed Friday close stays visible over the weekend and on Monday until
@@ -491,6 +499,9 @@ def describe_status(
     out["store"] = str(store.path)
     if consumer_names is not None:
         out["configured_consumers"] = consumer_names
+    if not with_poll:
+        out["poll"] = "see the serving process's status"
+        return out
     start, end = settings.order_poll_window
     out["poll"] = {
         "interval_s": settings.order_poll_interval_s,
