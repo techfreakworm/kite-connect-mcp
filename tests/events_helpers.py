@@ -89,7 +89,7 @@ class Clock:
 def _python_wrapper() -> str:
     """A consumer program for the tests: a tiny script in a private temp folder that runs this interpreter.
 
-    The consumers file refuses a program in a folder others can write (events/consumers.py check_owned_file), and the
+    The consumers file refuses a program in a folder others can write (events/trust.py check_owned_file), and the
     interpreter of a virtualenv or a CI tool cache may sit in such a folder; a script in a mkdtemp folder never does."""
     folder = tempfile.mkdtemp(prefix="kite-events-tests-")
     path = os.path.join(folder, "python")
@@ -100,6 +100,16 @@ def _python_wrapper() -> str:
 
 
 PY = _python_wrapper()
+
+
+def folders(parent: Path, *names: str) -> list[Path]:
+    """New folders `names` in `parent`, each of mode 700 whatever the umask: the trust check (events/trust.py) refuses
+    a folder that a group others share can write, and umask 002 with such a group would make a bare mkdir() one."""
+    made = [parent / name for name in names]
+    for folder in made:
+        folder.mkdir()
+        folder.chmod(0o700)
+    return made
 
 
 def write_consumers(
