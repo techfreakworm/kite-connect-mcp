@@ -42,7 +42,11 @@ def build_runtime(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     limiter: RateLimiter | None = None,
     ticker_connect: Callable[..., Any] | None = None,
+    with_events: bool = True,
 ) -> Runtime:
+    """The runtime of one server process. `with_events=False` leaves the event service out even with
+    KITE_MCP_EVENTS=true: a command that only reads (`status`, `tools`) must not open, lock or create the store the
+    serving process owns. The events tools then read the store read-only, when it exists."""
     token_file = TokenFile(settings.token_file, writable=settings.auth_mode == "managed")
     tokens = TokenProvider(token_file=token_file, env_token=settings.access_token, clock=clock)
     client = KiteClient(settings, tokens, transport=transport, limiter=limiter or RateLimiter(sleep=sleep), sleep=sleep)
@@ -58,7 +62,7 @@ def build_runtime(
     rt.instruments = InstrumentStore(settings, client, clock=clock)
     rt.ticker = TickerManager(settings, tokens, clock=clock, connect=ticker_connect)
     rt.login = LoginManager(settings, client, tokens, audit, clock=clock)
-    if settings.events:  # a bad consumers file is a ConfigError here, so the server does not start
+    if settings.events and with_events:  # a bad consumers file is a ConfigError here, so the server does not start
         from .events.service import EventService
 
         rt.events = EventService(settings, client, tokens, clock=clock)

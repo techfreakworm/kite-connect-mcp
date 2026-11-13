@@ -1,4 +1,4 @@
-"""Command line: `kite-connect-mcp [serve|status|tools|check-config|login|logout|audit] ...`.
+"""Command line: `kite-connect-mcp [serve|status|tools|check-config|login|logout|audit|events] ...`.
 
 Logs go to stderr only: with the stdio transport, stdout carries the MCP protocol and nothing else.
 """
@@ -13,11 +13,14 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import __version__
 from .config import Settings, load_env_file, unknown_variables
 from .errors import ConfigError, KiteMCPError
+
+if TYPE_CHECKING:
+    from .events.store import EventStore
 
 log = logging.getLogger("kite_connect_mcp")
 
@@ -95,28 +98,29 @@ def cmd_status(args: argparse.Namespace) -> int:
     settings = _settings(args)
     from .server import build_runtime
 
-    rt = build_runtime(settings)
-    out: dict[str, Any] = {
-        "version": __version__,
-        "auth_mode": settings.auth_mode,
-        "token_file": str(settings.token_file),
-        "session": rt.tokens.status(),
-        "safety": rt.pipeline.limits(),
-        "today": rt.audit.usage().as_dict(),
-    }
-    if args.verify:
+    rt = build_runtime(settings, with_events=False)  # a status read never touches the serving process's store
 
-        async def verify() -> dict[str, Any]:
-            try:
-                profile = await rt.client.get("/user/profile")
-                return {"verified": True, "user_id": (profile or {}).get("user_id")}
-            except KiteMCPError as exc:
-                return {"verified": False, "error": rt.client.scrub(str(exc))}
-            finally:
-                await rt.client.aclose()
+    async def collect() -> dict[str, Any]:
+        try:
+            out: dict[str, Any] = {
+                "version": __version__,
+                "auth_mode": settings.auth_mode,
+                "token_file": str(settings.token_file),
+                "session": rt.tokens.status(),
+                "safety": rt.pipeline.limits(),
+                "today": rt.audit.usage().as_dict(),
+            }
+            if args.verify:
+                try:
+                    profile = await rt.client.get("/user/profile")
+                    out["live_check"] = {"verified": True, "user_id": (profile or {}).get("user_id")}
+                except KiteMCPError as exc:
+                    out["live_check"] = {"verified": False, "error": rt.client.scrub(str(exc))}
+            return out
+        finally:
+            await rt.aclose()  # in the loop the client ran in
 
-        out["live_check"] = asyncio.run(verify())
-    print(json.dumps(out, indent=2, default=str))
+    print(json.dumps(asyncio.run(collect()), indent=2, default=str))
     return 0
 
 
@@ -124,15 +128,18 @@ def cmd_tools(args: argparse.Namespace) -> int:
     settings = _settings(args)
     from .server import build_runtime, build_server
 
-    rt = build_runtime(settings)
-    server, reg = build_server(rt)
-    if args.markdown:
-        print(tools_markdown(server, reg))
-    else:
-        for info in reg.registered:
-            print(f"{info.name:28} {info.toolset:10} {info.kind:6} {info.title}")
-        for name, why in sorted(reg.skipped.items()):
-            print(f"{name:28} (hidden: {why})")
+    rt = build_runtime(settings, with_events=False)  # the events tools read an existing store read-only
+    try:
+        server, reg = build_server(rt)
+        if args.markdown:
+            print(tools_markdown(server, reg))
+        else:
+            for info in reg.registered:
+                print(f"{info.name:28} {info.toolset:10} {info.kind:6} {info.title}")
+            for name, why in sorted(reg.skipped.items()):
+                print(f"{name:28} (hidden: {why})")
+    finally:
+        asyncio.run(rt.aclose())  # the client was never used; this closes what the tool modules opened
     return 0
 
 
@@ -206,6 +213,60 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _open_store(settings: Settings, *, readonly: bool) -> EventStore:
+    """The event store by its path, never through build_runtime: these commands work while the service runs, and never
+    create a store."""
+    from .events.store import EventStore
+
+    path = settings.events_db
+    if path is None:
+        raise ConfigError("no event store: set KITE_MCP_EVENTS=true or KITE_MCP_EVENTS_DB")
+    if not path.exists():
+        raise ConfigError(f"no event store at {path} (has the event service run?)")
+    return EventStore(path, readonly=readonly)
+
+
+def cmd_events(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    action = args.events_command
+    if action == "selftest":
+        from .events import selftest
+
+        url = args.url or selftest.default_url(settings)
+        status = asyncio.run(selftest.send(url, selftest.build_payload(settings.require_api_secret())))
+        print(f"selftest: POST {url} -> HTTP {status}" + ("" if status == 200 else " (expected 200)"))
+        return 0 if status == 200 else 1
+    from .events.consumers import ConsumersConfig
+    from .events.service import describe_status
+    from .timeutil import now_ist
+
+    store = _open_store(settings, readonly=action in ("status", "tail"))
+    try:
+        if action == "status":
+            names = [c.name for c in ConsumersConfig.load(settings.events_consumers_file).consumers]
+            print(json.dumps(describe_status(store, settings, now_ist(), names), indent=2, default=str))
+            return 0
+        if action == "tail":
+            for event in store.events(order_id=args.order, limit=args.limit):
+                print(json.dumps(event, ensure_ascii=False))
+            return 0
+        known = {c.name for c in ConsumersConfig.load(settings.events_consumers_file).consumers}
+        known |= set(store.summary()["consumers"]) | set(store.paused())  # also one no longer configured
+        if args.consumer not in known:
+            raise ConfigError(f"unknown consumer {args.consumer!r} (known: {', '.join(sorted(known)) or 'none'})")
+        if action == "pause":
+            store.pause(args.consumer, now_ist())
+            print(f"paused {args.consumer}: events are still recorded; `resume` delivers them")
+        elif action == "resume":
+            skipped = store.resume(args.consumer, skip_backlog=args.skip_backlog, now=now_ist())
+            print(f"resumed {args.consumer}" + (f"; {skipped} waiting deliveries skipped" if args.skip_backlog else ""))
+        elif action == "retry":
+            print(f"{store.retry_failed(args.consumer, now_ist())} failed deliveries of {args.consumer} queued again")
+        return 0
+    finally:
+        store.close()
+
+
 def cmd_login(args: argparse.Namespace) -> int:
     settings = _settings(args)
     _setup_logging(settings.log_level)
@@ -273,6 +334,25 @@ def build_parser() -> argparse.ArgumentParser:
     logout = sub.add_parser("logout", help="managed mode: end the Kite session and delete the token file")
     logout.add_argument("--yes", action="store_true", help="really log out")
     logout.set_defaults(func=cmd_logout)
+
+    events = sub.add_parser("events", help="order events: status, recent events, pause/resume a consumer, selftest")
+    events_sub = events.add_subparsers(dest="events_command", required=True)
+    events_sub.add_parser("status", help="health of the postbacks, the poll and each consumer")
+    tail = events_sub.add_parser("tail", help="print recent events as JSON lines")
+    tail.add_argument("--limit", type=int, default=20)
+    tail.add_argument("--order", help="only this order's events")
+    for name, text in (
+        ("pause", "hold a consumer's deliveries (events are still recorded)"),
+        ("resume", "deliver a paused consumer's backlog"),
+        ("retry", "queue a consumer's failed deliveries again"),
+    ):
+        p = events_sub.add_parser(name, help=text)
+        p.add_argument("consumer")
+        if name == "resume":
+            p.add_argument("--skip-backlog", action="store_true", help="mark the waiting deliveries skipped instead")
+    st = events_sub.add_parser("selftest", help="post a signed synthetic postback and check the answer")
+    st.add_argument("--url", help="the postback URL (default: this server's own KITE_MCP_POSTBACK_PATH on loopback)")
+    events.set_defaults(func=cmd_events)
     return parser
 
 
