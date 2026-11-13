@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import grp
 import json
 import os
+import pwd
 import re
 import stat
 import sys
@@ -13,6 +15,7 @@ import pytest
 from conftest import FIXED_NOW
 from events_helpers import filled_row, order_row
 from kite_connect_mcp.errors import ConfigError
+from kite_connect_mcp.events import consumers as consumers_module
 from kite_connect_mcp.events.consumers import (
     DEFAULT_RETRY_DELAYS,
     Consumer,
@@ -261,12 +264,48 @@ def test_only_a_regular_file_is_read(tmp_path):
     refused(tmp_path, "is not a regular file")
 
 
-def test_a_file_others_can_write_is_refused(tmp_path):
+def groups_are(monkeypatch, *, private):
+    """Make every group private to its owner, or shared, whatever this machine's groups are. Returns the (gid, uid)
+    of every lookup made."""
+    lookups = []
+
+    def lookup(gid, uid):
+        lookups.append((gid, uid))
+        return private
+
+    monkeypatch.setattr(consumers_module, "_group_is_private", lookup)
+    return lookups
+
+
+def test_a_file_others_can_write_is_refused(tmp_path, monkeypatch):
+    groups_are(monkeypatch, private=False)
     refused(write(tmp_path, {"consumers": []}, mode=0o666), "run chmod go-w")
-    refused(write(tmp_path, {"consumers": []}, mode=0o620), "is writable by group or others (mode 620)")
+    path = write(tmp_path, {"consumers": []}, mode=0o620)
+    refused(path, f"is writable by its group, which is not private to its owner (mode 620); run chmod g-w {path}")
 
 
-def test_a_file_in_a_folder_others_can_write_is_refused_unless_the_folder_is_sticky(tmp_path):
+def test_a_file_its_private_group_can_write_is_accepted(tmp_path, monkeypatch):
+    lookups = groups_are(monkeypatch, private=True)
+    path = write(tmp_path, {"consumers": []}, mode=0o660)
+    assert ConsumersConfig.load(path).consumers == ()
+    info = os.stat(path)
+    assert (info.st_gid, info.st_uid) in lookups  # the file's own group and owner
+    refused(write(tmp_path, {"consumers": []}, mode=0o662), "is writable by group or others (mode 662)")
+    refused(write(tmp_path, {"consumers": []}, mode=0o606), "is writable by group or others (mode 606)")
+
+
+def test_the_sticky_bit_spares_a_folder_only(tmp_path, monkeypatch):
+    groups_are(monkeypatch, private=True)
+    path = write(tmp_path, {"consumers": []})
+    try:
+        path.chmod(0o1666)
+    except OSError:  # some systems refuse the sticky bit on a file
+        pytest.skip("this system does not set the sticky bit on a file")
+    refused(path, "is writable by group or others (mode 1666)")
+
+
+def test_a_file_in_a_folder_others_can_write_is_refused_unless_the_folder_is_sticky(tmp_path, monkeypatch):
+    groups_are(monkeypatch, private=False)
     folder = tmp_path / "open"
     folder.mkdir()
     path = write(folder, {"consumers": []})
@@ -276,6 +315,36 @@ def test_a_file_in_a_folder_others_can_write_is_refused_unless_the_folder_is_sti
     refused(path, f"the folder {folder} above the consumers file")
     folder.chmod(0o1777)  # like /tmp: others may add files but not replace this one
     assert ConsumersConfig.load(path).consumers == ()
+
+
+def test_a_folder_its_private_group_can_write_is_accepted(tmp_path, monkeypatch):
+    lookups = groups_are(monkeypatch, private=True)
+    folder = tmp_path / "home"  # like a folder made with Ubuntu's umask 002 in a group of the user's own
+    folder.mkdir()
+    path = write(folder, {"consumers": []})
+    folder.chmod(0o775)
+    assert ConsumersConfig.load(path).consumers == ()
+    info = os.stat(folder)
+    assert (info.st_gid, info.st_uid) in lookups  # the folder's own group and owner
+    folder.chmod(0o777)
+    refused(path, f"the folder {folder} above the consumers file {path} is writable by group or others (mode 777)")
+    folder.chmod(0o757)
+    refused(path, f"the folder {folder} above the consumers file {path} is writable by group or others (mode 757)")
+    folder.chmod(0o1777)
+    assert ConsumersConfig.load(path).consumers == ()
+
+
+def test_a_folder_a_shared_group_can_write_is_refused(tmp_path, monkeypatch):
+    groups_are(monkeypatch, private=False)
+    folder = tmp_path / "shared"
+    folder.mkdir()
+    path = write(folder, {"consumers": []})
+    folder.chmod(0o775)
+    refused(
+        path,
+        f"the folder {folder} above the consumers file {path} is writable by its group, which is not private to its "
+        f"owner (mode 775); run chmod g-w {folder}",
+    )
 
 
 def test_a_link_counts_where_it_is_and_where_it_points(tmp_path):
@@ -337,11 +406,110 @@ def test_a_program_others_can_change_is_refused(tmp_path):
     refused(with_program(tmp_path, link), f"consumer 'a': the folder {open_folder} above the program")
 
 
+def test_a_program_its_private_group_can_write_is_accepted_and_a_shared_one_refused(tmp_path, monkeypatch):
+    folder = tmp_path / "bin"
+    folder.mkdir()
+    folder.chmod(0o775)
+    program = notify_program(folder, mode=0o775)
+    groups_are(monkeypatch, private=True)
+    (c,) = ConsumersConfig.load(with_program(tmp_path, program)).consumers
+    assert c.command == (str(program),)
+    groups_are(monkeypatch, private=False)
+    refused(with_program(tmp_path, program), f"consumer 'a': the program {program} is writable by its group")
+    program.chmod(0o755)
+    refused(with_program(tmp_path, program), f"consumer 'a': the folder {folder} above the program")
+
+
 def test_a_link_to_a_trusted_program_is_accepted(tmp_path):
     link = tmp_path / "python"  # like a virtualenv's bin/python, a link to a system interpreter
     link.symlink_to(PROG)
     (c,) = ConsumersConfig.load(with_program(tmp_path, link)).consumers
     assert c.command == (str(link),)
+
+
+# --- whether a group is private to its owner ------------------------------------------------------------------------
+
+ME = ("me", 1000, 1000)  # (name, uid, primary gid): a user with a group of their own
+
+
+def accounts(monkeypatch, users, groups):
+    """Replace this machine's accounts: `users` are (name, uid, primary gid), `groups` map a gid to its
+    supplementary members. A uid or gid not listed is unknown (KeyError), as on a real machine."""
+    entries = [pwd.struct_passwd((n, "x", u, g, "", "/nonexistent", "/bin/sh")) for n, u, g in users]
+
+    def getpwuid(uid):
+        for entry in entries:
+            if entry.pw_uid == uid:
+                return entry
+        raise KeyError(uid)
+
+    def getgrgid(gid):
+        if gid not in groups:
+            raise KeyError(gid)
+        return grp.struct_group((f"g{gid}", "x", gid, list(groups[gid])))
+
+    monkeypatch.setattr(pwd, "getpwall", lambda: list(entries))
+    monkeypatch.setattr(pwd, "getpwuid", getpwuid)
+    monkeypatch.setattr(grp, "getgrgid", getgrgid)
+
+
+@pytest.mark.parametrize(
+    ("users", "members", "private"),
+    [
+        ([ME], [], True),  # Ubuntu's user-private group: the owner's primary group, no one else in it
+        ([ME], ["me"], True),  # the owner listed as a member too
+        ([ME, ("me-alias", 1000, 1000)], [], True),  # a second name for the same uid is the same user
+        ([ME, ("other", 1001, 1001)], ["other"], False),  # another user is a member
+        ([ME, ("other", 1001, 1001)], ["me", "other"], False),
+        ([ME, ("other", 1001, 1000)], [], False),  # another user has it as primary group
+        ([ME], ["ghost"], False),  # a member with no account is still someone else
+    ],
+    ids=["own", "owner-member", "alias", "member", "members", "other-primary", "unknown-member"],
+)
+def test_a_group_is_private_only_when_no_one_else_is_in_it(monkeypatch, users, members, private):
+    accounts(monkeypatch, users, {1000: members})
+    assert consumers_module._group_is_private(1000, 1000) is private
+
+
+def test_a_group_or_owner_that_cannot_be_looked_up_counts_as_shared(monkeypatch):
+    accounts(monkeypatch, [ME], {1000: []})
+    assert consumers_module._group_is_private(4242, 1000) is False  # no such group
+    assert consumers_module._group_is_private(1000, 4242) is False  # no such owner
+
+
+def test_the_folder_s_own_group_and_owner_are_looked_up(tmp_path, monkeypatch):
+    folder = tmp_path / "home"
+    folder.mkdir()
+    path = write(folder, {"consumers": []})
+    folder.chmod(0o775)
+    gid, uid = folder.stat().st_gid, folder.stat().st_uid
+    accounts(monkeypatch, [("me", uid, gid)], {gid: []})
+    assert ConsumersConfig.load(path).consumers == ()
+    accounts(monkeypatch, [("me", uid, gid), ("other", uid + 1, gid)], {gid: []})
+    refused(path, f"the folder {folder} above the consumers file {path} is writable by its group, which is not private")
+
+
+def _private_group(gid, uid):
+    """Whether no user but `uid` is in group `gid`, as a member or by primary group (an independent reckoning)."""
+    try:
+        group, owner = grp.getgrgid(gid), pwd.getpwuid(uid)
+    except KeyError:
+        return False
+    by_primary = {p.pw_name for p in pwd.getpwall() if p.pw_gid == gid and p.pw_uid != uid}
+    return not by_primary and set(group.gr_mem) <= {owner.pw_name}
+
+
+def test_the_real_lookup_of_my_own_primary_group():
+    uid = os.geteuid()
+    try:
+        me = pwd.getpwuid(uid)
+    except KeyError:  # a container user without an account: the owner cannot be looked up
+        assert consumers_module._group_is_private(os.getegid(), uid) is False
+        return
+    assert consumers_module._group_is_private(me.pw_gid, uid) is _private_group(me.pw_gid, uid)
+    if uid != 0:
+        root_group = pwd.getpwuid(0).pw_gid  # root's primary group: root is in it, so it is not private to me
+        assert consumers_module._group_is_private(root_group, uid) is False
 
 
 def _open_folders(path):
@@ -351,7 +519,8 @@ def _open_folders(path):
         folder = os.path.dirname(start)
         while True:
             info = os.stat(folder)
-            open_mode = info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX
+            writable = info.st_mode & 0o002 or (info.st_mode & 0o020 and not _private_group(info.st_gid, info.st_uid))
+            open_mode = writable and not info.st_mode & stat.S_ISVTX
             if open_mode or info.st_uid not in (os.geteuid(), 0):
                 found.append(folder)
             if os.path.dirname(folder) == folder:

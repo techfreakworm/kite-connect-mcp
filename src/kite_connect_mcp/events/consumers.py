@@ -24,14 +24,17 @@ The command is an argv list (no shell) whose program is an absolute path. Its ar
 (`ps`): put secrets in the environment instead. `env_pass` names variables of the service's own environment to pass on;
 the service's KITE_* variables are never passed. The commands run as the service's user, who can read its Kite token,
 so the file and each program must be regular files that only that user or root can change, in folders only they can
-change (a sticky folder such as /tmp is fine), like OpenSSH's StrictModes: see check_owned_file. A script given as an
-argument (["/usr/bin/python3", "/home/me/notify.py"]) is not checked: keep it writable by you or root only.
+change (a sticky folder such as /tmp is fine, and so is group write by a group of the owner's own), like OpenSSH's
+StrictModes: see check_owned_file. A script given as an argument (["/usr/bin/python3", "/home/me/notify.py"]) is not
+checked: keep it writable by you or root only.
 """
 
 from __future__ import annotations
 
+import grp
 import json
 import os
+import pwd
 import re
 import stat
 from collections.abc import Mapping, Sequence
@@ -185,7 +188,12 @@ def check_owned_file(path: str | os.PathLike[str], what: str) -> str | None:
     owned by this user or root and writable by no one else unless sticky (like /tmp, where others cannot replace a
     file they do not own). The folders are checked on the path as written and on the path with every link resolved,
     so a link in a folder anyone can write is refused like a file there. Not opening anything also means a FIFO
-    cannot make the caller wait."""
+    cannot make the caller wait.
+
+    Group write on the file or a folder is accepted when that one's group is private to its owner, as Debian's
+    OpenSSH relaxes StrictModes: Ubuntu and Debian give each user a group of their own, and their umask 002 makes the
+    user's folders group-writable (mode 775). See _group_is_private. Write by others is refused, unless the folder is
+    sticky."""
     written = os.path.abspath(path)
     try:
         real = os.path.realpath(written)
@@ -194,24 +202,18 @@ def check_owned_file(path: str | os.PathLike[str], what: str) -> str | None:
         return f"cannot read {what} {written}: {_reason(exc)}"
     if not stat.S_ISREG(info.st_mode):
         return f"{what} {written} is not a regular file"
-    problem = _owner_problem(info, f"{what} {written}")
+    problem = _owner_problem(info, f"{what} {written}") or _write_problem(info, f"{what} {written}", written)
     if problem is not None:
         return problem
-    mode = stat.S_IMODE(info.st_mode)
-    if mode & 0o022:
-        return f"{what} {written} is writable by group or others (mode {mode:o}); run chmod go-w {written}"
     for folder in dict.fromkeys([*_folders_above(written), *_folders_above(real)]):
         name = f"the folder {folder} above {what} {written}"
         try:
             info = os.stat(folder)
         except OSError as exc:
             return f"cannot check {name}: {_reason(exc)}"
-        problem = _owner_problem(info, name)
+        problem = _owner_problem(info, name) or _write_problem(info, name, folder)
         if problem is not None:
             return problem
-        mode = stat.S_IMODE(info.st_mode)
-        if mode & 0o022 and not mode & stat.S_ISVTX:
-            return f"{name} is writable by group or others (mode {mode:o}); run chmod go-w {folder}"
     return None
 
 
@@ -235,6 +237,37 @@ def _owner_problem(info: os.stat_result, name: str) -> str | None:
     if info.st_uid in (os.geteuid(), 0):
         return None
     return f"{name} is owned by uid {info.st_uid}, not by this user or root"
+
+
+def _write_problem(info: os.stat_result, name: str, path: str) -> str | None:
+    """Why someone other than its owner could change `path` (described as `name`) through its mode, or None."""
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISDIR(info.st_mode) and mode & stat.S_ISVTX:
+        return None  # a sticky folder: others may add files, not replace one they do not own
+    if mode & 0o002:
+        return f"{name} is writable by group or others (mode {mode:o}); run chmod go-w {path}"
+    if mode & 0o020 and not _group_is_private(info.st_gid, info.st_uid):
+        return (
+            f"{name} is writable by its group, which is not private to its owner (mode {mode:o}); run chmod g-w {path}"
+        )
+    return None
+
+
+def _group_is_private(gid: int, owner_uid: int) -> bool:
+    """Whether group `gid` is private to user `owner_uid`, as Ubuntu's and Debian's user-private groups are: its
+    supplementary members are none or only the owner's name, and no user of another uid has it as primary group. A
+    group or owner that cannot be looked up counts as shared.
+
+    Users the system does not list (a directory service set not to enumerate them) are not seen; Debian's OpenSSH
+    has the same limit."""
+    try:
+        members = grp.getgrgid(gid).gr_mem
+        owner = pwd.getpwuid(owner_uid).pw_name
+    except KeyError:
+        return False
+    if any(member != owner for member in members):
+        return False
+    return not any(user.pw_gid == gid and user.pw_uid != owner_uid for user in pwd.getpwall())
 
 
 def _folders_above(path: str) -> list[str]:
