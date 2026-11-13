@@ -331,6 +331,16 @@ def test_a_late_read_with_an_older_exchange_update_is_dropped(store):
     assert store.last_seq() == 2 and store.previous(ORDER_ID).state[3] == "1230"
 
 
+def test_a_state_saved_without_an_event_keeps_the_last_event_id(store):
+    """The id an order's next event chains to stays that of its last event: a state saved with event_id "" (as the
+    baseline is) does not blank it."""
+    assert ingest(store, order_row()) == 1
+    with store.write() as con:
+        store.save_state(con, OrderView.from_row(filled_row()), FIXED_NOW, event_id="")
+    stored = store.previous(ORDER_ID)
+    assert stored.event_id == store.event(1)["event_id"] and stored.final
+
+
 def test_a_state_recorded_without_an_event_has_no_event_id(store):
     view = OrderView.from_row(order_row())
     with store.write() as con:
@@ -388,8 +398,57 @@ def test_a_store_of_another_schema_version_is_refused(store):
 def test_a_read_only_open_of_a_file_without_the_schema_is_refused(tmp_path):
     path = tmp_path / "events.sqlite3"
     path.touch()
-    with pytest.raises(StoreError, match="has schema version none"):
+    with pytest.raises(StoreError, match=r"is not set up yet \(has the event service run\?\)"):
         EventStore(path, readonly=True)
+
+
+def test_a_database_that_is_not_an_event_store_is_not_taken_over(tmp_path):
+    """A file with tables but no schema version is someone else's: the store refuses it rather than add its tables."""
+    path = tmp_path / "events.sqlite3"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE notes (body TEXT)")
+    con.commit()
+    con.close()
+    before = path.read_bytes()
+    for readonly in (False, True):
+        with pytest.raises(StoreError, match="is not an event store: it has tables but no schema version"):
+            EventStore(path, readonly=readonly)
+    assert path.read_bytes() == before
+    assert not (tmp_path / "events.sqlite3-wal").exists()
+
+
+def test_a_new_store_is_set_up_in_one_transaction(tmp_path, monkeypatch):
+    """Its tables and its schema version are written together: a setup that fails before the version leaves no table,
+    so the next open sets the file up instead of refusing it as not an event store."""
+    path = tmp_path / "events.sqlite3"
+    real_connect = sqlite3.connect
+
+    class FailingAtTheVersion(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if sql.startswith("INSERT OR IGNORE INTO meta"):
+                raise sqlite3.OperationalError("disk I/O error")
+            return super().execute(sql, *args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", lambda *a, **k: real_connect(*a, **k, factory=FailingAtTheVersion))
+        with pytest.raises(StoreError, match="disk I/O error"):
+            EventStore(path)
+    con = real_connect(path)
+    try:
+        assert con.execute("SELECT count(*) FROM sqlite_master").fetchone() == (0,)
+    finally:
+        con.close()
+    store = EventStore(path)
+    try:
+        assert store.meta("schema_version") == "1"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("status", ["pending", "retrying", ""])
+def test_finish_delivery_takes_only_a_final_status(store, status):
+    with pytest.raises(ValueError, match="not a final delivery status"):
+        store.finish_delivery("notify", 1, status, FIXED_NOW)
 
 
 def test_an_event_that_breaks_a_rule_is_an_error_not_a_duplicate(store):

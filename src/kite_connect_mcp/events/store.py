@@ -13,7 +13,9 @@ mark_alerted) change only a pending delivery and say whether they did: a deliver
 ran (skipped by `events resume --skip-backlog`, removed by prune) is left as it is. A failure and its delivery_failed
 event, and an alert's mark and its delivery_delayed event, are written in one transaction by the event service.
 
-The file records its SCHEMA_VERSION in meta; a file of another version is refused when it is opened, not misread.
+The file records its SCHEMA_VERSION in meta, written in the same transaction as its tables; a file of another
+version, or a database with tables but no version (not an event store), is refused when it is opened, not misread or
+taken over.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from ..errors import KiteMCPError
 from ..timeutil import to_ist
@@ -85,6 +87,8 @@ CREATE TABLE IF NOT EXISTS paused (consumer TEXT PRIMARY KEY, since TEXT NOT NUL
 
 
 DoorbellDrop = Literal["doorbell_unknown_order", "doorbell_wrong_order", "doorbell_gave_up"]  # why, and its counter
+FinalStatus = Literal["done", "failed", "skipped"]  # a delivery's status once it is no longer pending
+FINAL_STATUSES: tuple[FinalStatus, ...] = get_args(FinalStatus)
 
 
 class StoreError(KiteMCPError):
@@ -119,11 +123,17 @@ def _bump(con: sqlite3.Connection, name: str, now: dt.datetime, note: str | None
 
 
 def _schema_version(con: sqlite3.Connection) -> str | None:
-    """The version a file records, None when it has no meta table yet (a new file) or no version in it."""
+    """The version a file records, None when it has no meta table (a new file, or not an event store) or no version
+    in it."""
     if con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone() is None:
         return None
     row = con.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     return None if row is None else str(row[0])
+
+
+def _is_empty(con: sqlite3.Connection) -> bool:
+    """True for a database with nothing in it: no table, index, view or trigger (a new file)."""
+    return con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
 
 
 @dataclass(frozen=True)
@@ -143,9 +153,10 @@ class Doorbell:
 @dataclass(frozen=True)
 class Delivery:
     """One consumer's pending delivery of one event (`seq`). `order_key` groups the deliveries that go one at a time
-    and in order. `attempts` counts the failed tries so far, `first_try_at` is when the first of them was made (None
-    before any), `next_try_at` when the delivery is due, `last_error` the last error a try gave. `delayed_sent` says
-    whether the delivery_delayed alert for it has been recorded (mark_alerted), so that alert is sent once."""
+    and in order. `attempts` counts the failed tries since the delivery was queued (retry_failed starts it
+    again at 0), `first_try_at` is when the first of them was made (None before any), `next_try_at` when the delivery
+    is due, `last_error` the last error a try gave. `delayed_sent` says whether the delivery_delayed alert for it has
+    been recorded (mark_alerted), so that alert is sent once."""
 
     consumer: str
     seq: int
@@ -218,24 +229,40 @@ class EventStore:
             con = sqlite3.connect(self.path, timeout=timeout_s, isolation_level=None, check_same_thread=False)
         try:
             con.row_factory = sqlite3.Row
-            version = _schema_version(con)
-            if (self.readonly or version is not None) and version != str(SCHEMA_VERSION):  # checked before any write
-                raise StoreError(
-                    f"the event store {self.path} has schema version {version or 'none'}; "
-                    f"this version of kite-connect-mcp needs {SCHEMA_VERSION}"
-                )
+            self._check_version(con)  # before any write
             if not self.readonly:
                 con.execute("PRAGMA journal_mode=WAL")
                 con.execute("PRAGMA synchronous=FULL")
-                con.executescript(SCHEMA)
+                # the tables and the version in one transaction: a crash between them would leave a file it refuses
+                con.execute("BEGIN IMMEDIATE")
+                for statement in SCHEMA.split(";"):  # not executescript(), which commits first
+                    if statement.strip():
+                        con.execute(statement)
                 con.execute(
                     "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
                 )
+                con.execute("COMMIT")
         except BaseException:
             with contextlib.suppress(sqlite3.Error):
                 con.close()
             raise
         return con
+
+    def _check_version(self, con: sqlite3.Connection) -> None:
+        """Refuse a file of another schema version, a database that is not an event store (tables, no version), and,
+        read-only, a file not set up yet (a read-write open sets up an empty one)."""
+        version = _schema_version(con)
+        if version == str(SCHEMA_VERSION):
+            return
+        if version is not None:
+            raise StoreError(
+                f"the event store {self.path} has schema version {version}; "
+                f"this version of kite-connect-mcp needs {SCHEMA_VERSION}"
+            )
+        if not _is_empty(con):
+            raise StoreError(f"the file {self.path} is not an event store: it has tables but no schema version")
+        if self.readonly:
+            raise StoreError(f"the event store {self.path} is not set up yet (has the event service run?)")
 
     def close(self) -> None:
         with self._lock, contextlib.suppress(sqlite3.Error):
@@ -313,13 +340,15 @@ class EventStore:
 
     def save_state(self, con: sqlite3.Connection, view: OrderView, now: dt.datetime, *, event_id: str) -> None:
         """Record the order's new state and the event that reported it (`event_id`, "" for a state recorded without an
-        event, as the baseline is). The next event of the order chains to that id, so it is required, never left out."""
+        event, as the baseline is). The next event of the order chains to that id, so it is required, never left out;
+        "" keeps the id of the order's last event, when it has one."""
         con.execute(
             "INSERT INTO order_state (order_id, state, final, filled, exchange_update_timestamp, event_id, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET state = excluded.state, "
             "final = excluded.final, filled = excluded.filled, exchange_update_timestamp = "
             "coalesce(excluded.exchange_update_timestamp, order_state.exchange_update_timestamp), "
-            "event_id = excluded.event_id, updated_at = excluded.updated_at",
+            "event_id = CASE WHEN excluded.event_id = '' THEN order_state.event_id ELSE excluded.event_id END, "
+            "updated_at = excluded.updated_at",
             (
                 view.order_id,
                 json.dumps(view.state()),
@@ -342,7 +371,8 @@ class EventStore:
         now: dt.datetime,
     ) -> int | None:
         """Store `body` and one pending delivery per consumer. None when an event with its event_id is stored
-        already; a body that breaks another rule (no kind or source) raises, and write() makes it a StoreError.
+        already; a body that breaks another rule (a kind or source of None) raises, and write() makes it a StoreError
+        (a body without one of them is a KeyError).
 
         The duplicate check is a NOT EXISTS, not OR IGNORE or ON CONFLICT DO NOTHING: those advance SQLite's
         AUTOINCREMENT counter even when they insert nothing, which would leave gaps in seq and a last_seq() that no
@@ -513,7 +543,7 @@ class EventStore:
         self,
         consumer: str,
         seq: int,
-        status: Literal["done", "failed", "skipped"],
+        status: FinalStatus,
         now: dt.datetime,
         error: str | None = None,
         *,
@@ -523,7 +553,7 @@ class EventStore:
         new `error` replaces the last one; None keeps it. False, with nothing changed, when the delivery is no longer
         pending: an operator's skip stays a skip even when the outcome of the try in flight lands after it. With
         `con`, inside that write(), so it is kept or rolled back with what the block writes."""
-        if status not in ("done", "failed", "skipped"):
+        if status not in FINAL_STATUSES:
             raise ValueError(f"not a final delivery status: {status!r}")
         sql = (
             "UPDATE deliveries SET status = ?, last_error = coalesce(?, last_error), updated_at = ? "

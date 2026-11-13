@@ -379,11 +379,22 @@ def clean_error_text(text: str) -> str:
     return _LINK_RE.sub("[link]", " ".join(text.split()))
 
 
+def clip_words(text: str, limit: int) -> str:
+    """`text` (clean, one line) cut to at most `limit` characters. A cut inside a word drops what is left of that word,
+    so a clipped text never ends in part of one ("[li" of a "[link]"); a text of one long word is cut inside it."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    if not text[limit].isspace() and " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip()
+
+
 def _clean_error(error: str | None) -> str | None:
     """A failed delivery's error, often a command's stderr: clean_error_text, clipped to MAX_ERROR_CHARS."""
     if not error:
         return None
-    return clean_error_text(error)[:MAX_ERROR_CHARS].rstrip() or None
+    return clip_words(clean_error_text(error), MAX_ERROR_CHARS) or None
 
 
 def router_event(

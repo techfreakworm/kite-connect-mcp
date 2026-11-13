@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, Any
 
 from ._wait import wait_any
 from .consumers import EXIT_RETRY, Consumer, consumer_env
-from .model import MAX_ERROR_CHARS, clean_error_text
+from .model import MAX_ERROR_CHARS, clean_error_text, clip_words
 from .store import Delivery
 from .trust import check_owned_file
 
@@ -268,7 +268,7 @@ class Router:
         # again now (a chmod since loading is caught), off the event loop: user and group lookups can be slow
         problem = await asyncio.to_thread(check_owned_file, consumer.command[0], "the program")
         if problem is not None:
-            return "failed", clean_error_text(problem)[:MAX_ERROR_CHARS]
+            return "failed", clip_words(clean_error_text(problem), MAX_ERROR_CHARS)
         try:
             proc = await self._spawn(
                 *consumer.command,

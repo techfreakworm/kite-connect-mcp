@@ -11,6 +11,7 @@ from conftest import FIXED_NOW
 from events_helpers import ORDER_ID, filled_row, order_row
 from kite_connect_mcp.events.model import (
     CHANGES,
+    MAX_ERROR_CHARS,
     OrderView,
     Previous,
     canonical,
@@ -367,6 +368,25 @@ def test_a_delivery_error_is_one_line_without_links():
         == "Delivery to notify failed: BUY 25 ABCD (NSE) placed: MARKET (exit 1: curl failed [link] retrying later)"
     )
     assert "example.com" not in json.dumps(failed)
+
+
+@pytest.mark.parametrize("pad", [194, 195, 196, 197, 198])
+def test_a_clipped_error_never_ends_in_part_of_a_word(pad):
+    """Clipped inside a word, an error drops what is left of that word: never "[li" from a "[link]"."""
+    about = {"seq": 1, "event_id": "e1", "kind": "order", "text": "BUY 25 ABCD (NSE) placed: MARKET"}
+    failed = router_event(
+        "delivery_failed",
+        consumer="notify",
+        about=about,
+        error="x" * pad + " https://hooks.example.com/T000/secret",
+        seed="t",
+        received_at=FIXED_NOW,
+    )
+    assert failed["error"] == "x" * pad
+    one_word = router_event(
+        "delivery_failed", consumer="notify", about=about, error="y" * 300, seed="t", received_at=FIXED_NOW
+    )
+    assert one_word["error"] == "y" * MAX_ERROR_CHARS  # one long word is cut, as there is no word end to cut at
 
 
 def test_a_link_is_removed_before_the_error_is_clipped():
