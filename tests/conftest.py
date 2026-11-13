@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import socket
 from collections.abc import Callable
 from pathlib import Path
@@ -165,6 +166,18 @@ def base_env(tmp_path: Path) -> dict[str, str]:
 
 
 @pytest.fixture
+def cli_env(base_env: dict[str, str], monkeypatch: pytest.MonkeyPatch):
+    """The environment a real `kite-connect-mcp` run sees; main() also lowers some log levels, so put them back."""
+    names = ("mcp", "httpx2", "httpcore2", "uvicorn.access", "websockets")
+    levels = {name: logging.getLogger(name).level for name in names}
+    for key, value in base_env.items():
+        monkeypatch.setenv(key, value)
+    yield base_env
+    for name, level in levels.items():
+        logging.getLogger(name).setLevel(level)
+
+
+@pytest.fixture
 def settings_factory(base_env: dict[str, str]) -> Callable[..., Settings]:
     def make(**overrides: str | None) -> Settings:
         env = dict(base_env)
@@ -215,9 +228,11 @@ def runtime_factory(fake_kite: FakeKite, settings_factory: Callable[..., Setting
         return rt
 
     yield make
-    for rt in created:  # the store of an event service (KITE_MCP_EVENTS=true), also when the test failed before stop()
+    # the store and lock of an event service (KITE_MCP_EVENTS=true), also when a test failed before stop()
+    for rt in created:
         if rt.events is not None:
             rt.events.store.close()
+            rt.events._release_lock()
 
 
 @pytest.fixture

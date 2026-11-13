@@ -1118,18 +1118,6 @@ async def test_cli_logout_in_external_mode_does_nothing(settings_factory, fake_k
     assert settings.token_file.exists() and fake_kite.requests == [] and kite.logouts == []
 
 
-@pytest.fixture
-def cli_env(base_env, monkeypatch):
-    """The environment a real `kite-connect-mcp` run sees; main() also lowers some log levels, so put them back."""
-    names = ("mcp", "httpx2", "httpcore2", "uvicorn.access", "websockets")
-    levels = {name: logging.getLogger(name).level for name in names}
-    for key, value in base_env.items():
-        monkeypatch.setenv(key, value)
-    yield base_env
-    for name, level in levels.items():
-        logging.getLogger(name).setLevel(level)
-
-
 def test_main_login_prints_only_the_link_on_stdout(cli_env, capsys):
     assert main(["login"]) == 0
     out, err = capsys.readouterr()

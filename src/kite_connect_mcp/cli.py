@@ -86,6 +86,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         proxy_headers=True,
         forwarded_allow_ips="127.0.0.1",
         timeout_graceful_shutdown=10,
+        lifespan="on",  # a startup that fails in any way (the event service) exits instead of serving without it
     )
     return 0
 

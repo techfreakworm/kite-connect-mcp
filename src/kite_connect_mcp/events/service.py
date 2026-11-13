@@ -111,6 +111,7 @@ class EventService:
         self._stop: asyncio.Event | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._lock_fd: int | None = None
+        self._stopped = False  # stop() closed the store: start() refuses from then on
 
     # --- listeners ------------------------------------------------------------------------------------------------
 
@@ -316,16 +317,20 @@ class EventService:
     # --- running --------------------------------------------------------------------------------------------------
 
     HOUSEKEEPING_S = 6 * 3600
+    STOP_TIMEOUT_S = 10  # how long stop() waits for the parts before it cancels them
 
     @property
     def running(self) -> bool:
+        """True between start() and stop()."""
         return bool(self._tasks)
 
     async def start(self) -> None:
         """Run the poll, the doorbell worker, the router and the housekeeping as tasks. Raises ConfigError when another
-        process already serves this store."""
+        process already serves this store, or when this service was stopped (stop() closed its store)."""
         if self._tasks:
             return
+        if self._stopped:
+            raise ConfigError("a stopped event service cannot be restarted: build a new one")
         self._take_lock()
         self._stop = asyncio.Event()
         jobs = {
@@ -335,22 +340,47 @@ class EventService:
             "housekeeping": self._housekeeping,
         }
         self._tasks = [asyncio.create_task(job(self._stop), name=f"kite-events-{name}") for name, job in jobs.items()]
+        for task in self._tasks:
+            task.add_done_callback(self._part_ended)
         log.info("order events: started, %d consumer(s)", len(self.config.consumers))
 
     async def stop(self) -> None:
-        """Stop the tasks (a part still busy after 10 s is cancelled; a consumer command still running is killed, and
-        its delivery stays pending for the next start), then release the lock and close the store. Calling it again,
-        or without start(), is harmless."""
-        if self._tasks and self._stop is not None:
-            self._stop.set()
-            _, pending = await asyncio.wait(self._tasks, timeout=10)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-            self._tasks = []
-            log.info("order events: stopped")
-        self._release_lock()
-        self.store.close()
+        """Stop the tasks (a part still busy after STOP_TIMEOUT_S is cancelled; a consumer command still running is
+        killed, and its delivery stays pending for the next server), then close the store and release the lock. A
+        stop() that is itself cancelled still cancels the parts, closes the store and releases the lock. Calling it
+        again, or without start(), is harmless; start() refuses afterwards."""
+        self._stopped = True
+        tasks = self._tasks
+        try:
+            if tasks and self._stop is not None:
+                self._stop.set()
+                await asyncio.wait(tasks, timeout=self.STOP_TIMEOUT_S)
+        finally:
+            try:
+                for task in tasks:
+                    task.cancel()  # does nothing to a part that has ended
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                self._tasks = []
+                # the store first: the lock covers this process's last use of the file (SQLite tidies its WAL on close)
+                self.store.close()
+                self._release_lock()
+                if tasks:
+                    log.info("order events: stopped")
+
+    def _part_ended(self, task: asyncio.Task[None]) -> None:
+        """Each part's done-callback: a part that ends while the service runs (its loop crashed, or something cancelled
+        it) is an error, as nothing runs it again until the server restarts. Ending after stop() is quiet."""
+        if self._stop is None or self._stop.is_set():
+            return
+        if task.cancelled():
+            log.error("order events: %s was cancelled while the service was running; it stays down", task.get_name())
+        elif (exc := task.exception()) is not None:
+            log.error(
+                "order events: %s failed while the service was running; it stays down", task.get_name(), exc_info=exc
+            )
+        else:
+            log.error("order events: %s ended while the service was running; it stays down", task.get_name())
 
     def housekeep(self) -> int:
         """Delete what is older than KITE_MCP_EVENTS_KEEP_DAYS (doorbells after two days). Returns the events
@@ -377,14 +407,14 @@ class EventService:
         try:
             fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         except OSError as exc:
-            raise ConfigError(f"cannot open the lock file {path}: {exc.strerror}") from None
+            raise ConfigError(f"cannot open the lock file {path}: {exc.strerror or type(exc).__name__}") from None
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             os.close(fd)
             if isinstance(exc, BlockingIOError):
                 raise ConfigError(f"another process is already serving order events from {self.store.path}") from None
-            raise ConfigError(f"cannot lock {path}: {exc.strerror}") from None
+            raise ConfigError(f"cannot lock {path}: {exc.strerror or type(exc).__name__}") from None
         self._lock_fd = fd
 
     def _release_lock(self) -> None:
