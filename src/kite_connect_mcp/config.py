@@ -44,6 +44,7 @@ DEFAULT_API_BASE_URL = "https://api.kite.trade"
 DEFAULT_LOGIN_URL = "https://kite.zerodha.com/connect/login"
 DEFAULT_TICKER_URL = "wss://ws.kite.trade"
 DEFAULT_PORT = 8765
+DEFAULT_ORDER_POLL_WINDOW = (dt.time(9, 0), dt.time(16, 0))  # IST, a little wider than the market's hours
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
@@ -103,7 +104,7 @@ def _choice(env: Mapping[str, str], name: str, default: str, choices: tuple[str,
     return value
 
 
-_DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_DAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 
 def _window(
@@ -128,6 +129,14 @@ def _window(
     return start, end
 
 
+def _day(token: str) -> int | None:
+    """Mon=0 .. Sun=6 from 'mon', 'Tues', 'thursday' (at least three letters of the name); None for anything else."""
+    token = token.strip().lower()
+    if len(token) < 3:
+        return None
+    return next((i for i, full in enumerate(_DAY_NAMES) if full.startswith(token)), None)
+
+
 def _days(env: Mapping[str, str], name: str, default: frozenset[int], problems: list[str]) -> frozenset[int]:
     """Weekdays (Mon=0 .. Sun=6) from 'Mon-Fri', 'mon,wed,fri', 'Tue' or '*'."""
     raw = env.get(name)
@@ -137,14 +146,14 @@ def _days(env: Mapping[str, str], name: str, default: frozenset[int], problems: 
         return frozenset(range(7))
     days: set[int] = set()
     for part in raw.split(","):
-        first, sep, last = part.strip().lower().partition("-")
-        try:
-            a = _DAY_NAMES.index(first[:3]) if len(first) >= 3 else -1
-            b = _DAY_NAMES.index(last[:3]) if sep and len(last) >= 3 else (a if not sep else -1)
-        except ValueError:
-            a = b = -1
-        if a < 0 or b < 0 or b < a:
+        first, sep, last = part.partition("-")
+        a = _day(first)
+        b = _day(last) if sep else a
+        if a is None or b is None:
             problems.append(f"{name} must look like Mon-Fri or mon,wed,fri, not {raw!r}")
+            return default
+        if b < a:
+            problems.append(f"{name}: ranges run forward from Mon to Sun; list the days to wrap, e.g. fri,sat,sun,mon")
             return default
         days.update(range(a, b + 1))
     return frozenset(days)
@@ -278,7 +287,7 @@ class Settings:
     events_db: Path | None = None  # the service's store; another process reads it with KITE_MCP_EVENTS_DB
     events_consumers_file: Path | None = None
     order_poll_interval_s: int = 60
-    order_poll_window: tuple[dt.time, dt.time] = (dt.time(9, 0), dt.time(16, 0))
+    order_poll_window: tuple[dt.time, dt.time] = DEFAULT_ORDER_POLL_WINDOW
     order_poll_days: frozenset[int] = frozenset(range(5))
     events_keep_days: int = 30
 
@@ -405,7 +414,7 @@ class Settings:
             events_db=events_db,
             events_consumers_file=Path(consumers_raw).expanduser() if consumers_raw else None,
             order_poll_interval_s=_int(env, "KITE_MCP_ORDER_POLL_INTERVAL_S", 60, problems, minimum=10),
-            order_poll_window=_window(env, "KITE_MCP_ORDER_POLL_WINDOW", (dt.time(9, 0), dt.time(16, 0)), problems),
+            order_poll_window=_window(env, "KITE_MCP_ORDER_POLL_WINDOW", DEFAULT_ORDER_POLL_WINDOW, problems),
             order_poll_days=_days(env, "KITE_MCP_ORDER_POLL_DAYS", frozenset(range(5)), problems),
             events_keep_days=_int(env, "KITE_MCP_EVENTS_KEEP_DAYS", 30, problems, minimum=1),
             log_level=(env.get("KITE_MCP_LOG_LEVEL", "INFO").strip().upper() or "INFO"),
@@ -436,6 +445,8 @@ class Settings:
             problems.append("KITE_MCP_BEARER_TOKEN must be at least 32 characters (try: openssl rand -hex 32)")
         if self.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             problems.append("KITE_MCP_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR or CRITICAL")
+        if self.events_keep_days > 3650:
+            problems.append("KITE_MCP_EVENTS_KEEP_DAYS cannot exceed 3650 (ten years)")
         if self.events and self.transport != "http":
             problems.append(
                 "KITE_MCP_EVENTS=true needs KITE_MCP_TRANSPORT=http: the event service is one long-lived process "
