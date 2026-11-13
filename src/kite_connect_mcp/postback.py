@@ -209,7 +209,7 @@ class PostbackRoute:
                 events.record_selftest(order_id)
             else:
                 events.ring(order_id)
-        except StoreError as exc:  # its text is the store's path and SQLite's message, nothing from the payload
+        except StoreError as exc:  # its text is SQLite's message (a write names no path), nothing from the payload
             self._log_limited("503", logging.ERROR, f"postback: answering 503 (the poll will catch up): {exc}")
             return _bare(503)
         self.recent.remember(key, now)

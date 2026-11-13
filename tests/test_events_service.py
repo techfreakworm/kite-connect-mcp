@@ -485,6 +485,43 @@ async def test_stop_writes_the_refusals_still_in_memory(service_factory):
         store.close()
 
 
+async def test_stop_closes_the_store_and_frees_the_lock_even_if_writing_the_refusals_fails(
+    service_factory, fake_kite, monkeypatch
+):
+    fake_kite.on("GET", "/orders", [])
+    svc, _ = service_factory()
+    await svc.start()
+
+    def failing() -> None:
+        raise RuntimeError("a bug in the flush")
+
+    monkeypatch.setattr(svc, "flush_refusals", failing)
+    with pytest.raises(RuntimeError, match="a bug in the flush"):
+        await svc.stop()
+    with pytest.raises(StoreError):
+        svc.store.events()  # closed
+    other, _ = service_factory()
+    await other.start()  # the lock was released
+    await other.stop()
+    assert fake_kite.writes() == []
+
+
+async def test_a_refusal_after_stop_is_not_written_to_the_closed_store(service_factory, caplog):
+    svc, _ = service_factory()
+    svc.REFUSAL_WRITE_S = 0.05
+    svc.refused("bad checksum")  # written at once
+    await svc.stop()
+    svc.refused("bad checksum")  # a request still in flight as the server shuts down
+    svc.refused("bad checksum")
+    await asyncio.sleep(0.2)
+    assert "could not count" not in caplog.text
+    store = EventStore(svc.store.path, readonly=True)
+    try:
+        assert store.counters()["postback_refused"]["count"] == 1
+    finally:
+        store.close()
+
+
 def test_refusals_the_store_could_not_take_wait_for_the_next_write(service_factory, monkeypatch, caplog):
     clock = Clock()
     svc, _ = service_factory(clock=clock)

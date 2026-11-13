@@ -249,6 +249,7 @@ def test_the_repeat_guard_is_bounded_and_forgets_after_its_window():
 
 async def test_a_burst_of_refusals_is_written_once_and_logged_once_a_minute(make_app, http, caplog):
     rt, app = make_app()
+    rt.events.REFUSAL_WRITE_S = 3600  # the service's clock does not move here: no real-time write in the middle
     rt.clock = clock = Clock()
     client = http(app)
     for _ in range(5):

@@ -297,13 +297,15 @@ class EventService:
         event loop, so refusals are counted in memory and written at most once every REFUSAL_WRITE_S, in one write
         (postback_refused moves by their number; its note is the last one's reason): the first after a quiet spell
         is written at once, the ones after it by a timer when the interval is over, by the next refusal after it, or
-        by stop()."""
+        by stop(). Once stop() has begun they are left to it, and after it nothing is written (the store is closed)."""
         if reason not in REFUSALS:
             raise ValueError("refused() takes one of REFUSALS")
         now = self.clock()
         self._refused_count += 1
         self._refused_note = reason
         self._refused_at = now
+        if self._stopped:
+            return  # no write and no timer: stop() writes what it finds, then closes the store
         interval = dt.timedelta(seconds=self.REFUSAL_WRITE_S)
         last = self._refused_written_at
         if last is None or not dt.timedelta(0) <= now - last < interval:  # a clock that went back holds nothing
@@ -390,12 +392,15 @@ class EventService:
                 await asyncio.gather(*tasks, return_exceptions=True)
             finally:
                 self._tasks = []
-                self.flush_refusals()
-                # the store first: the lock covers this process's last use of the file (SQLite tidies its WAL on close)
-                self.store.close()
-                self._release_lock()
-                if tasks:
-                    log.info("order events: stopped")
+                try:
+                    self.flush_refusals()
+                finally:
+                    # the store first, so that the lock covers this process's last use of the file (SQLite
+                    # tidies its WAL on close); both even when the flush fails
+                    self.store.close()
+                    self._release_lock()
+                    if tasks:
+                        log.info("order events: stopped")
 
     def _part_ended(self, task: asyncio.Task[None]) -> None:
         """Each part's done-callback: a part that ends while the service runs (its loop crashed, or something cancelled
