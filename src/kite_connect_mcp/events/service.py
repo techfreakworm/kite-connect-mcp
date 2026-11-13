@@ -248,6 +248,17 @@ def last_closed_poll_day(settings: Settings, now: dt.datetime) -> dt.date | None
     return None
 
 
+def _day_of(stamp: str | None) -> dt.date | None:
+    """The IST date of a time kept in meta (baseline_done holds an ISO time; a bare date reads as that day), None when
+    there is none or it cannot be read."""
+    if not stamp:
+        return None
+    try:
+        return to_ist(dt.datetime.fromisoformat(stamp)).date()
+    except ValueError:
+        return None
+
+
 def describe_status(
     store: EventStore, settings: Settings, now: dt.datetime, consumer_names: list[str] | None = None
 ) -> dict[str, Any]:
@@ -256,7 +267,8 @@ def describe_status(
     `warning` is set while no poll has succeeded after the most recent close of the poll window (meta after_close_ok
     is older than last_closed_poll_day), so a failed Friday close stays visible over the weekend and on Monday until
     Monday's own close is polled. A store the poll has never touched (neither baseline_done nor after_close_ok set) has
-    missed nothing, and shows no warning."""
+    missed nothing, and shows no warning; nor does a close before the day of the first poll (the date of baseline_done),
+    which the service was not running to see. A baseline_done that cannot be read hides no warning."""
     out = store.summary(consumer_names or ())
     out["store"] = str(store.path)
     if consumer_names is not None:
@@ -272,7 +284,8 @@ def describe_status(
     due = last_closed_poll_day(settings, now)
     ok = out["after_close_ok"]
     polled = ok is not None or out["baseline_done"] is not None
-    if due is not None and polled and (ok is None or ok < due.isoformat()):
+    since = _day_of(out["baseline_done"])  # the day the poll first read the book
+    if due is not None and polled and (ok is None or ok < due.isoformat()) and (since is None or due >= since):
         out["warning"] = (
             f"no successful poll after the close on {_WEEKDAYS[due.weekday()]} {due.isoformat()}: "
             "fills after the last poll may be missing"

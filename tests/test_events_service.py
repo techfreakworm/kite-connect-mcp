@@ -259,6 +259,24 @@ def test_the_warning_follows_the_configured_poll_days(service_factory):
     assert "warning" not in svc.status()
 
 
+def test_no_warning_about_a_close_before_the_first_poll(service_factory):
+    clock = Clock(at(7, 11))  # a Saturday
+    svc, _ = service_factory(clock=clock)
+    svc.store.set_meta("baseline_done", iso(at(7, 11)))  # the first poll ever ran this Saturday morning
+    for moment in (at(7, 11), at(8, 12), at(9, 10), at(9, 15, 59)):
+        clock.now = moment  # Friday's close is the last one until Monday's: the service did not run on Friday
+        assert "warning" not in svc.status(), moment
+    clock.now = at(9, 16)  # Monday's close came after the baseline, and no poll after it succeeded
+    assert "Mon 2026-11-09" in svc.status()["warning"]
+    svc.store.set_meta("after_close_ok", "2026-11-09")
+    assert "warning" not in svc.status()
+    clock.now = at(9, 10)  # Monday morning: Friday's close is the last one
+    svc.store.set_meta("after_close_ok", "2026-11-05")
+    assert "warning" not in svc.status()  # the baseline on Saturday came after it
+    svc.store.set_meta("baseline_done", "not a time")  # a baseline time that cannot be read hides no warning
+    assert "Fri 2026-11-06" in svc.status()["warning"]
+
+
 def test_no_warning_before_the_service_has_polled(service_factory):
     svc, _ = service_factory(clock=Clock(at(6, 17)))
     assert svc.store.meta("baseline_done") is None and svc.store.meta("after_close_ok") is None
