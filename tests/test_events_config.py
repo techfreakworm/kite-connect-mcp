@@ -7,7 +7,7 @@ import datetime as dt
 import pytest
 
 from conftest import BEARER
-from kite_connect_mcp.config import TOOLSETS, unknown_variables
+from kite_connect_mcp.config import DEFAULT_ORDER_POLL_DAYS, TOOLSETS, Settings, unknown_variables
 from kite_connect_mcp.errors import ConfigError
 
 SERVICE = {"KITE_MCP_EVENTS": "true", "KITE_MCP_TRANSPORT": "http", "KITE_MCP_BEARER_TOKEN": BEARER}
@@ -22,6 +22,12 @@ def test_off_by_default(settings_factory):
     assert s.order_poll_window == (dt.time(9, 0), dt.time(16, 0))
     assert s.order_poll_days == frozenset({0, 1, 2, 3, 4})
     assert s.events_keep_days == 30
+
+
+def test_the_poll_days_have_one_default():
+    assert frozenset(range(5)) == DEFAULT_ORDER_POLL_DAYS  # Mon-Fri
+    assert Settings().order_poll_days is DEFAULT_ORDER_POLL_DAYS
+    assert Settings.from_env({}).order_poll_days is DEFAULT_ORDER_POLL_DAYS
 
 
 def test_events_is_a_toolset():
@@ -80,6 +86,8 @@ def test_a_bad_poll_window_is_refused(settings_factory, raw):
         ("*", set(range(7))),
         ("Tue", {1}),
         ("Mon - Fri", {0, 1, 2, 3, 4}),
+        ("Mon- Fri", {0, 1, 2, 3, 4}),
+        ("Monday-Friday", {0, 1, 2, 3, 4}),
         ("Tues-Thurs", {1, 2, 3}),
     ],
 )
@@ -93,10 +101,22 @@ def test_bad_poll_days_are_refused(settings_factory, raw):
         settings_factory(KITE_MCP_ORDER_POLL_DAYS=raw)
 
 
-@pytest.mark.parametrize("raw", ["Fri-Mon", "Sun-Thu"])
-def test_a_range_that_runs_backwards_is_explained(settings_factory, raw):
-    with pytest.raises(ConfigError, match="ranges run forward from Mon to Sun; list the days to wrap"):
+@pytest.mark.parametrize(
+    ("raw", "bad", "listed"),
+    [
+        ("Fri-Mon", "Fri-Mon", "fri,sat,sun,mon"),
+        ("Sun-Thu", "Sun-Thu", "sun,mon,tue,wed,thu"),
+        ("mon, fri-tue", "fri-tue", "fri,sat,sun,mon,tue"),
+    ],
+)
+def test_a_range_that_runs_backwards_is_explained(settings_factory, raw, bad, listed):
+    with pytest.raises(ConfigError) as error:
         settings_factory(KITE_MCP_ORDER_POLL_DAYS=raw)
+    problem = str(error.value).splitlines()[-1]
+    assert problem == (
+        f"  - KITE_MCP_ORDER_POLL_DAYS: {bad!r} runs backwards (ranges run forward from Mon to Sun); "
+        f"list the days: {listed}"
+    )
 
 
 def test_the_poll_interval_has_a_floor(settings_factory):
@@ -109,11 +129,11 @@ def test_keep_days_is_at_least_one(settings_factory):
         settings_factory(KITE_MCP_EVENTS_KEEP_DAYS="0")
 
 
-def test_keep_days_has_a_ceiling(settings_factory):
+@pytest.mark.parametrize("raw", ["3651", "1000000000"])  # far above, a timedelta of that many days would overflow
+def test_keep_days_has_a_ceiling(settings_factory, raw):
     assert settings_factory(KITE_MCP_EVENTS_KEEP_DAYS="3650").events_keep_days == 3650
-    for raw in ("3651", "1000000000"):  # far above, a timedelta of that many days would overflow in the purge
-        with pytest.raises(ConfigError, match="KITE_MCP_EVENTS_KEEP_DAYS cannot exceed 3650"):
-            settings_factory(KITE_MCP_EVENTS_KEEP_DAYS=raw)
+    with pytest.raises(ConfigError, match="KITE_MCP_EVENTS_KEEP_DAYS cannot exceed 3650"):
+        settings_factory(KITE_MCP_EVENTS_KEEP_DAYS=raw)
 
 
 def test_the_new_variables_are_known():

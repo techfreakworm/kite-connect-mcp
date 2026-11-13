@@ -45,6 +45,7 @@ DEFAULT_LOGIN_URL = "https://kite.zerodha.com/connect/login"
 DEFAULT_TICKER_URL = "wss://ws.kite.trade"
 DEFAULT_PORT = 8765
 DEFAULT_ORDER_POLL_WINDOW = (dt.time(9, 0), dt.time(16, 0))  # IST, a little wider than the market's hours
+DEFAULT_ORDER_POLL_DAYS = frozenset(range(5))  # Mon-Fri (Mon=0 .. Sun=6)
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
@@ -104,9 +105,6 @@ def _choice(env: Mapping[str, str], name: str, default: str, choices: tuple[str,
     return value
 
 
-_DAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
-
-
 def _window(
     env: Mapping[str, str], name: str, default: tuple[dt.time, dt.time], problems: list[str]
 ) -> tuple[dt.time, dt.time]:
@@ -127,6 +125,9 @@ def _window(
         problems.append(f"{name}: the start must be before the end")
         return default
     return start, end
+
+
+_DAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 
 def _day(token: str) -> int | None:
@@ -153,7 +154,11 @@ def _days(env: Mapping[str, str], name: str, default: frozenset[int], problems: 
             problems.append(f"{name} must look like Mon-Fri or mon,wed,fri, not {raw!r}")
             return default
         if b < a:
-            problems.append(f"{name}: ranges run forward from Mon to Sun; list the days to wrap, e.g. fri,sat,sun,mon")
+            wrapped = ",".join(_DAY_NAMES[day][:3] for day in (*range(a, 7), *range(b + 1)))
+            problems.append(
+                f"{name}: {part.strip()!r} runs backwards (ranges run forward from Mon to Sun); "
+                f"list the days: {wrapped}"
+            )
             return default
         days.update(range(a, b + 1))
     return frozenset(days)
@@ -288,7 +293,7 @@ class Settings:
     events_consumers_file: Path | None = None
     order_poll_interval_s: int = 60
     order_poll_window: tuple[dt.time, dt.time] = DEFAULT_ORDER_POLL_WINDOW
-    order_poll_days: frozenset[int] = frozenset(range(5))
+    order_poll_days: frozenset[int] = DEFAULT_ORDER_POLL_DAYS
     events_keep_days: int = 30
 
     log_level: str = "INFO"
@@ -415,7 +420,7 @@ class Settings:
             events_consumers_file=Path(consumers_raw).expanduser() if consumers_raw else None,
             order_poll_interval_s=_int(env, "KITE_MCP_ORDER_POLL_INTERVAL_S", 60, problems, minimum=10),
             order_poll_window=_window(env, "KITE_MCP_ORDER_POLL_WINDOW", DEFAULT_ORDER_POLL_WINDOW, problems),
-            order_poll_days=_days(env, "KITE_MCP_ORDER_POLL_DAYS", frozenset(range(5)), problems),
+            order_poll_days=_days(env, "KITE_MCP_ORDER_POLL_DAYS", DEFAULT_ORDER_POLL_DAYS, problems),
             events_keep_days=_int(env, "KITE_MCP_EVENTS_KEEP_DAYS", 30, problems, minimum=1),
             log_level=(env.get("KITE_MCP_LOG_LEVEL", "INFO").strip().upper() or "INFO"),
         )
