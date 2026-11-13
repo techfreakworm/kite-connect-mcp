@@ -218,18 +218,6 @@ class EventService:
             body, order_id=order_id, consumers=self.config.matching(body), now=now, counter="selftest_received"
         )
 
-    def record_router_event(
-        self, name: str, *, consumer: str, about: Mapping[str, Any], error: str | None, seed: str
-    ) -> int | None:
-        """A late or failed delivery, for the other consumers, on its own (the router uses fail_delivery and
-        alert_delayed, which write it with the delivery change it reports). Nothing is raised about a router event
-        itself, so two failing consumers cannot report each other's failures forever."""
-        now = self.clock()
-        body = self._router_body(name, consumer=consumer, about=about, error=error, seed=seed, now=now)
-        if body is None:
-            return None
-        return self._insert(body, order_id=None, consumers=self.config.matching(body, exclude=consumer), now=now)
-
     def fail_delivery(self, consumer: str, delivery: Delivery, error: str | None, now: dt.datetime) -> bool:
         """Mark a pending delivery failed with `error`, and record its delivery_failed event (seeded with the failure
         time) for the other consumers, in one transaction. False, with nothing written, when the delivery is no longer
@@ -280,7 +268,8 @@ class EventService:
     def _router_body(
         name: str, *, consumer: str, about: Mapping[str, Any], error: str | None, seed: str, now: dt.datetime
     ) -> dict[str, Any] | None:
-        """The router event `name` about `about`, None when `about` is a router event itself (not reported further)."""
+        """The router event `name` about `about`, None when `about` is a router event itself: nothing is raised about a
+        router event, so two failing consumers cannot report each other's failures forever."""
         if about.get("kind") == "router":
             log.warning("order events: %s for %s about a router event (not reported further)", name, consumer)
             return None

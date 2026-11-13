@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from decimal import Decimal
 
 import pytest
@@ -415,11 +416,43 @@ def test_a_link_is_removed_before_the_error_is_clipped():
             "[link] and [link]",
         ),  # an escape inside a link
         (" \n\t ", ""),
+        # what `tput sgr0` writes (ESC ( B, ESC [ m), glued to the link
+        ("\x1b(B\x1b[mhttps://hooks.example.com/T000/SECRET done", "[link] done"),
+        ("xhttps://hooks.example.com/T000/SECRET done", "[link] done"),  # a word character before the scheme
+        ("\x9b31mhttps://hooks.example.com/T000/SECRET\x9b0m done", "[link] done"),  # the 8-bit CSI
+        ("\ufffd31mhttps://hooks.example.com/T000/SECRET done", "[link] done"),  # an 8-bit CSI byte, decoded
+        ("stream wss://feed.example.com/live?token=SECRET closed", "stream [link] closed"),
+        ("cannot reach postgres://user:SECRET@db.example.com/events", "cannot reach [link]"),
+        ("open WWW.EXAMPLE.COM/SECRET now", "open [link] now"),
+        # an OSC 8 hyperlink: its target goes with the sequence, its text stays
+        ("\x1b]8;;https://example.com/SECRET\x1b\\click here\x1b]8;;\x1b\\ now", "click here now"),
+        ("\x1b]0;title SECRET\x07ok", "ok"),  # a window title
+        ("\x1b]8;;https://example.com/SECRET", "[link]"),  # an OSC left open
     ],
 )
 def test_clean_error_text_is_one_printable_line_without_links(raw, clean):
     assert clean_error_text(raw) == clean
     assert clean_error_text(clean) == clean  # cleaning again changes nothing
+    assert "SECRET" not in clean_error_text(raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "a" * 4096,
+        "a." * 2048,
+        "\x1b]" + "a" * 4096,
+        "\x1b[" + "0" * 4096,
+        "a" * 4000 + "!://",
+        "\x1b]" * 2048,
+    ],
+)
+def test_clean_error_text_takes_linear_time_on_one_long_word(raw):
+    """A command can print 4 KB of one word: cleaning it must not backtrack over it (this would take minutes)."""
+    started = time.perf_counter()
+    for _ in range(10):
+        clean_error_text(raw)
+    assert time.perf_counter() - started < 1
 
 
 def test_a_blank_delivery_error_is_none():

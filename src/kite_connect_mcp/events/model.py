@@ -47,8 +47,11 @@ MAX_EXPONENT = 30  # no price or quantity needs more digits; a number further ou
 
 _FINAL_CHANGE = {"COMPLETE": "filled", "CANCELLED": "cancelled", "REJECTED": "rejected"}
 _ACCOUNT_RE = re.compile(r"(?i)\baccount-[A-Za-z0-9]+")
-_LINK_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
-_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")  # a terminal's control sequence (colour, cursor): ESC [ ... letter
+_LINK_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")  # in Kite's status messages
+# A terminal's control sequences: CSI (ESC [ ... letter: colour, cursor), OSC (ESC ] ... BEL or ESC \: a title, or
+# a hyperlink and its target), the other ESC sequences (ESC ( B of `tput sgr0`, ESC 7), and the 8-bit CSI.
+_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[ -/]*[0-~])|\x9b[0-?]*[ -/]*[@-~]")
+_WWW_RE = re.compile(r"(?i)\bwww\.")
 
 
 def normalize_status(raw: object) -> str:
@@ -369,14 +372,23 @@ def session_event(name: str, *, seed: str, received_at: dt.datetime) -> dict[str
     }
 
 
+def _is_link(word: str) -> bool:
+    """A word that holds a scheme (`https://`, `wss://`, `postgres://`, glued to anything before it) or a `www.`."""
+    return "://" in word or _WWW_RE.search(word) is not None
+
+
 def clean_error_text(text: str) -> str:
     """Text from a command (its stderr) made fit for a log, a terminal and other consumers: terminal control sequences
-    and other unprintable characters dropped, whitespace and line breaks run into single spaces, links as "[link]".
-    Nothing is clipped: clip after cleaning, so a clipped text never shows part of a link. Cleaning twice changes
-    nothing. A secret without a scheme (a token in a path) is not recognised: commands must not print secrets."""
+    and other unprintable characters dropped, whitespace and line breaks run into single spaces, and each word that
+    holds a link, whole, as "[link]" (whatever is glued to it: the rest of an escape, a word, a user and password).
+    Nothing is clipped: clip after cleaning (clip_words), so a clipped text never shows part of a link. Cleaning twice
+    changes nothing. A secret without a scheme (a token in a path) is not recognised: commands must not print secrets.
+
+    Linear in the text's length: a word is tested with `in` and an anchored pattern, not one regex around it that would
+    backtrack over every long word (a command can print 4 KB of one)."""
     text = _ESCAPE_RE.sub("", text)
     text = "".join(ch for ch in text if ch.isprintable() or ch.isspace())
-    return _LINK_RE.sub("[link]", " ".join(text.split()))
+    return " ".join("[link]" if _is_link(word) else word for word in text.split())
 
 
 def clip_words(text: str, limit: int) -> str:

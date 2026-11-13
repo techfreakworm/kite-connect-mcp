@@ -13,7 +13,8 @@ The consumer contract:
            print a secret to it (a token in a path is not recognised as a link)
   exit 0   handled (including a refusal the consumer reported itself): done
   exit 75  temporary failure: retried (10 s, 30 s, 1 min, 2 min, 5 min, then every 5 min, for 30 min in all)
-  signal   killed by a signal (a service stop, the OOM killer): like 75
+  signal   killed by a signal (a service stop, the OOM killer): like 75. Only the command itself counts: a shell
+           script whose child is killed exits 128+N, a permanent failure, so it should exit 75 itself then
   timeout  the process group is killed: like 75. A command has ended when it has exited and its stderr is closed, so
            a process it starts in the background must not keep stderr open (redirect it), or the delivery times out
   other    permanent failure: `delivery_failed` at once, no retry
@@ -119,10 +120,15 @@ def _stderr_text(data: bytes, cut: bool) -> str:
 
 
 def _error(head: str, stderr: str) -> str:
-    """`head` ("exit 3"), then as much of the end of the clean `stderr` as fits with it in MAX_ERROR_CHARS. Clipping
-    after cleaning never leaves part of a link."""
+    """`head` ("exit 3"), then as much of the end of the clean `stderr` as fits with it in MAX_ERROR_CHARS, from the
+    start of a word: a cut inside one drops what is left of it, so the error never starts with part of a "[link]"."""
     room = MAX_ERROR_CHARS - len(head) - 2
-    tail = stderr[-room:].lstrip() if room > 0 and stderr else ""
+    if room <= 0 or not stderr:
+        return head
+    tail = stderr[-room:]
+    if len(stderr) > room and not stderr[-room - 1].isspace():
+        tail = _FIRST_WORD_RE.sub("", tail, count=1)
+    tail = tail.lstrip()
     return f"{head}: {tail}" if tail else head
 
 
@@ -131,6 +137,11 @@ def _signal_name(number: int) -> str:
         return signal.Signals(number).name
     except ValueError:
         return f"signal {number}"
+
+
+def _ending(code: int) -> str:
+    """How a command with return code `code` ended: "exited 3", or "was killed by SIGTERM" (a negative code)."""
+    return f"was killed by {_signal_name(-code)}" if code < 0 else f"exited {code}"
 
 
 def _kill(proc: asyncio.subprocess.Process) -> None:
@@ -290,7 +301,7 @@ class Router:
                 await asyncio.wait_for(_reap(proc), 5)
             error = f"timed out after {consumer.timeout_s:g} s"
             if exited is not None:
-                error += f": the command exited {exited}, but a process it started kept stderr open"
+                error += f": the command {_ending(exited)}, but a process it started kept stderr open"
             return "retry", error
         except BaseException:  # cancelled as the router stops, or anything else: never leave the command unwatched
             _kill(proc)

@@ -14,7 +14,7 @@ import pytest
 
 from events_helpers import PY, Clock, filled_row, folders, make_service, order_row
 from kite_connect_mcp.events.model import MAX_ERROR_CHARS
-from kite_connect_mcp.events.router import STDERR_KEEP, Router, _read_tail
+from kite_connect_mcp.events.router import STDERR_KEEP, Router, _error, _read_tail, _stderr_text
 from kite_connect_mcp.events.store import StoreError
 
 
@@ -177,9 +177,11 @@ async def test_a_timeout_kills_what_the_command_started_too(build, tmp_path):
         "import subprocess\n"
         f"subprocess.Popen([sys.executable, '-c', 'import time\\n' + {beating(beat)!r}], stdin=subprocess.DEVNULL, "
         "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        f"while not os.path.exists({str(beat)!r}):\n    time.sleep(0.01)\n"  # the child runs: now wait to be killed
         "time.sleep(30)"
     )
-    spec, _ = consumer("notify", code, tmp_path, timeout_s=1)
+    # two Python start-ups before the timeout: 3 s, so a slow machine still gets there (the wait above only says when)
+    spec, _ = consumer("notify", code, tmp_path, timeout_s=3)
     svc, router, _ = build(spec)
     svc.ingest_order(order_row(), source="poll")
     await asyncio.wait_for(router.step(router.config.get("notify")), 10)
@@ -197,6 +199,36 @@ async def test_a_background_child_that_keeps_stderr_open_times_out(build, tmp_pa
     assert (
         last_error(svc, clock) == "timed out after 1 s: the command exited 0, but a process it started kept stderr open"
     )
+
+
+async def test_a_timeout_after_the_command_died_of_a_signal_names_the_signal(build, tmp_path):
+    code = (
+        "import signal, subprocess\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        "os.kill(os.getpid(), signal.SIGTERM)"
+    )
+    spec, _ = consumer("notify", code, tmp_path, timeout_s=1)
+    svc, router, clock = build(spec)
+    svc.ingest_order(order_row(), source="poll")
+    await asyncio.wait_for(router.step(router.config.get("notify")), 10)
+    assert last_error(svc, clock) == (
+        "timed out after 1 s: the command was killed by SIGTERM, but a process it started kept stderr open"
+    )
+
+
+def test_a_clipped_stderr_starts_at_a_whole_word():
+    room = MAX_ERROR_CHARS - len("exit 3") - 2
+    cut_in_a_word = "start [link] " + "b" * (room - 3)  # the last `room` characters begin inside "[link]"
+    assert _error("exit 3", cut_in_a_word) == "exit 3: " + "b" * (room - 3)
+    at_a_word = "start " + "c" * room  # they begin at a word: it stays
+    assert _error("exit 3", at_a_word) == "exit 3: " + "c" * room
+    assert _error("exit 3", "short [link] end") == "exit 3: short [link] end"
+    assert _error("exit 3", "z" * (room + 5)) == "exit 3"  # one long word, cut: nothing whole is left of it
+
+
+def test_an_8_bit_csi_byte_does_not_hide_a_link_in_stderr():
+    text = _stderr_text(b"\x9b31mhttps://hooks.example.com/T000/" + HOOK_PART.encode() + b"\x9b0m failed", cut=False)
+    assert text == "[link] failed"
 
 
 @pytest.mark.parametrize("name", ["SIGTERM", "SIGKILL"])

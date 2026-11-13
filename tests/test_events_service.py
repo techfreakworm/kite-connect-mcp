@@ -126,15 +126,24 @@ def test_a_selftest_reaches_only_the_consumers_that_ask_for_it(svc):
     assert svc.store.counters()["selftest_received"]["count"] == 1
 
 
-def test_a_router_event_never_reaches_its_own_consumer_and_never_cascades(svc):
-    about = svc.store.event(svc.ingest_order(filled_row(), source="poll"))
-    seq = svc.record_router_event("delivery_failed", consumer="fills", about=about, error="exit 1", seed="t")
-    assert deliveries(svc, "notify")[-1] == seq
-    assert seq not in deliveries(svc, "fills")
-    seq2 = svc.record_router_event("delivery_failed", consumer="notify", about=about, error="exit 1", seed="t")
-    assert seq2 not in deliveries(svc, "notify")
-    router = svc.store.event(seq)
-    assert svc.record_router_event("delivery_failed", consumer="fills", about=router, error="x", seed="t2") is None
+def fail_first(svc, consumer, error="exit 1"):
+    """Fail `consumer`'s first due delivery for good, as the router does; returns the seq of the event it was."""
+    delivery, _ = svc.store.next_delivery(consumer, FIXED_NOW)
+    assert svc.fail_delivery(consumer, delivery, error, FIXED_NOW) is True
+    return delivery.seq
+
+
+def test_a_router_event_never_reaches_its_own_consumer(svc):
+    placed = svc.ingest_order(order_row(), source="poll")
+    filled = svc.ingest_order(filled_row(), source="poll")  # a fill: for fills too
+    assert fail_first(svc, "fills") == filled
+    about_fills = svc.store.last_seq()
+    assert svc.store.event(about_fills)["consumer"] == "fills"
+    assert deliveries(svc, "notify")[-1] == about_fills and about_fills not in deliveries(svc, "fills")
+    assert fail_first(svc, "notify") == placed
+    about_notify = svc.store.last_seq()
+    assert svc.store.event(about_notify)["consumer"] == "notify"
+    assert about_notify not in deliveries(svc, "notify")  # notify takes router events, but not one about itself
 
 
 def test_fail_delivery_records_the_failure_with_its_router_event(svc):
@@ -155,8 +164,9 @@ def test_fail_delivery_records_the_failure_with_its_router_event(svc):
 
 
 def test_a_failed_delivery_of_a_router_event_raises_no_other(svc):
-    about = svc.store.event(svc.ingest_order(filled_row(), source="poll"))
-    svc.record_router_event("delivery_failed", consumer="fills", about=about, error="exit 1", seed="t")
+    svc.ingest_order(order_row(), source="poll")
+    svc.ingest_order(filled_row(), source="poll")
+    fail_first(svc, "fills")  # its delivery_failed event goes to notify
     delivery, _ = svc.store.next_delivery("notify", FIXED_NOW)
     while svc.store.event(delivery.seq)["kind"] != "router":
         svc.store.finish_delivery("notify", delivery.seq, "done", FIXED_NOW)
