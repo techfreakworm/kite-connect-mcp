@@ -7,6 +7,8 @@ process, and other MCP processes open the file read-only for the `events` tools.
 An event, its order's new state and a delivery row for every matching consumer are written in one transaction
 (`write()`), so a crash leaves either all of them or none. Times are ISO 8601 in IST with milliseconds (`iso()`), so
 they compare correctly as text.
+
+The file records its SCHEMA_VERSION in meta; a file of another version is refused when it is opened, not misread.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ from ..errors import KiteMCPError
 from ..timeutil import to_ist
 from .model import OrderView, Previous
 
+SCHEMA_VERSION = 1
+MAX_EVENTS_LIMIT = 1000  # the most events() returns at once
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (
@@ -45,6 +49,7 @@ CREATE TABLE IF NOT EXISTS order_state (
     final INTEGER NOT NULL,
     filled TEXT NOT NULL,
     exchange_update_timestamp TEXT,
+    event_id TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS doorbells (
@@ -89,35 +94,67 @@ def _body(row: sqlite3.Row) -> dict[str, Any]:
     return body
 
 
+def _schema_version(con: sqlite3.Connection) -> str | None:
+    """The version a file records, None when it has no meta table yet (a new file) or no version in it."""
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'").fetchone() is None:
+        return None
+    row = con.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    return None if row is None else str(row[0])
+
+
 class EventStore:
+    """One event store file. The event service, and the `events` commands that change delivery state, open it
+    read-write; other processes open it read-only. One connection is shared by the threads of a process under a lock,
+    every write goes through `write()`, and any failure to open, read or write it is a StoreError.
+
+    `timeout_s` is SQLite's busy timeout: how long a write waits for another process's write lock before it fails.
+    """
+
     def __init__(self, path: Path, *, readonly: bool = False, timeout_s: float = 5.0):
         self.path = Path(path)
         self.readonly = readonly
         self._lock = threading.RLock()
         try:
-            if readonly:
-                if not self.path.exists():
-                    raise StoreError(f"no event store at {self.path} (has the event service run?)")
-                self._con = sqlite3.connect(
-                    f"{self.path.resolve().as_uri()}?mode=ro",
-                    uri=True,
-                    timeout=timeout_s,
-                    isolation_level=None,
-                    check_same_thread=False,
-                )
-            else:
-                self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                os.close(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600))
-                os.chmod(self.path, 0o600)
-                self._con = sqlite3.connect(self.path, timeout=timeout_s, isolation_level=None, check_same_thread=False)
-                self._con.execute("PRAGMA journal_mode=WAL")
-                self._con.execute("PRAGMA synchronous=FULL")
-                self._con.executescript(SCHEMA)
-                self._con.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')")
-            self._con.row_factory = sqlite3.Row
-            self._con.execute(f"PRAGMA busy_timeout={int(timeout_s * 1000)}")
-        except sqlite3.Error as exc:
+            self._con = self._open(timeout_s)
+        except (sqlite3.Error, OSError) as exc:
             raise StoreError(f"cannot open the event store {self.path}: {exc}") from None
+
+    def _open(self, timeout_s: float) -> sqlite3.Connection:
+        if self.readonly:
+            if not self.path.exists():
+                raise StoreError(f"no event store at {self.path} (has the event service run?)")
+            con = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=timeout_s,  # also sets SQLite's busy timeout
+                isolation_level=None,
+                check_same_thread=False,
+            )
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.close(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600))
+            os.chmod(self.path, 0o600)
+            con = sqlite3.connect(self.path, timeout=timeout_s, isolation_level=None, check_same_thread=False)
+        try:
+            con.row_factory = sqlite3.Row
+            version = _schema_version(con)
+            if (self.readonly or version is not None) and version != str(SCHEMA_VERSION):  # checked before any write
+                raise StoreError(
+                    f"the event store {self.path} has schema version {version or 'none'}; "
+                    f"this version of kite-connect-mcp needs {SCHEMA_VERSION}"
+                )
+            if not self.readonly:
+                con.execute("PRAGMA journal_mode=WAL")
+                con.execute("PRAGMA synchronous=FULL")
+                con.executescript(SCHEMA)
+                con.execute(
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
+                )
+        except BaseException:
+            with contextlib.suppress(sqlite3.Error):
+                con.close()
+            raise
+        return con
 
     def close(self) -> None:
         with self._lock, contextlib.suppress(sqlite3.Error):
@@ -127,11 +164,18 @@ class EventStore:
 
     @contextlib.contextmanager
     def write(self) -> Iterator[sqlite3.Connection]:
-        """One write transaction (BEGIN IMMEDIATE ... COMMIT). Any sqlite error becomes StoreError and rolls back."""
+        """One write transaction (BEGIN IMMEDIATE ... COMMIT) on the connection it yields: what the block does is
+        committed together, or rolled back together when it raises. Any SQLite error becomes StoreError.
+
+        Keep the block synchronous (no await inside it), and inside it call only the methods that take `con`: a method
+        that writes on its own (ring, bump, set_meta, ...) would open a second transaction, so it raises StoreError
+        ("nested write") and the whole block rolls back."""
         if self.readonly:
             raise StoreError("the event store is open read-only")
         with self._lock:
             try:
+                if self._con.in_transaction:  # the lock is re-entrant: this thread is inside a write() already
+                    raise StoreError("nested write: inside write(), call only the methods that take con")
                 self._con.execute("BEGIN IMMEDIATE")
             except sqlite3.Error as exc:
                 raise StoreError(f"cannot write the event store: {exc}") from None
@@ -170,7 +214,7 @@ class EventStore:
     # --- orders and events ----------------------------------------------------------------------------------------
 
     def previous(self, order_id: str, con: sqlite3.Connection | None = None) -> Previous | None:
-        sql = "SELECT state, final, filled, exchange_update_timestamp FROM order_state WHERE order_id = ?"
+        sql = "SELECT state, final, filled, exchange_update_timestamp, event_id FROM order_state WHERE order_id = ?"
         if con is not None:
             row = con.execute(sql, (order_id,)).fetchone()
         else:
@@ -183,22 +227,25 @@ class EventStore:
             bool(row["final"]),
             Decimal(row["filled"]),
             row["exchange_update_timestamp"],
-            "",
+            row["event_id"],
         )
 
-    def save_state(self, con: sqlite3.Connection, view: OrderView, now: dt.datetime) -> None:
+    def save_state(self, con: sqlite3.Connection, view: OrderView, now: dt.datetime, *, event_id: str) -> None:
+        """Record the order's new state and the event that reported it (`event_id`, "" for a state recorded without an
+        event, as the baseline is). The next event of the order chains to that id, so it is required, never left out."""
         con.execute(
-            "INSERT INTO order_state (order_id, state, final, filled, exchange_update_timestamp, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET state = excluded.state, "
+            "INSERT INTO order_state (order_id, state, final, filled, exchange_update_timestamp, event_id, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET state = excluded.state, "
             "final = excluded.final, filled = excluded.filled, exchange_update_timestamp = "
             "coalesce(excluded.exchange_update_timestamp, order_state.exchange_update_timestamp), "
-            "updated_at = excluded.updated_at",
+            "event_id = excluded.event_id, updated_at = excluded.updated_at",
             (
                 view.order_id,
                 json.dumps(view.state()),
                 int(view.final),
                 str(view.filled),
                 view.exchange_update_timestamp,
+                event_id,
                 iso(now),
             ),
         )
@@ -214,18 +261,23 @@ class EventStore:
         now: dt.datetime,
     ) -> int | None:
         """Store `body` and one pending delivery per consumer. None when an event with its event_id is stored
-        already."""
+        already; a body that breaks another rule (no kind or source) raises, and write() makes it a StoreError.
+
+        The duplicate check is a NOT EXISTS, not OR IGNORE or ON CONFLICT DO NOTHING: those advance SQLite's
+        AUTOINCREMENT counter even when they insert nothing, which would leave gaps in seq and a last_seq() that no
+        event has. Inside write() no other writer can come between the check and the insert."""
         cursor = con.execute(
-            "INSERT OR IGNORE INTO events (event_id, kind, source, received_at, order_id, body) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                body["event_id"],
-                body["kind"],
-                body["source"],
-                iso(now),
-                order_id,
-                json.dumps(body, ensure_ascii=False, separators=(",", ":")),
-            ),
+            "INSERT INTO events (event_id, kind, source, received_at, order_id, body) "
+            "SELECT :event_id, :kind, :source, :received_at, :order_id, :body "
+            "WHERE NOT EXISTS (SELECT 1 FROM events WHERE event_id = :event_id)",
+            {
+                "event_id": body["event_id"],
+                "kind": body["kind"],
+                "source": body["source"],
+                "received_at": iso(now),
+                "order_id": order_id,
+                "body": json.dumps(body, ensure_ascii=False, separators=(",", ":")),
+            },
         )
         if cursor.rowcount == 0 or cursor.lastrowid is None:
             return None
@@ -243,8 +295,12 @@ class EventStore:
         return _body(rows[0]) if rows else None
 
     def events(self, *, order_id: str | None = None, after_seq: int = 0, limit: int = 50) -> list[dict[str, Any]]:
-        """Oldest first. With `after_seq`, the first `limit` events after it (paging forward); without, the newest
-        `limit`. `order_id` keeps one order's events."""
+        """Oldest first, at most `limit` of them (capped at MAX_EVENTS_LIMIT; none for a limit below 1). With
+        `after_seq` above 0, the first events after that seq (paging forward); with after_seq=0, the newest. `order_id`
+        keeps one order's events."""
+        if limit < 1:
+            return []
+        limit = min(limit, MAX_EVENTS_LIMIT)
         where = "seq > ?" + (" AND order_id = ?" if order_id else "")
         params: list[Any] = [after_seq] + ([order_id] if order_id else [])
         if after_seq > 0:
@@ -255,14 +311,18 @@ class EventStore:
         return [_body(r) for r in rows]
 
     def last_seq(self) -> int:
-        return int(self._read("SELECT coalesce(max(seq), 0) AS n FROM events")[0]["n"])
+        """The seq of the last event ever stored, 0 before the first. It never goes back, even when a prune empties
+        the events table: SQLite's AUTOINCREMENT counter is read, not the highest seq left."""
+        rows = self._read("SELECT seq FROM sqlite_sequence WHERE name = 'events'")
+        return int(rows[0]["seq"]) if rows else 0
 
     # --- doorbells ------------------------------------------------------------------------------------------------
 
     def ring(self, order_id: str, now: dt.datetime) -> None:
         with self.write() as con:
             con.execute(
-                "INSERT OR IGNORE INTO doorbells (order_id, first_rung_at, tries) VALUES (?, ?, 0)",
+                "INSERT INTO doorbells (order_id, first_rung_at, tries) VALUES (?, ?, 0) "
+                "ON CONFLICT(order_id) DO NOTHING",
                 (order_id, iso(now)),
             )
 
