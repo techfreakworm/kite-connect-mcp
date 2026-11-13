@@ -197,12 +197,16 @@ class EventStore:
     read-write; other processes open it read-only. One connection is shared by the threads of a process under a lock,
     every write goes through `write()`, and any failure to open, read or write it is a StoreError.
 
+    Only the event service makes a store (`create`, the default): a read-only open, or a read-write one with
+    create=False (the `events` commands), takes only a store that is there and set up, and says so when it is not.
+
     `timeout_s` is SQLite's busy timeout: how long a write waits for another process's write lock before it fails.
     """
 
-    def __init__(self, path: Path, *, readonly: bool = False, timeout_s: float = 5.0):
+    def __init__(self, path: Path, *, readonly: bool = False, create: bool = True, timeout_s: float = 5.0):
         self.path = Path(path)
         self.readonly = readonly
+        self.create = create and not readonly
         self._lock = threading.RLock()
         try:
             self._con = self._open(timeout_s)
@@ -210,13 +214,14 @@ class EventStore:
             raise StoreError(f"cannot open the event store {self.path}: {exc}") from None
 
     def _open(self, timeout_s: float) -> sqlite3.Connection:
-        if self.readonly:
+        if not self.create:
             try:  # not Path.exists(): a folder it cannot enter is an OSError (cannot open), not a missing store
                 self.path.stat()
             except (FileNotFoundError, NotADirectoryError):
                 raise StoreError(f"no event store at {self.path} (has the event service run?)") from None
             con = sqlite3.connect(
-                f"{self.path.resolve().as_uri()}?mode=ro",
+                # mode=rw, not a plain path: a file removed since the check above is not made anew
+                f"{self.path.resolve().as_uri()}?mode={'ro' if self.readonly else 'rw'}",
                 uri=True,
                 timeout=timeout_s,  # also sets SQLite's busy timeout
                 isolation_level=None,
@@ -250,7 +255,7 @@ class EventStore:
 
     def _check_version(self, con: sqlite3.Connection) -> None:
         """Refuse a file of another schema version, a database that is not an event store (tables, no version), and,
-        read-only, a file not set up yet (a read-write open sets up an empty one)."""
+        unless it may create the store, a file not set up yet (the event service sets up an empty one)."""
         version = _schema_version(con)
         if version == str(SCHEMA_VERSION):
             return
@@ -261,7 +266,7 @@ class EventStore:
             )
         if not _is_empty(con):
             raise StoreError(f"the file {self.path} is not an event store: it has tables but no schema version")
-        if self.readonly:
+        if not self.create:
             raise StoreError(f"the event store {self.path} is not set up yet (has the event service run?)")
 
     def close(self) -> None:
@@ -636,6 +641,10 @@ class EventStore:
 
     def paused(self) -> dict[str, str]:
         return {r["consumer"]: r["since"] for r in self._read("SELECT consumer, since FROM paused ORDER BY consumer")}
+
+    def consumer_names(self) -> set[str]:
+        """Every consumer the store knows: with a delivery, or paused (configured or not)."""
+        return {r["consumer"] for r in self._read("SELECT consumer FROM deliveries UNION SELECT consumer FROM paused")}
 
     # --- status ---------------------------------------------------------------------------------------------------
 

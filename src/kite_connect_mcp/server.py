@@ -45,8 +45,8 @@ def build_runtime(
     with_events: bool = True,
 ) -> Runtime:
     """The runtime of one server process. `with_events=False` leaves the event service out even with
-    KITE_MCP_EVENTS=true: a command that only reads (`status`, `tools`) must not open, lock or create the store the
-    serving process owns. The events tools then read the store read-only, when it exists."""
+    KITE_MCP_EVENTS=true: a command that is not the server (`status`, `tools`, `login`, `logout`) must not open, lock
+    or create the store the serving process owns. The events tools then read the store read-only, when it exists."""
     token_file = TokenFile(settings.token_file, writable=settings.auth_mode == "managed")
     tokens = TokenProvider(token_file=token_file, env_token=settings.access_token, clock=clock)
     client = KiteClient(settings, tokens, transport=transport, limiter=limiter or RateLimiter(sleep=sleep), sleep=sleep)

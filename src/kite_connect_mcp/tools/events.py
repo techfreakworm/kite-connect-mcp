@@ -62,7 +62,8 @@ def register(reg: Registrar) -> None:
         """Recent order events from the event store: fills, partial fills, cancellations, rejections, new and modified
         orders (from postbacks and the order-book poll), session events such as a rejected token, and delivery alerts.
         Each event has a one-line `text`. Oldest first. `last_seq` is the seq of the newest event stored: to page
-        forward, pass the last event's seq as after_seq; a page that ends at last_seq is the last one."""
+        forward, pass the last event's seq as after_seq, until a page that ends at last_seq, or an empty page (with
+        order_id, the order's last event is seldom the store's last)."""
         require(1 <= limit <= MAX_EVENTS, f"limit must be between 1 and {MAX_EVENTS}")
         require(0 <= after_seq <= MAX_SEQ, f"after_seq must be between 0 and {MAX_SEQ}")
         events = store.events(order_id=order_id, after_seq=after_seq, limit=limit)

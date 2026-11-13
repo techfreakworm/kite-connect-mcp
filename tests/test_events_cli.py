@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import httpx2
@@ -10,8 +11,9 @@ import pytest
 
 import kite_connect_mcp.server as server_module
 from conftest import API_SECRET, BEARER, FIXED_NOW
-from events_helpers import ORDER_ID, PY, filled_row, make_service, order_row
+from events_helpers import ORDER_ID, PY, filled_row, make_service, order_row, write_consumers
 from kite_connect_mcp import cli
+from kite_connect_mcp.auth.login import cli_login, cli_logout
 from kite_connect_mcp.errors import ConfigError, KiteMCPError
 from kite_connect_mcp.events import selftest
 from kite_connect_mcp.events.model import is_selftest_id
@@ -22,6 +24,7 @@ from kite_connect_mcp.tools._base import Runtime
 
 NOTIFY = {"name": "notify", "command": [PY, "-c", "pass"]}
 SERVICE = {"KITE_MCP_EVENTS": "true", "KITE_MCP_TRANSPORT": "http", "KITE_MCP_BEARER_TOKEN": BEARER}
+HTTP_NO_EVENTS = {"KITE_MCP_TRANSPORT": "http", "KITE_MCP_BEARER_TOKEN": BEARER, "KITE_MCP_POSTBACK_PATH": "/postback"}
 
 
 @pytest.fixture
@@ -59,14 +62,16 @@ def test_pause_resume_skip_and_retry(env, capsys):
     assert run(capsys, "pause", "notify")[0] == 0
     assert env.store.is_paused("notify")
     code, out = run(capsys, "resume", "notify", "--skip-backlog")
-    assert code == 0 and "2" in out.out and not env.store.is_paused("notify")
+    assert code == 0 and "2 waiting deliveries skipped" in out.out and not env.store.is_paused("notify")
     assert env.store.summary(["notify"])["consumers"]["notify"]["skipped"] == 2
     # both deliveries are skipped now, and only a pending one can fail: a new event's delivery fails
     seq = env.ingest_order(order_row(order_id="250101000000002"), source="poll")
     assert env.store.finish_delivery("notify", seq, "failed", env.clock(), "exit 1")
     code, out = run(capsys, "retry", "notify")
-    assert code == 0 and "1" in out.out
+    assert code == 0 and out.out.strip() == "1 failed delivery of notify queued again"
     assert env.store.summary(["notify"])["consumers"]["notify"]["pending"] == 1
+    code, out = run(capsys, "retry", "notify")
+    assert code == 0 and out.out.strip() == "0 failed deliveries of notify queued again"
 
 
 def test_an_unknown_consumer_is_an_error(env, capsys):
@@ -78,6 +83,45 @@ def test_a_paused_consumer_that_is_no_longer_configured_can_be_resumed(env, caps
     env.store.pause("retired", env.clock())  # paused once, then removed from the consumers file
     code, out = run(capsys, "resume", "retired")
     assert code == 0 and "resumed retired" in out.out and not env.store.is_paused("retired")
+
+
+def test_retry_refuses_a_consumer_no_longer_configured_unless_it_is_paused(env, capsys, tmp_path):
+    assert env.store.finish_delivery("notify", 1, "failed", env.clock(), "exit 1")
+    write_consumers(tmp_path, [{"name": "other", "command": [PY, "-c", "pass"]}])  # notify is removed from the file
+    code, out = run(capsys, "retry", "notify")
+    assert code == 2 and "no longer in the consumers file" in out.err
+    assert env.store.summary()["consumers"]["notify"]["failed"] == 1  # nothing was queued
+    assert run(capsys, "pause", "notify")[0] == 0  # known from its deliveries
+    code, out = run(capsys, "retry", "notify")  # paused: its deliveries wait for `resume`
+    assert code == 0 and out.out.strip() == "1 failed delivery of notify queued again"
+
+
+def test_a_name_neither_configured_nor_in_the_store_never_opens_it_read_write(env, capsys, monkeypatch):
+    opened = []
+    real_init = EventStore.__init__
+
+    def spy(self, path, *, readonly=False, **kw):
+        opened.append(readonly)
+        real_init(self, path, readonly=readonly, **kw)
+
+    monkeypatch.setattr(EventStore, "__init__", spy)
+    for action in ("pause", "resume", "retry"):
+        code, out = run(capsys, action, "nobody")
+        assert code == 2 and "unknown consumer 'nobody' (known: notify)" in out.err
+    assert opened == [True, True, True]
+
+
+def test_a_broken_consumers_file_falls_back_to_the_names_in_the_store(env, capsys, tmp_path):
+    (tmp_path / "consumers.json").write_text("{")
+    code, out = run(capsys, "pause", "notify")
+    assert code == 0 and env.store.is_paused("notify")
+    assert "warning" in out.err and "not valid JSON" in out.err and "the consumers the event store knows" in out.err
+    code, out = run(capsys, "status")
+    data = json.loads(out.out)
+    assert code == 0 and "notify" in data["consumers"] and "configured_consumers" not in data
+    assert "not valid JSON" in out.err
+    code, out = run(capsys, "pause", "nobody")
+    assert code == 2 and "unknown consumer 'nobody'" in out.err
 
 
 def test_status_and_tail_do_not_change_the_store(env, capsys):
@@ -100,10 +144,37 @@ def test_a_store_that_is_not_there_yet_is_not_created(capsys, monkeypatch, base_
         monkeypatch.setenv(key, value)
     missing = tmp_path / "events.sqlite3"
     monkeypatch.setenv("KITE_MCP_EVENTS_DB", str(missing))
-    for args in (("status",), ("pause", "notify")):
-        code, out = run(capsys, *args)
-        assert code == 2 and "no event store at" in out.err
+    for configured in (False, True):  # a configured name opens the store read-write at once: it must not create it
+        if configured:
+            monkeypatch.setenv("KITE_MCP_EVENTS_CONSUMERS_FILE", str(write_consumers(tmp_path, [NOTIFY])))
+        for args in (("status",), ("tail",), ("pause", "notify"), ("resume", "notify"), ("retry", "notify")):
+            code, out = run(capsys, *args)
+            assert code == 2 and "no event store at" in out.err, args
     assert not missing.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can enter any folder")
+def test_a_store_in_a_folder_it_cannot_enter_is_a_clean_error(capsys, monkeypatch, base_env, tmp_path):
+    for key, value in base_env.items():
+        monkeypatch.setenv(key, value)
+    folder = tmp_path / "locked"
+    EventStore(folder / "events.sqlite3").close()
+    monkeypatch.setenv("KITE_MCP_EVENTS_DB", str(folder / "events.sqlite3"))
+    monkeypatch.setenv("KITE_MCP_EVENTS_CONSUMERS_FILE", str(write_consumers(tmp_path, [NOTIFY])))
+    folder.chmod(0)
+    try:
+        for args in (("status",), ("tail",), ("pause", "notify"), ("pause", "nobody")):
+            code, out = run(capsys, *args)
+            assert code == 2 and "cannot open the event store" in out.err and "Traceback" not in out.err, args
+    finally:
+        folder.chmod(0o700)
+
+
+@pytest.mark.parametrize("limit", ["0", "-1", "1001", "many"])
+def test_tail_takes_a_limit_from_1_to_1000(env, capsys, limit):
+    with pytest.raises(SystemExit) as exit_:
+        cli.main(["events", "tail", "--limit", limit])
+    assert exit_.value.code == 2 and "--limit" in capsys.readouterr().err
 
 
 def test_the_selftest_payload_is_signed_and_marked():
@@ -146,9 +217,97 @@ def test_the_selftest_command(capsys, monkeypatch, base_env):
     assert code == 0 and "200" in out.out
     assert seen["url"] == "https://kite.example.com/postback" and verify_checksum(seen["payload"], API_SECRET)
     assert API_SECRET not in out.out + out.err
-    monkeypatch.setenv("KITE_MCP_POSTBACK_PATH", "/postback")
+    for key, value in {**SERVICE, "KITE_MCP_POSTBACK_PATH": "/postback"}.items():
+        monkeypatch.setenv(key, value)
     code, _ = run(capsys, "selftest")
     assert code == 0 and seen["url"] == "http://127.0.0.1:8765/postback"
+
+
+def test_without_the_event_service_the_selftest_needs_a_url(capsys, monkeypatch, base_env):
+    """With the events off, this server's route hands a postback to the ticker's buffer: there is nothing to test."""
+    for key, value in {**base_env, **HTTP_NO_EVENTS}.items():
+        monkeypatch.setenv(key, value)
+    sent = []
+
+    async def fake_send(url, payload, **_):
+        sent.append(url)
+        return 200
+
+    monkeypatch.setattr(selftest, "send", fake_send)
+    code, out = run(capsys, "selftest")
+    assert code == 2 and "KITE_MCP_EVENTS" in out.err and "--url" in out.err
+    assert sent == []
+
+
+async def test_a_selftest_to_a_server_without_the_event_service_is_refused(runtime_factory):
+    rt = runtime_factory(**HTTP_NO_EVENTS)
+    server, _ = build_server(rt)
+    app = build_http_app(server, rt)
+    status = await selftest.send(
+        "http://testserver/postback", selftest.build_payload(API_SECRET), transport=httpx2.ASGITransport(app=app)
+    )
+    assert status == 404
+    assert rt.ticker.events.recent(500)[0] == []  # no made-up order where agents read order updates
+
+
+@pytest.mark.parametrize(
+    ("status", "hint"),
+    [
+        (404, "the event service is off there"),
+        (403, "KITE_API_SECRET"),
+        (503, "event store cannot write"),
+        (308, "a redirect"),
+        (500, "(expected 200)"),
+    ],
+)
+def test_a_failed_selftest_says_what_its_answer_likely_means(capsys, monkeypatch, base_env, status, hint):
+    for key, value in base_env.items():
+        monkeypatch.setenv(key, value)
+
+    async def answer(url, payload, **_):
+        return status
+
+    monkeypatch.setattr(selftest, "send", answer)
+    code, out = run(capsys, "selftest", "--url", "https://kite.example.com/postback")
+    assert code == 1 and f"HTTP {status}" in out.out and hint in out.out
+
+
+def test_the_selftest_hides_a_password_in_the_url(capsys, monkeypatch, base_env):
+    for key, value in base_env.items():
+        monkeypatch.setenv(key, value)
+
+    async def ok(url, payload, **_):
+        return 200
+
+    monkeypatch.setattr(selftest, "send", ok)
+    code, out = run(capsys, "selftest", "--url", "https://someone:pw-ABCD@kite.example.com/postback")
+    assert code == 0 and "https://[redacted]@kite.example.com/postback" in out.out
+    assert "pw-ABCD" not in out.out + out.err and "someone" not in out.out + out.err
+
+
+@pytest.mark.parametrize(
+    ("url", "shown"),
+    [
+        ("https://kite.example.com/postback", "https://kite.example.com/postback"),
+        ("https://a:b@kite.example.com/postback", "https://[redacted]@kite.example.com/postback"),
+        ("http://a@127.0.0.1:8765/postback", "http://[redacted]@127.0.0.1:8765/postback"),
+        ("a:b@kite.example.com/postback", "[redacted]@kite.example.com/postback"),
+        ("https://kite.example.com/a@b", "https://kite.example.com/a@b"),
+        ("https://kite.example.com/?to=a@b", "https://kite.example.com/?to=a@b"),
+    ],
+)
+def test_a_url_is_shown_without_its_user_and_password(url, shown):
+    assert selftest.shown_url(url) == shown
+
+
+async def test_an_unreachable_url_is_reported_without_its_password():
+    with pytest.raises(KiteMCPError) as error:
+        await selftest.send(
+            "https://someone:pw-ABCD@kite.example.com/postback",
+            selftest.build_payload(API_SECRET),
+            transport=httpx2.MockTransport(_unreachable),
+        )
+    assert "pw-ABCD" not in str(error.value) and "[redacted]@kite.example.com" in str(error.value)
 
 
 def test_the_selftest_fails_on_a_refusal(capsys, monkeypatch, base_env):
@@ -207,6 +366,8 @@ def test_the_selftest_needs_the_api_secret(capsys, monkeypatch, base_env):
         ("0.0.0.0", "http://127.0.0.1:8765/postback"),
         ("::", "http://127.0.0.1:8765/postback"),
         ("::1", "http://[::1]:8765/postback"),
+        ("[::1]", "http://[::1]:8765/postback"),
+        ("[::]", "http://127.0.0.1:8765/postback"),
         ("localhost", "http://localhost:8765/postback"),
     ],
 )
@@ -271,6 +432,16 @@ def test_status_verify_closes_the_client_in_its_own_loop(no_service, capsys, mon
     assert json.loads(capsys.readouterr().out)["live_check"] == {"verified": True, "user_id": "AB1234"}
     assert len(closed) == 1 and closed[0].client._http.is_closed
     assert fake_kite.writes() == []
+
+
+async def test_login_and_logout_do_not_build_the_event_service(no_service, settings_factory, fake_kite, capsys):
+    settings = settings_factory(**SERVICE)
+    assert await cli_login(settings, request_token=None, listen=False, transport=fake_kite.transport()) == 0
+    settings.token_file.unlink()  # nothing to end at Kite: the logout makes no call
+    assert await cli_logout(settings, yes=True, transport=fake_kite.transport()) == 0
+    assert "There was no stored token" in capsys.readouterr().out
+    assert not _store_path(no_service).exists()
+    assert fake_kite.requests == []
 
 
 def test_tools_does_not_build_the_event_service(no_service, capsys):

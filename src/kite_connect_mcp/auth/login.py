@@ -534,7 +534,8 @@ async def cli_login(
         return 2
     from ..server import build_runtime  # imported here: server imports the tool modules, which import this one
 
-    rt = build_runtime(settings, transport=transport, clock=clock or now_ist)
+    # never the event service: it would open, lock or even create the store a serving process owns
+    rt = build_runtime(settings, transport=transport, clock=clock or now_ist, with_events=False)
     manager = rt.login
     try:
         if manager is None:  # build_runtime always sets it
@@ -664,7 +665,7 @@ async def cli_logout(
         return 2
     from ..server import build_runtime
 
-    rt = build_runtime(settings, transport=transport, clock=clock or now_ist)
+    rt = build_runtime(settings, transport=transport, clock=clock or now_ist, with_events=False)  # as in cli_login
     manager = rt.login
     try:
         if manager is None:

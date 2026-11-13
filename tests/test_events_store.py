@@ -164,6 +164,45 @@ def test_a_read_only_store(store, tmp_path):
         EventStore(tmp_path / "a-file" / "events.sqlite3", readonly=True)
 
 
+def test_an_open_that_must_not_create_a_store(store, tmp_path):
+    """create=False (the `events` commands that change delivery state): read-write, but only a store that is there."""
+    add(store, order_row())
+    store.close()
+    writer = EventStore(store.path, create=False)
+    assert not writer.readonly and writer.event(1)["order"]["order_id"] == ORDER_ID
+    writer.pause("notify", FIXED_NOW)
+    assert writer.is_paused("notify")
+    writer.close()
+    missing = tmp_path / "missing" / "events.sqlite3"
+    with pytest.raises(StoreError, match="no event store at"):
+        EventStore(missing, create=False)
+    assert not missing.parent.exists()
+    empty = tmp_path / "empty.sqlite3"
+    empty.touch()
+    with pytest.raises(StoreError, match=r"is not set up yet \(has the event service run\?\)"):
+        EventStore(empty, create=False)
+    assert empty.read_bytes() == b""
+
+
+def test_an_open_that_must_not_create_never_makes_the_file_even_when_it_goes_away_meanwhile(tmp_path, monkeypatch):
+    """The file is checked, then opened: if it is removed in between, SQLite must not make a new one."""
+    path = tmp_path / "events.sqlite3"
+    EventStore(path).close()
+    real_stat = type(path).stat
+
+    def stat_then_remove(self, *args, **kwargs):
+        result = real_stat(self, *args, **kwargs)
+        if self == path:
+            path.unlink()
+        return result
+
+    monkeypatch.setattr(type(path), "stat", stat_then_remove)
+    with pytest.raises(StoreError, match="cannot open the event store"):
+        EventStore(path, create=False)
+    monkeypatch.undo()
+    assert not path.exists()
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can enter any folder")
 def test_a_store_in_a_folder_it_cannot_enter_is_out_of_reach_not_missing(store):
     """Path.exists() raises here on Python 3.12 and says False on 3.13: neither must read as "no event store"."""

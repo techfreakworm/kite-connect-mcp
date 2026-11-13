@@ -107,6 +107,17 @@ def test_pause_resume_and_skip_the_backlog(store):
     assert store.next_delivery("notify", T0) == (None, None)
 
 
+def test_the_consumer_names_are_those_with_deliveries_or_paused(store):
+    assert store.consumer_names() == set()
+    add(store, "1", 100, consumers=("notify", "audit"))
+    store.pause("retired", T0)
+    store.pause("notify", T0)
+    assert store.consumer_names() == {"notify", "audit", "retired"}
+    reader = EventStore(store.path, readonly=True)
+    assert reader.consumer_names() == {"notify", "audit", "retired"}
+    reader.close()
+
+
 def test_the_summary(store):
     add(store, "1", 100)
     add(store, "2", 100)

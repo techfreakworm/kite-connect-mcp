@@ -22,6 +22,9 @@ What the checksum does not cover: it binds the order_id and order_timestamp only
 replayed or have its other fields altered and still verify. Treat what arrives as a notification and confirm anything
 that matters with the order book.
 
+Without the event service a signed selftest (`kite-connect-mcp events selftest`, an order id that starts with
+"selftest-") is answered 404: there is no event path to test, and a made-up order must not reach the buffer.
+
 With KITE_MCP_EVENTS=true the route is registered whenever KITE_MCP_POSTBACK_PATH is set, the ticker on or off, and a
 verified postback rings the event service's doorbell (or records a selftest): the order is then re-read from Kite and
 nothing from the payload is stored (see events/doorbell.py). With KITE_MCP_ALLOWED_USER_ID set, a postback for another
@@ -185,6 +188,10 @@ class PostbackRoute:
         if not verify_checksum(payload, secret):
             return refuse(403, "bad checksum", "the checksum is missing or does not match")
         if events is None:
+            if payload["order_id"].startswith(SELFTEST_PREFIX):  # a str (checked); ours, never Kite's: keep it out
+                line = "postback refused: a selftest, but the event service is off here (KITE_MCP_EVENTS)"
+                self._log_limited("selftest without events", logging.WARNING, line)
+                return _bare(404)  # `events selftest` then fails: there is no event path here to test
             ticker = self.rt.ticker
             if ticker is None:
                 return _bare(503)

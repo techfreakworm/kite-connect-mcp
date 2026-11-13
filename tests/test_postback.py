@@ -243,6 +243,22 @@ async def test_a_postback_needs_no_login(make_app, http, tmp_path):
     assert (await send(http(app), postback())).status_code == 200
 
 
+@pytest.mark.parametrize("order_id", ["selftest-0123456789ab", "selftest-", "selftest-not-ours"])
+async def test_a_selftest_is_refused_without_the_event_service(make_app, http, caplog, order_id):
+    """`events selftest` tests the event path: without the service it must fail, and leave no made-up order in the
+    buffer that `ticker_order_updates` returns to agents."""
+    rt, _, app = make_app()
+    client = http(app)
+    with caplog.at_level(logging.INFO, logger="kite_connect_mcp"):
+        responses = [await send(client, postback(order_id=order_id, order_timestamp=f"{STAMP}")) for _ in range(2)]
+    assert [(r.status_code, r.content) for r in responses] == [(404, b"")] * 2
+    assert buffered(rt) == []
+    lines = [r.getMessage() for r in caplog.records if "selftest" in r.getMessage()]
+    assert lines == ["postback refused: a selftest, but the event service is off here (KITE_MCP_EVENTS)"]  # once
+    assert order_id not in caplog.text
+    assert (await send(client, postback())).status_code == 200 and len(buffered(rt)) == 1  # a real one still goes
+
+
 async def test_without_a_ticker_manager_it_is_a_503(make_app, http):
     rt, _, app = make_app()
     rt.ticker = None

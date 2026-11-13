@@ -214,16 +214,56 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
 
 def _open_store(settings: Settings, *, readonly: bool) -> EventStore:
-    """The event store by its path, never through build_runtime: these commands work while the service runs, and never
-    create a store."""
-    from .events.store import EventStore
+    """The event store by its path, never through build_runtime: these commands work while the service runs. A store
+    that is not there is never made, and one that cannot be opened (missing, out of reach, another schema version) is
+    a ConfigError with EventStore's reason."""
+    from .events.store import EventStore, StoreError
 
     path = settings.events_db
     if path is None:
         raise ConfigError("no event store: set KITE_MCP_EVENTS=true or KITE_MCP_EVENTS_DB")
-    if not path.exists():
-        raise ConfigError(f"no event store at {path} (has the event service run?)")
-    return EventStore(path, readonly=readonly)
+    try:
+        return EventStore(path, readonly=readonly, create=False)
+    except StoreError as exc:
+        raise ConfigError(str(exc)) from None
+
+
+def _configured_consumers(settings: Settings) -> list[str] | None:
+    """The names in the consumers file, or None when it cannot be read: that is said on stderr, and the commands go on
+    with the names the store knows, so a consumer can still be paused while its file is broken."""
+    from .events.consumers import ConsumersConfig
+
+    try:
+        return [c.name for c in ConsumersConfig.load(settings.events_consumers_file).consumers]
+    except ConfigError as exc:
+        print(f"kite-connect-mcp: warning: {exc}\n(going on with the consumers the event store knows)", file=sys.stderr)
+        return None
+
+
+def _check_consumer(settings: Settings, action: str, name: str) -> None:
+    """Refuse, before the store is opened read-write, a name that is neither in the consumers file nor in the store (a
+    typo), and `retry` for a consumer no longer in the file unless it is paused: no router would deliver what it
+    queues. A paused one's deliveries wait for `resume`, by which time it may be configured again."""
+    configured = _configured_consumers(settings)
+    if configured is not None and name in configured:
+        return
+    store = _open_store(settings, readonly=True)
+    try:
+        known, paused = store.consumer_names(), store.is_paused(name)
+    finally:
+        store.close()
+    if name not in known:
+        everyone = ", ".join(sorted(known | set(configured or ()))) or "none"
+        raise ConfigError(f"unknown consumer {name!r} (known: {everyone})")
+    if action == "retry" and configured is not None and not paused:
+        raise ConfigError(
+            f"{name!r} is no longer in the consumers file, so no router would deliver what retry queues: add it back "
+            "first, or pause it to queue its failed deliveries for a later resume"
+        )
+
+
+def _deliveries(count: int, what: str) -> str:
+    return f"{count} {what} {'delivery' if count == 1 else 'deliveries'}"
 
 
 def cmd_events(args: argparse.Namespace) -> int:
@@ -232,39 +272,58 @@ def cmd_events(args: argparse.Namespace) -> int:
     if action == "selftest":
         from .events import selftest
 
+        if not args.url and not settings.events:
+            raise ConfigError(
+                "the event service is off in this configuration (KITE_MCP_EVENTS), so a selftest of this server has "
+                "nothing to test: turn it on, or give --url of a server that has it"
+            )
         url = args.url or selftest.default_url(settings)
         status = asyncio.run(selftest.send(url, selftest.build_payload(settings.require_api_secret())))
-        print(f"selftest: POST {url} -> HTTP {status}" + ("" if status == 200 else " (expected 200)"))
+        print(f"selftest: POST {selftest.shown_url(url)} -> HTTP {status}{selftest.explain(status)}")
         return 0 if status == 200 else 1
-    from .events.consumers import ConsumersConfig
     from .events.service import describe_status
     from .timeutil import now_ist
 
-    store = _open_store(settings, readonly=action in ("status", "tail"))
+    if action in ("status", "tail"):
+        names = _configured_consumers(settings) if action == "status" else None
+        store = _open_store(settings, readonly=True)
+        try:
+            if action == "status":
+                print(json.dumps(describe_status(store, settings, now_ist(), names), indent=2, default=str))
+            else:
+                for event in store.events(order_id=args.order, limit=args.limit):
+                    print(json.dumps(event, ensure_ascii=False))
+        finally:
+            store.close()
+        return 0
+    name = args.consumer
+    _check_consumer(settings, action, name)
+    store = _open_store(settings, readonly=False)
     try:
-        if action == "status":
-            names = [c.name for c in ConsumersConfig.load(settings.events_consumers_file).consumers]
-            print(json.dumps(describe_status(store, settings, now_ist(), names), indent=2, default=str))
-            return 0
-        if action == "tail":
-            for event in store.events(order_id=args.order, limit=args.limit):
-                print(json.dumps(event, ensure_ascii=False))
-            return 0
-        known = {c.name for c in ConsumersConfig.load(settings.events_consumers_file).consumers}
-        known |= set(store.summary()["consumers"]) | set(store.paused())  # also one no longer configured
-        if args.consumer not in known:
-            raise ConfigError(f"unknown consumer {args.consumer!r} (known: {', '.join(sorted(known)) or 'none'})")
         if action == "pause":
-            store.pause(args.consumer, now_ist())
-            print(f"paused {args.consumer}: events are still recorded; `resume` delivers them")
+            store.pause(name, now_ist())
+            print(f"paused {name}: events are still recorded; `resume` delivers them")
         elif action == "resume":
-            skipped = store.resume(args.consumer, skip_backlog=args.skip_backlog, now=now_ist())
-            print(f"resumed {args.consumer}" + (f"; {skipped} waiting deliveries skipped" if args.skip_backlog else ""))
+            skipped = store.resume(name, skip_backlog=args.skip_backlog, now=now_ist())
+            print(f"resumed {name}" + (f"; {_deliveries(skipped, 'waiting')} skipped" if args.skip_backlog else ""))
         elif action == "retry":
-            print(f"{store.retry_failed(args.consumer, now_ist())} failed deliveries of {args.consumer} queued again")
+            print(f"{_deliveries(store.retry_failed(name, now_ist()), 'failed')} of {name} queued again")
         return 0
     finally:
         store.close()
+
+
+def _event_limit(text: str) -> int:
+    """`events tail --limit`: 1 to MAX_EVENTS_LIMIT, as the store gives at most that many."""
+    from .events.store import MAX_EVENTS_LIMIT
+
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if not 1 <= value <= MAX_EVENTS_LIMIT:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_EVENTS_LIMIT}, not {value}")
+    return value
 
 
 def cmd_login(args: argparse.Namespace) -> int:
@@ -339,7 +398,9 @@ def build_parser() -> argparse.ArgumentParser:
     events_sub = events.add_subparsers(dest="events_command", required=True)
     events_sub.add_parser("status", help="health of the postbacks, the poll and each consumer")
     tail = events_sub.add_parser("tail", help="print recent events as JSON lines")
-    tail.add_argument("--limit", type=int, default=20)
+    tail.add_argument(
+        "--limit", type=_event_limit, default=20, help="how many of the newest (default 20, at most 1000)"
+    )
     tail.add_argument("--order", help="only this order's events")
     for name, text in (
         ("pause", "hold a consumer's deliveries (events are still recorded)"),
