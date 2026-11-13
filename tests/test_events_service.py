@@ -136,6 +136,55 @@ def test_a_router_event_never_reaches_its_own_consumer_and_never_cascades(svc):
     assert svc.record_router_event("delivery_failed", consumer="fills", about=router, error="x", seed="t2") is None
 
 
+def test_fail_delivery_records_the_failure_with_its_router_event(svc):
+    svc.ingest_order(order_row(), source="poll")
+    seq = svc.ingest_order(filled_row(), source="poll")  # a fill: for fills too
+    seen = []
+    svc.on_event(lambda: seen.append([e["kind"] for e in svc.store.events()]))
+    delivery, _ = svc.store.next_delivery("fills", FIXED_NOW)
+    assert svc.fail_delivery("fills", delivery, "exit 1: boom", FIXED_NOW) is True
+    (router,) = [e for e in svc.store.events() if e["kind"] == "router"]
+    assert router["router"] == "delivery_failed" and router["consumer"] == "fills" and router["about_seq"] == seq
+    assert router["error"] == "exit 1: boom"
+    assert deliveries(svc, "notify")[-1] == router["seq"] and router["seq"] not in deliveries(svc, "fills")
+    assert seen == [["order", "order", "router"]]  # told once, after the commit
+    assert svc.store.summary()["consumers"]["fills"]["last_error"] == "exit 1: boom"
+    assert svc.fail_delivery("fills", delivery, "exit 1: again", FIXED_NOW) is False  # no longer pending
+    assert len([e for e in svc.store.events() if e["kind"] == "router"]) == 1 and len(seen) == 1
+
+
+def test_a_failed_delivery_of_a_router_event_raises_no_other(svc):
+    about = svc.store.event(svc.ingest_order(filled_row(), source="poll"))
+    svc.record_router_event("delivery_failed", consumer="fills", about=about, error="exit 1", seed="t")
+    delivery, _ = svc.store.next_delivery("notify", FIXED_NOW)
+    while svc.store.event(delivery.seq)["kind"] != "router":
+        svc.store.finish_delivery("notify", delivery.seq, "done", FIXED_NOW)
+        delivery, _ = svc.store.next_delivery("notify", FIXED_NOW)
+    last = svc.store.last_seq()
+    assert svc.fail_delivery("notify", delivery, "exit 1", FIXED_NOW) is True
+    assert svc.store.last_seq() == last and svc.store.summary()["consumers"]["notify"]["failed"] == 1
+
+
+def test_alert_delayed_marks_the_delivery_and_records_its_router_event_once(svc):
+    svc.ingest_order(order_row(), source="poll")
+    seq = svc.ingest_order(filled_row(), source="poll")
+    later = FIXED_NOW + dt.timedelta(seconds=90)
+    svc.store.retry_delivery(
+        "fills", seq, first_try_at=FIXED_NOW, next_try_at=later, now=FIXED_NOW, error="exit 75: busy"
+    )
+    (delivery,) = svc.store.overdue_alerts("fills", later, 60)
+    assert svc.alert_delayed("fills", delivery, later) is True
+    (router,) = [e for e in svc.store.events() if e["kind"] == "router"]
+    assert router["router"] == "delivery_delayed" and router["about_seq"] == seq and router["error"] == "exit 75: busy"
+    assert router["seq"] in deliveries(svc, "notify") and router["seq"] not in deliveries(svc, "fills")
+    assert svc.store.summary()["consumers"]["fills"]["delayed"] == 1
+    assert svc.store.overdue_alerts("fills", later, 60) == []
+    svc.alert_delayed("fills", delivery, later)  # a repeat records nothing new
+    assert len([e for e in svc.store.events() if e["kind"] == "router"]) == 1
+    svc.store.finish_delivery("fills", seq, "done", later)
+    assert svc.alert_delayed("fills", delivery, later) is False  # no longer pending
+
+
 def test_ring_and_refused(svc):
     svc.ring(ORDER_ID)
     assert svc.store.doorbells() == [(ORDER_ID, 0)]

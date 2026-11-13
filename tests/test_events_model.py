@@ -14,6 +14,7 @@ from kite_connect_mcp.events.model import (
     OrderView,
     Previous,
     canonical,
+    clean_error_text,
     clean_reason,
     judge,
     normalize_status,
@@ -356,6 +357,30 @@ def test_a_link_is_removed_before_the_error_is_clipped():
         "delivery_failed", consumer="notify", about=about, error=error, seed="t", received_at=FIXED_NOW
     )
     assert failed["error"] == "x" * 190 + " [link]"
+
+
+@pytest.mark.parametrize(
+    ("raw", "clean"),
+    [
+        (
+            "exit 1: curl failed\nhttps://hooks.example.com/T000/secret\n\tretrying  later ",
+            "exit 1: curl failed [link] retrying later",
+        ),
+        (
+            "\x1b[31mERROR\x1b[0m: post\tfailed\r\nsee https://hooks.example.com/T000/secret\x07 now",
+            "ERROR: post failed see [link] now",
+        ),
+        ("a\x00b\u202ec \u2028 d\x1b", "abc d"),  # NUL, a bidi override, a line separator, a lone escape
+        (
+            "https://hooks.example.com/T0\x1b[0m00/secret and www.example.com/x",
+            "[link] and [link]",
+        ),  # an escape inside a link
+        (" \n\t ", ""),
+    ],
+)
+def test_clean_error_text_is_one_printable_line_without_links(raw, clean):
+    assert clean_error_text(raw) == clean
+    assert clean_error_text(clean) == clean  # cleaning again changes nothing
 
 
 def test_a_blank_delivery_error_is_none():

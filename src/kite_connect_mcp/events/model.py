@@ -48,6 +48,7 @@ MAX_EXPONENT = 30  # no price or quantity needs more digits; a number further ou
 _FINAL_CHANGE = {"COMPLETE": "filled", "CANCELLED": "cancelled", "REJECTED": "rejected"}
 _ACCOUNT_RE = re.compile(r"(?i)\baccount-[A-Za-z0-9]+")
 _LINK_RE = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
+_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")  # a terminal's control sequence (colour, cursor): ESC [ ... letter
 
 
 def normalize_status(raw: object) -> str:
@@ -368,12 +369,21 @@ def session_event(name: str, *, seed: str, received_at: dt.datetime) -> dict[str
     }
 
 
+def clean_error_text(text: str) -> str:
+    """Text from a command (its stderr) made fit for a log, a terminal and other consumers: terminal control sequences
+    and other unprintable characters dropped, whitespace and line breaks run into single spaces, links as "[link]".
+    Nothing is clipped: clip after cleaning, so a clipped text never shows part of a link. Cleaning twice changes
+    nothing. A secret without a scheme (a token in a path) is not recognised: commands must not print secrets."""
+    text = _ESCAPE_RE.sub("", text)
+    text = "".join(ch for ch in text if ch.isprintable() or ch.isspace())
+    return _LINK_RE.sub("[link]", " ".join(text.split()))
+
+
 def _clean_error(error: str | None) -> str | None:
-    """A failed delivery's error, often a command's stderr: one line, links as "[link]", clipped to MAX_ERROR_CHARS.
-    Links go before the clip, so a clipped error never shows part of one."""
+    """A failed delivery's error, often a command's stderr: clean_error_text, clipped to MAX_ERROR_CHARS."""
     if not error:
         return None
-    return _LINK_RE.sub("[link]", " ".join(error.split()))[:MAX_ERROR_CHARS].rstrip() or None
+    return clean_error_text(error)[:MAX_ERROR_CHARS].rstrip() or None
 
 
 def router_event(

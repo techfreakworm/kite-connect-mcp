@@ -7,16 +7,28 @@ order's events go to it one at a time and in order, and an order still retrying 
 The consumer contract:
   stdin    one event as JSON, then a newline
   env      PATH, HOME, LANG, KITE_EVENT_CONSUMER=<name>, and the consumer's env_pass names; never KITE_*
+  stdout   discarded
+  stderr   its end becomes the delivery's error: one line, control characters dropped, links as "[link]", clipped.
+           It reaches the service's log, `events status` and the other consumers' delivery_failed events, so never
+           print a secret to it (a token in a path is not recognised as a link)
   exit 0   handled (including a refusal the consumer reported itself): done
   exit 75  temporary failure: retried (10 s, 30 s, 1 min, 2 min, 5 min, then every 5 min, for 30 min in all)
-  timeout  the process group is killed: like 75
+  signal   killed by a signal (a service stop, the OOM killer): like 75
+  timeout  the process group is killed: like 75. A command has ended when it has exited and its stderr is closed, so
+           a process it starts in the background must not keep stderr open (redirect it), or the delivery times out
   other    permanent failure: `delivery_failed` at once, no retry
-A delivery still retrying past its alert point raises `delivery_delayed` once. Deliveries are at least once (a crash
-between the command and the bookkeeping repeats it), so a consumer must be idempotent on event_id.
+A command that cannot start fails for good, unless the system is short of something for a while (EAGAIN, ENOMEM,
+EMFILE, ENFILE, ETXTBSY): then it is retried like 75. A delivery still retrying past its alert point raises
+`delivery_delayed` once. Deliveries are at least once (a crash between the command and the bookkeeping repeats it),
+so a consumer must be idempotent on event_id.
 
 The program is checked again before each run (events/trust.py): a program that someone else could change since the
 consumers file was loaded, or that is gone, is a permanent failure and is not run. The log names a consumer and its
 program, never the command's arguments (they may hold what belongs in env_pass) nor the event.
+
+Only the last STDERR_KEEP bytes of stderr are kept while it is read, not after, so a command that floods it cannot
+fill the server's memory. A failure is written with its delivery_failed event, and an alert's mark with its
+delivery_delayed event, in one transaction (EventService.fail_delivery, alert_delayed).
 """
 
 from __future__ import annotations
@@ -24,17 +36,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import errno
 import json
 import logging
 import os
+import re
 import signal
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from ._wait import wait_any
 from .consumers import EXIT_RETRY, Consumer, consumer_env
-from .model import MAX_ERROR_CHARS
-from .store import Delivery, iso
+from .model import MAX_ERROR_CHARS, clean_error_text
+from .store import Delivery
 from .trust import check_owned_file
 
 if TYPE_CHECKING:
@@ -42,11 +56,81 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+STDERR_KEEP = 4096  # the bytes of a command's stderr kept, from its end: plenty for an error, never more
+_READ_CHUNK = 65536
+_TEMPORARY_START_ERRNOS = frozenset({errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE, errno.ETXTBSY})
+_FIRST_WORD_RE = re.compile(r"^\S*")
 
-def _tail(data: bytes | None) -> str:
-    """The end of a command's stderr, on one line."""
-    text = " ".join((data or b"").decode("utf-8", "replace").split())
-    return text[-MAX_ERROR_CHARS:]
+Spawn = Callable[..., Awaitable[asyncio.subprocess.Process]]
+
+
+async def _read_tail(stream: asyncio.StreamReader) -> tuple[bytes, bool]:
+    """Read `stream` to its end, keeping only its last STDERR_KEEP bytes. Returns them, and whether anything before
+    them was dropped."""
+    tail = bytearray()
+    cut = False
+    while chunk := await stream.read(_READ_CHUNK):
+        tail += chunk
+        if len(tail) > STDERR_KEEP:
+            del tail[:-STDERR_KEEP]
+            cut = True
+    return bytes(tail), cut
+
+
+async def _feed(stdin: asyncio.StreamWriter, data: bytes) -> None:
+    """Write the event and close stdin. A command that exits without reading it is not an error here: its exit code
+    tells how it went."""
+    try:
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            stdin.write(data)
+            await stdin.drain()
+    finally:
+        stdin.close()
+
+
+async def _converse(proc: asyncio.subprocess.Process, data: bytes) -> tuple[bytes, bool]:
+    """Give the command its event, read the end of its stderr (see _read_tail) and wait for it to exit."""
+    assert proc.stdin is not None  # spawned with stdin and stderr as pipes
+    assert proc.stderr is not None
+    reading = asyncio.ensure_future(_read_tail(proc.stderr))
+    try:
+        await _feed(proc.stdin, data)
+        tail = await reading
+        await proc.wait()
+    finally:
+        reading.cancel()
+    return tail
+
+
+async def _reap(proc: asyncio.subprocess.Process) -> None:
+    """After a kill: read what is left of stderr, so that the end of the pipe is seen (a pipe left full is no longer
+    read), and wait for the process."""
+    assert proc.stderr is not None
+    await asyncio.gather(_read_tail(proc.stderr), proc.wait())
+
+
+def _stderr_text(data: bytes, cut: bool) -> str:
+    """The kept end of a command's stderr as clean text (model.clean_error_text). When its start was dropped, the
+    first word can be the end of a longer one, a link that cleaning would no longer recognise among them: it goes."""
+    text = data.decode("utf-8", "replace")
+    if cut:
+        text = _FIRST_WORD_RE.sub("", text, count=1)
+    return clean_error_text(text)
+
+
+def _error(head: str, stderr: str) -> str:
+    """`head` ("exit 3"), then as much of the end of the clean `stderr` as fits with it in MAX_ERROR_CHARS. Clipping
+    after cleaning never leaves part of a link."""
+    room = MAX_ERROR_CHARS - len(head) - 2
+    tail = stderr[-room:].lstrip() if room > 0 and stderr else ""
+    return f"{head}: {tail}" if tail else head
+
+
+def _signal_name(number: int) -> str:
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return f"signal {number}"
 
 
 def _kill(proc: asyncio.subprocess.Process) -> None:
@@ -62,13 +146,13 @@ class Router:
     IDLE_S = 30.0  # the longest a worker sleeps: a change from another process (events resume, retry) wakes no one
     PAUSED_S = 5.0  # how often a paused consumer is looked at again
 
-    def __init__(self, service: EventService, *, environ: Mapping[str, str] | None = None, spawn: Any = None):
+    def __init__(self, service: EventService, *, environ: Mapping[str, str] | None = None, spawn: Spawn | None = None):
         self.service = service
         self.store = service.store
         self.config = service.config
         self.clock = service.clock
         self._environ = dict(os.environ if environ is None else environ)
-        self._spawn = spawn or asyncio.create_subprocess_exec
+        self._spawn: Spawn = spawn or asyncio.create_subprocess_exec
         self._wake = {c.name: asyncio.Event() for c in self.config.consumers}
         service.on_event(self.wake)
 
@@ -101,7 +185,9 @@ class Router:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("router: the loop for consumer %s failed; retrying in %d s", consumer.name, self.IDLE_S)
+                log.exception(
+                    "order events: the loop for consumer %s failed; retrying in %d s", consumer.name, self.IDLE_S
+                )
                 wait = self.IDLE_S
             if wait is not None:
                 await wait_any(wait, wake, stop)
@@ -151,47 +237,38 @@ class Router:
             ):
                 return self._decided_elsewhere(consumer, delivery)
             log.warning(
-                "router: event %d for %s will be retried in %d s (%s)", delivery.seq, consumer.name, delay, error
+                "order events: event %d for %s will be retried in %d s (%s)", delivery.seq, consumer.name, delay, error
             )
             return "retry"
-        if not self.store.finish_delivery(consumer.name, delivery.seq, "failed", now, error):
+        if not self.service.fail_delivery(consumer.name, delivery, error, now):  # with its delivery_failed event
             return self._decided_elsewhere(consumer, delivery)
-        log.warning("router: delivering event %d to %s failed: %s", delivery.seq, consumer.name, error)
-        self.service.record_router_event(
-            "delivery_failed", consumer=consumer.name, about=body, error=error, seed=iso(now)
-        )
+        log.warning("order events: delivering event %d to %s failed: %s", delivery.seq, consumer.name, error)
         return "failed"
 
     def _decided_elsewhere(self, consumer: Consumer, delivery: Delivery) -> str:
         """The delivery was skipped (events resume --skip-backlog) or pruned while it ran: leave it as it is."""
         log.info(
-            "router: event %d for %s was changed while it was delivered; left as it is", delivery.seq, consumer.name
+            "order events: event %d for %s was changed while it was delivered; left as it is",
+            delivery.seq,
+            consumer.name,
         )
         return "skipped"
 
     def _report_delays(self, consumer: Consumer, now: dt.datetime) -> None:
-        """Raise `delivery_delayed` once for each delivery of `consumer` still retrying past its alert point."""
+        """Raise `delivery_delayed` once for each delivery of `consumer` still retrying past its alert point: the mark
+        and the event are written together, so a store error leaves the alert due, not lost."""
         for delivery in self.store.overdue_alerts(consumer.name, now, consumer.alert_after_s):
-            if not self.store.mark_alerted(consumer.name, delivery.seq):
-                continue
-            body = self.store.event(delivery.seq)
-            if body is not None and delivery.first_try_at is not None:
-                self.service.record_router_event(
-                    "delivery_delayed",
-                    consumer=consumer.name,
-                    about=body,
-                    error=delivery.last_error,
-                    seed=iso(delivery.first_try_at),
-                )
+            self.service.alert_delayed(consumer.name, delivery, now)
 
     async def run_command(self, consumer: Consumer, body: Mapping[str, Any]) -> tuple[str, str | None]:
-        """("done" | "retry" | "failed", error text or None). The event goes on stdin; stdout is discarded; the end of
-        stderr becomes the error."""
+        """("done" | "retry" | "failed", error text or None): see the contract in the module docstring. The event
+        goes on stdin; stdout is discarded; the end of stderr, cleaned, ends the error. An error is clean text of at
+        most MAX_ERROR_CHARS, the same in the log, the store and the router event."""
         data = (json.dumps(body, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
         # again now (a chmod since loading is caught), off the event loop: user and group lookups can be slow
         problem = await asyncio.to_thread(check_owned_file, consumer.command[0], "the program")
         if problem is not None:
-            return "failed", problem
+            return "failed", clean_error_text(problem)[:MAX_ERROR_CHARS]
         try:
             proc = await self._spawn(
                 *consumer.command,
@@ -202,20 +279,28 @@ class Router:
                 start_new_session=True,
             )
         except OSError as exc:
-            return "failed", f"cannot start the command: {exc.strerror or type(exc).__name__}"
+            outcome = "retry" if exc.errno in _TEMPORARY_START_ERRNOS else "failed"  # short of processes, memory, files
+            return outcome, f"cannot start the command: {exc.strerror or type(exc).__name__}"
         try:
-            _, err = await asyncio.wait_for(proc.communicate(data), consumer.timeout_s)
+            err, cut = await asyncio.wait_for(_converse(proc, data), consumer.timeout_s)
         except TimeoutError:
+            exited = proc.returncode  # set when the command itself has exited: then stderr is held by what it started
             _kill(proc)
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(proc.wait(), 5)
-            return "retry", f"timed out after {consumer.timeout_s:g} s"
-        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):  # read the rest, so the pipe's end is seen and the process is reaped
+                await asyncio.wait_for(_reap(proc), 5)
+            error = f"timed out after {consumer.timeout_s:g} s"
+            if exited is not None:
+                error += f": the command exited {exited}, but a process it started kept stderr open"
+            return "retry", error
+        except BaseException:  # cancelled as the router stops, or anything else: never leave the command unwatched
             _kill(proc)
             raise
-        tail = _tail(err)
-        if proc.returncode == 0:
+        code = proc.returncode
+        if code == 0:
             return "done", None
-        if proc.returncode == EXIT_RETRY:
-            return "retry", "exit 75" + (f": {tail}" if tail else "")
-        return "failed", f"exit {proc.returncode}" + (f": {tail}" if tail else "")
+        stderr = _stderr_text(err, cut)
+        if code is not None and code < 0:
+            return "retry", _error(f"killed by {_signal_name(-code)}", stderr)
+        if code == EXIT_RETRY:
+            return "retry", _error(f"exit {EXIT_RETRY}", stderr)
+        return "failed", _error(f"exit {code}", stderr)

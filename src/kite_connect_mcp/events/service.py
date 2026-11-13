@@ -4,12 +4,16 @@ It owns the store and the consumers config, and is the only place events are cre
     ingest_order          a row read from Kite (the doorbell's re-read, or the poll) -> an order event, or nothing
     note_token_rejected   Kite refused the stored token -> one session event per token
     record_selftest       a verified selftest postback -> a selftest event
-    record_router_event   a delivery that is late or failed -> a router event (never to its own consumer)
+    fail_delivery         a delivery that failed for good -> its failure and a delivery_failed router event
+    alert_delayed         a delivery still retrying past its alert point -> a delivery_delayed router event, once
     ring / refused        the postback route's doorbell and its refusal counter
 
-Every new event is written in one transaction with its order's state, the counter it moves (selftest_received) and a
-pending delivery per matching consumer, then the listeners (the router) are told; a doorbell is kept in one
-transaction with its counter (postback_accepted). So a StoreError means none of it was kept.
+A router event never goes to the consumer it is about, and nothing is raised about a router event itself.
+
+Every new event is written in one transaction with its order's state, the counter it moves (selftest_received), the
+delivery change it reports (a failure, an alert sent) and a pending delivery per matching consumer, then the listeners
+(the router) are told; a doorbell is kept in one transaction with its counter (postback_accepted). So a StoreError means
+none of it was kept.
 
 It builds its parts (the doorbell worker, the poller, the router), and start()/stop() run them, with the housekeeping
 that prunes old events, as tasks on the event loop; the HTTP server starts the service as it comes up and stops it as
@@ -47,7 +51,7 @@ from .model import (
 )
 from .poll import Poller, in_poll_window, last_closed_poll_day
 from .router import Router
-from .store import EventStore, StoreError
+from .store import Delivery, EventStore, StoreError, iso
 
 if TYPE_CHECKING:
     from ..auth.tokenstore import TokenProvider
@@ -210,14 +214,70 @@ class EventService:
     def record_router_event(
         self, name: str, *, consumer: str, about: Mapping[str, Any], error: str | None, seed: str
     ) -> int | None:
-        """A late or failed delivery, for the other consumers. Nothing is raised about a router event itself, so two
-        failing consumers cannot report each other's failures forever."""
+        """A late or failed delivery, for the other consumers, on its own (the router uses fail_delivery and
+        alert_delayed, which write it with the delivery change it reports). Nothing is raised about a router event
+        itself, so two failing consumers cannot report each other's failures forever."""
+        now = self.clock()
+        body = self._router_body(name, consumer=consumer, about=about, error=error, seed=seed, now=now)
+        if body is None:
+            return None
+        return self._insert(body, order_id=None, consumers=self.config.matching(body, exclude=consumer), now=now)
+
+    def fail_delivery(self, consumer: str, delivery: Delivery, error: str | None, now: dt.datetime) -> bool:
+        """Mark a pending delivery failed with `error`, and record its delivery_failed event (seeded with the failure
+        time) for the other consumers, in one transaction. False, with nothing written, when the delivery is no longer
+        pending (skipped or pruned while its command ran): then no event is raised either."""
+        return self._router_change("delivery_failed", consumer, delivery, error, seed=iso(now), now=now)
+
+    def alert_delayed(self, consumer: str, delivery: Delivery, now: dt.datetime) -> bool:
+        """Mark the delivery_delayed alert of a pending delivery sent, and record that event (seeded with the first
+        try, so it is stored once per round of tries) for the other consumers, in one transaction. False, with nothing
+        written, when the delivery is no longer pending or was never tried."""
+        if delivery.first_try_at is None:
+            return False
+        return self._router_change(
+            "delivery_delayed", consumer, delivery, delivery.last_error, seed=iso(delivery.first_try_at), now=now
+        )
+
+    def _router_change(
+        self, name: str, consumer: str, delivery: Delivery, error: str | None, *, seed: str, now: dt.datetime
+    ) -> bool:
+        """The delivery change behind router event `name` and the event itself, in one write; listeners are told
+        after the commit, when the event is new."""
+        with self.store.write() as con:
+            if name == "delivery_failed":
+                changed = self.store.finish_delivery(consumer, delivery.seq, "failed", now, error, con=con)
+            else:
+                changed = self.store.mark_alerted(consumer, delivery.seq, con=con)
+            if not changed:
+                return False
+            about = self.store.event(delivery.seq, con=con)
+            body = None
+            if about is not None:
+                body = self._router_body(name, consumer=consumer, about=about, error=error, seed=seed, now=now)
+            seq = None
+            if body is not None:
+                seq = self.store.insert_event(
+                    con,
+                    body,
+                    order_id=None,
+                    consumers=self.config.matching(body, exclude=consumer),
+                    order_key=order_key(body),
+                    now=now,
+                )
+        if seq is not None:
+            self._tell(self._event_listeners)
+        return True
+
+    @staticmethod
+    def _router_body(
+        name: str, *, consumer: str, about: Mapping[str, Any], error: str | None, seed: str, now: dt.datetime
+    ) -> dict[str, Any] | None:
+        """The router event `name` about `about`, None when `about` is a router event itself (not reported further)."""
         if about.get("kind") == "router":
             log.warning("order events: %s for %s about a router event (not reported further)", name, consumer)
             return None
-        now = self.clock()
-        body = router_event(name, consumer=consumer, about=about, error=error, seed=seed, received_at=now)
-        return self._insert(body, order_id=None, consumers=self.config.matching(body, exclude=consumer), now=now)
+        return router_event(name, consumer=consumer, about=about, error=error, seed=seed, received_at=now)
 
     # --- the postback route's side ----------------------------------------------------------------------------------
 

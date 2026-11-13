@@ -286,6 +286,22 @@ def test_a_skip_by_resume_survives_a_late_retry(store):
     assert store.retry_failed("notify", T0) == 0
 
 
+def test_finish_mark_alerted_and_event_can_join_a_write(store):
+    add(store, "1", 100)
+    with pytest.raises(RuntimeError), store.write() as con:  # noqa: PT012 (the block is the write)
+        assert store.event(1, con=con)["seq"] == 1
+        assert store.mark_alerted("notify", 1, con=con) is True
+        assert store.finish_delivery("notify", 1, "failed", T0, "exit 1", con=con) is True
+        assert store.finish_delivery("notify", 1, "done", T0, con=con) is False  # failed already, in this write
+        raise RuntimeError("roll back")
+    assert row(store, "notify", 1) == ("pending", 0, 0, None)  # rolled back with the block
+    with store.write() as con:
+        assert store.finish_delivery("notify", 1, "failed", T0, "exit 1", con=con) is True
+    assert row(store, "notify", 1) == ("failed", 0, 0, "exit 1")
+    with store.write() as con:
+        assert store.event(99, con=con) is None
+
+
 def test_an_update_of_a_pruned_delivery_changes_nothing(store):
     add(store, "1", 100)
     picked, _ = store.next_delivery("notify", T0)

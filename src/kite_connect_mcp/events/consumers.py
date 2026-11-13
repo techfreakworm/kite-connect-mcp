@@ -26,6 +26,11 @@ the service's KITE_* variables are never passed. The commands run as the service
 so the file and each program must be regular files that only that user or root can change, reached through folders
 and links only they can change, like OpenSSH's StrictModes: see events/trust.py. A script given as an argument
 (["/usr/bin/python3", "/home/me/notify.py"]) is not checked: keep it writable by you or root only.
+
+What a command prints to stderr ends up, cleaned and clipped, in the service's log, in `events status` and in the other
+consumers' delivery_failed events: never print a secret there. A process the command starts in the background must
+not keep its stderr open (redirect it), or the delivery waits for it and times out. The whole contract (stdin, exit
+codes, timeouts) is in events/router.py.
 """
 
 from __future__ import annotations

@@ -10,7 +10,8 @@ they compare correctly as text.
 
 A delivery stays pending until it is done, failed or skipped. The router's updates (retry_delivery, finish_delivery,
 mark_alerted) change only a pending delivery and say whether they did: a delivery decided elsewhere while its command
-ran (skipped by `events resume --skip-backlog`, removed by prune) is left as it is.
+ran (skipped by `events resume --skip-backlog`, removed by prune) is left as it is. A failure and its delivery_failed
+event, and an alert's mark and its delivery_delayed event, are written in one transaction by the event service.
 
 The file records its SCHEMA_VERSION in meta; a file of another version is refused when it is opened, not misread.
 """
@@ -345,9 +346,15 @@ class EventStore:
         )
         return seq
 
-    def event(self, seq: int) -> dict[str, Any] | None:
-        rows = self._read("SELECT seq, body FROM events WHERE seq = ?", (seq,))
-        return _body(rows[0]) if rows else None
+    def event(self, seq: int, con: sqlite3.Connection | None = None) -> dict[str, Any] | None:
+        """The event `seq` with its seq, None when it is not stored. With `con`, read inside that write()."""
+        sql = "SELECT seq, body FROM events WHERE seq = ?"
+        if con is not None:
+            row = con.execute(sql, (seq,)).fetchone()
+        else:
+            rows = self._read(sql, (seq,))
+            row = rows[0] if rows else None
+        return _body(row) if row is not None else None
 
     def events(self, *, order_id: str | None = None, after_seq: int = 0, limit: int = 50) -> list[dict[str, Any]]:
         """Oldest first, at most `limit` of them (capped at MAX_EVENTS_LIMIT; none for a limit below 1). With
@@ -465,19 +472,24 @@ class EventStore:
         status: Literal["done", "failed", "skipped"],
         now: dt.datetime,
         error: str | None = None,
+        *,
+        con: sqlite3.Connection | None = None,
     ) -> bool:
         """Give a pending delivery its final status: done, failed (`events retry` can queue it again) or skipped. A
         new `error` replaces the last one; None keeps it. False, with nothing changed, when the delivery is no longer
-        pending: an operator's skip stays a skip even when the outcome of the try in flight lands after it."""
+        pending: an operator's skip stays a skip even when the outcome of the try in flight lands after it. With
+        `con`, inside that write(), so it is kept or rolled back with what the block writes."""
         if status not in ("done", "failed", "skipped"):
             raise ValueError(f"not a final delivery status: {status!r}")
-        with self.write() as con:
-            cursor = con.execute(
-                "UPDATE deliveries SET status = ?, last_error = coalesce(?, last_error), updated_at = ? "
-                "WHERE consumer = ? AND seq = ? AND status = 'pending'",
-                (status, error, iso(now), consumer, seq),
-            )
-            return cursor.rowcount == 1
+        sql = (
+            "UPDATE deliveries SET status = ?, last_error = coalesce(?, last_error), updated_at = ? "
+            "WHERE consumer = ? AND seq = ? AND status = 'pending'"
+        )
+        params = (status, error, iso(now), consumer, seq)
+        if con is not None:
+            return con.execute(sql, params).rowcount == 1
+        with self.write() as own:
+            return own.execute(sql, params).rowcount == 1
 
     def overdue_alerts(self, consumer: str, now: dt.datetime, alert_after_s: int) -> list[Delivery]:
         """Pending deliveries of `consumer` still retrying `alert_after_s` after their first try, not yet reported."""
@@ -501,15 +513,15 @@ class EventStore:
         first = rows[0]["t"] if rows else None
         return parse_iso(first) + dt.timedelta(seconds=alert_after_s) if first else None
 
-    def mark_alerted(self, consumer: str, seq: int) -> bool:
+    def mark_alerted(self, consumer: str, seq: int, *, con: sqlite3.Connection | None = None) -> bool:
         """Note that the delivery_delayed alert of a pending delivery has been recorded, so it is sent once. False,
-        with nothing changed, when the delivery is no longer pending."""
-        with self.write() as con:
-            cursor = con.execute(
-                "UPDATE deliveries SET delayed_sent = 1 WHERE consumer = ? AND seq = ? AND status = 'pending'",
-                (consumer, seq),
-            )
-            return cursor.rowcount == 1
+        with nothing changed, when the delivery is no longer pending. With `con`, inside that write(): the event
+        service marks it in the write that records the alert (EventService.alert_delayed)."""
+        sql = "UPDATE deliveries SET delayed_sent = 1 WHERE consumer = ? AND seq = ? AND status = 'pending'"
+        if con is not None:
+            return con.execute(sql, (consumer, seq)).rowcount == 1
+        with self.write() as own:
+            return own.execute(sql, (consumer, seq)).rowcount == 1
 
     def retry_failed(self, consumer: str, now: dt.datetime) -> int:
         """Put `consumer`'s failed deliveries back in the queue, as new (no tries, no alert, due `now`). Returns how

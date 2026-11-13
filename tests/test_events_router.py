@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import errno
 import json
 import logging
 import os
+import sqlite3
 
 import pytest
 
 from events_helpers import PY, Clock, filled_row, folders, make_service, order_row
-from kite_connect_mcp.events.router import Router
+from kite_connect_mcp.events.model import MAX_ERROR_CHARS
+from kite_connect_mcp.events.router import STDERR_KEEP, Router, _read_tail
+from kite_connect_mcp.events.store import StoreError
 
 
 def consumer(name, code, tmp_path, **extra):
@@ -22,6 +26,30 @@ def consumer(name, code, tmp_path, **extra):
 
 
 RECORD = "open(OUT, 'a').write(json.dumps({'seq': event['seq'], 'env': dict(os.environ)}) + '\\n')"
+HOOK_PART = "placeholderhookpart0001"  # the private part of a webhook link
+
+
+def beating(path, beats=100):
+    """Python code that appends a byte to `path` every 50 ms, `beats` times: alive while the file grows."""
+    return f"for _ in range({beats}):\n    open({str(path)!r}, 'a').write('x')\n    time.sleep(0.05)\n"
+
+
+async def assert_stopped(path):
+    """The process beating on `path` (see beating()) has stopped: the file no longer grows."""
+    await asyncio.sleep(0.1)
+    size = path.stat().st_size
+    await asyncio.sleep(0.3)
+    assert path.stat().st_size == size, "the process still runs"
+
+
+def last_error(svc, clock, name="notify"):
+    """The last error of `name`'s first pending delivery (one that is retrying is due later)."""
+    delivery, _ = svc.store.next_delivery(name, clock.now + dt.timedelta(days=1))
+    return delivery.last_error
+
+
+def router_events(svc):
+    return [e for e in svc.store.events() if e["kind"] == "router"]
 
 
 def lines(path):
@@ -32,10 +60,10 @@ def lines(path):
 def build(runtime_factory, tmp_path, fake_kite):
     made = []
 
-    def make(*consumers, clock=None, environ=None):
+    def make(*consumers, clock=None, environ=None, spawn=None):
         clock = clock or Clock()
         svc, rt = make_service(runtime_factory, tmp_path, consumers=list(consumers), clock=clock)
-        router = Router(svc, environ=environ)
+        router = Router(svc, environ=environ, spawn=spawn)
         svc.router = router
         made.append(svc)
         return svc, router, clock
@@ -138,8 +166,149 @@ async def test_a_timeout_is_a_temporary_failure_and_the_process_is_killed(build,
     assert d is None and later is not None
     summary = svc.store.summary()["consumers"]["notify"]
     assert summary["retrying"] == 1
+    assert last_error(svc, clock) == "timed out after 1 s"
     await asyncio.sleep(0.2)
     assert not out.exists()  # killed before it could write
+
+
+async def test_a_timeout_kills_what_the_command_started_too(build, tmp_path):
+    beat = tmp_path / "beat"
+    code = (
+        "import subprocess\n"
+        f"subprocess.Popen([sys.executable, '-c', 'import time\\n' + {beating(beat)!r}], stdin=subprocess.DEVNULL, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "time.sleep(30)"
+    )
+    spec, _ = consumer("notify", code, tmp_path, timeout_s=1)
+    svc, router, _ = build(spec)
+    svc.ingest_order(order_row(), source="poll")
+    await asyncio.wait_for(router.step(router.config.get("notify")), 10)
+    assert beat.exists()  # the child it started ran ...
+    await assert_stopped(beat)  # ... and was killed with it: the whole process group
+
+
+async def test_a_background_child_that_keeps_stderr_open_times_out(build, tmp_path):
+    code = "import subprocess\nsubprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\nsys.exit(0)"
+    spec, _ = consumer("notify", code, tmp_path, timeout_s=1)
+    svc, router, clock = build(spec)
+    svc.ingest_order(order_row(), source="poll")
+    await asyncio.wait_for(router.step(router.config.get("notify")), 10)
+    assert svc.store.summary()["consumers"]["notify"]["retrying"] == 1
+    assert (
+        last_error(svc, clock) == "timed out after 1 s: the command exited 0, but a process it started kept stderr open"
+    )
+
+
+@pytest.mark.parametrize("name", ["SIGTERM", "SIGKILL"])
+async def test_a_consumer_killed_by_a_signal_is_retried(build, tmp_path, name):
+    # a service stop sends SIGTERM to every process of the unit, consumers too; the OOM killer sends SIGKILL
+    spec, _ = consumer("notify", f"import signal\nos.kill(os.getpid(), signal.{name})", tmp_path)
+    watcher, _ = consumer("watch", "pass", tmp_path, match={"kinds": ["router"]})
+    svc, router, clock = build(spec, watcher)
+    svc.ingest_order(order_row(), source="poll")
+    assert await router.step(router.config.get("notify")) is None
+    summary = svc.store.summary()["consumers"]["notify"]
+    assert summary["retrying"] == 1 and summary["failed"] == 0
+    assert last_error(svc, clock) == f"killed by {name}"
+    assert router_events(svc) == []  # no delivery_failed
+
+
+async def test_any_other_error_while_the_command_runs_kills_it(build, tmp_path):
+    beat = tmp_path / "beat"
+    spec, _ = consumer("notify", beating(beat), tmp_path)
+
+    async def spawn(*args, **kwargs):
+        proc = await asyncio.create_subprocess_exec(*args, **kwargs)
+
+        async def broken_read(n=-1):
+            for _ in range(300):
+                if beat.exists():
+                    break
+                await asyncio.sleep(0.01)
+            raise RuntimeError("reading stderr failed")
+
+        proc.stderr.read = broken_read
+        return proc
+
+    svc, router, _ = build(spec, spawn=spawn)
+    svc.ingest_order(order_row(), source="poll")
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(router.step(router.config.get("notify")), 10)
+    assert beat.exists()
+    await assert_stopped(beat)
+    summary = svc.store.summary()["consumers"]["notify"]
+    assert summary["pending"] == 1 and summary["retrying"] == 0  # no try counted: it runs again
+
+
+async def test_stderr_becomes_one_clean_line(build, tmp_path):
+    message = (
+        "\x1b[31mnotify:\x1b[0m posting to https://hooks.example.com/T000/" + HOOK_PART + "\x07\r\n"
+        "failed:\t403 \u202eForbidden\n\n"
+    )
+    spec, _ = consumer("notify", f"sys.stderr.write({message!r}); sys.exit(3)", tmp_path)
+    svc, router, _ = build(spec)
+    svc.ingest_order(order_row(), source="poll")
+    await router.step(router.config.get("notify"))
+    assert (
+        svc.store.summary()["consumers"]["notify"]["last_error"]
+        == "exit 3: notify: posting to [link] failed: 403 Forbidden"
+    )
+
+
+async def test_a_long_stderr_keeps_its_end_and_never_part_of_a_link(build, tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    message = (
+        "x " * 100 + "https://hooks.example.com/services/T000/B000/" + HOOK_PART + " failed: 403 Forbidden " + "z" * 150
+    )
+    spec, _ = consumer("notify", f"sys.stderr.write({message!r}); sys.exit(1)", tmp_path)
+    watcher, _ = consumer("watch", "pass", tmp_path, match={"kinds": ["router"]})
+    svc, router, _ = build(spec, watcher)
+    svc.ingest_order(order_row(), source="poll")
+    await router.step(router.config.get("notify"))
+    error = svc.store.summary()["consumers"]["notify"]["last_error"]
+    assert error.startswith("exit 1: ") and error.endswith(" [link] failed: 403 Forbidden " + "z" * 150)
+    assert len(error) <= MAX_ERROR_CHARS
+    (failed,) = router_events(svc)
+    assert failed["error"] == error  # the same text in the store, the router event ...
+    assert error in caplog.text  # ... and the log
+    assert HOOK_PART not in json.dumps(failed) and HOOK_PART not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("write", "expected"),
+    [
+        ("sys.stderr.write('e' * 2000000 + ' the end')", "exit 3: the end"),  # a flood: only its end is kept
+        # the kept end starts inside a link: the cut word is dropped, not shown without its scheme
+        ("sys.stderr.write('https://hooks.example.com/' + 'S' * 5000 + ' failed')", "exit 3: failed"),
+    ],
+)
+async def test_only_the_end_of_stderr_is_read(build, tmp_path, write, expected):
+    spec, _ = consumer("notify", write + "\nsys.exit(3)", tmp_path)
+    svc, router, _ = build(spec)
+    svc.ingest_order(order_row(), source="poll")
+    await router.step(router.config.get("notify"))
+    assert svc.store.summary()["consumers"]["notify"]["last_error"] == expected
+
+
+async def test_a_command_that_floods_stderr_until_its_timeout_is_killed_and_reaped_at_once(build, tmp_path):
+    # the reader stops at the timeout; the rest is read after the kill, or a full pipe would hide its end for 5 s
+    spec, _ = consumer("notify", "while True:\n    sys.stderr.write('e' * 65536)", tmp_path, timeout_s=1)
+    svc, router, clock = build(spec)
+    svc.ingest_order(order_row(), source="poll")
+    await asyncio.wait_for(router.step(router.config.get("notify")), 3)
+    assert last_error(svc, clock) == "timed out after 1 s"
+
+
+async def test_the_stderr_reader_keeps_only_the_last_bytes():
+    data = bytes(range(256)) * 4096  # 1 MiB
+    reader = asyncio.StreamReader()
+    reader.feed_data(data)
+    reader.feed_eof()
+    assert await _read_tail(reader) == (data[-STDERR_KEEP:], True)
+    short = asyncio.StreamReader()
+    short.feed_data(b"short")
+    short.feed_eof()
+    assert await _read_tail(short) == (b"short", False)
 
 
 async def test_a_program_that_is_gone_fails(build, tmp_path):
@@ -168,6 +337,22 @@ async def test_a_command_that_cannot_start_fails(build, tmp_path):
     summary = svc.store.summary()["consumers"]["notify"]
     assert summary["failed"] == 1
     assert summary["last_error"] == "cannot start the command: Permission denied"
+
+
+@pytest.mark.parametrize("code", ["EAGAIN", "ENOMEM", "EMFILE", "ENFILE", "ETXTBSY"])
+async def test_a_temporary_failure_to_start_is_retried(build, tmp_path, code):
+    number = getattr(errno, code)
+
+    async def spawn(*args, **kwargs):
+        raise OSError(number, os.strerror(number))
+
+    spec, _ = consumer("notify", "pass", tmp_path)
+    svc, router, clock = build(spec, spawn=spawn)
+    svc.ingest_order(order_row(), source="poll")
+    await router.step(router.config.get("notify"))
+    summary = svc.store.summary()["consumers"]["notify"]
+    assert summary["retrying"] == 1 and summary["failed"] == 0
+    assert last_error(svc, clock) == f"cannot start the command: {os.strerror(number)}"
 
 
 async def test_a_program_others_can_change_since_loading_is_refused_and_never_run(build, tmp_path):
@@ -239,6 +424,55 @@ async def test_a_delivery_skipped_while_it_runs_stays_skipped(build, tmp_path):
     assert [e for e in svc.store.events() if e["kind"] == "router"] == []  # no delivery_failed for a skipped event
 
 
+def fail_router_events(svc, monkeypatch):
+    """Make the store fail to write a router event (as a full disk would), and nothing else."""
+    real = svc.store.insert_event
+
+    def insert_event(con, body, **kwargs):
+        if body["kind"] == "router":
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(con, body, **kwargs)
+
+    monkeypatch.setattr(svc.store, "insert_event", insert_event)
+
+
+async def test_a_failure_is_kept_only_with_its_delivery_failed_event(build, tmp_path, monkeypatch):
+    spec, out = consumer("notify", RECORD + "\nsys.exit(1)", tmp_path)
+    watcher, _ = consumer("watch", "pass", tmp_path, match={"kinds": ["router"]})
+    svc, router, _ = build(spec, watcher)
+    svc.ingest_order(order_row(), source="poll")
+    notify = router.config.get("notify")
+    with monkeypatch.context() as patch:
+        fail_router_events(svc, patch)
+        with pytest.raises(StoreError):
+            await router.step(notify)
+    summary = svc.store.summary()["consumers"]["notify"]
+    assert (summary["pending"], summary["failed"]) == (1, 0) and router_events(svc) == []  # neither was kept
+    assert await router.step(notify) is None  # so it runs again (deliveries are at least once) ...
+    assert len(lines(out)) == 2
+    summary = svc.store.summary()["consumers"]["notify"]
+    assert (summary["pending"], summary["failed"]) == (0, 1)
+    assert [e["router"] for e in router_events(svc)] == ["delivery_failed"]  # ... and both are kept
+
+
+async def test_a_delayed_alert_is_marked_sent_only_with_its_event(build, tmp_path, monkeypatch):
+    spec, _ = consumer("notify", "sys.exit(75)", tmp_path, alert_after_s=5, retry={"delays_s": [10]})
+    watcher, _ = consumer("watch", "pass", tmp_path, match={"kinds": ["router"]})
+    svc, router, clock = build(spec, watcher)
+    svc.ingest_order(order_row(), source="poll")
+    notify = router.config.get("notify")
+    await router.step(notify)  # try 1 at t=0, alert due at t=5
+    clock.advance(5)
+    with monkeypatch.context() as patch:
+        fail_router_events(svc, patch)
+        with pytest.raises(StoreError):
+            await router.step(notify)
+    assert svc.store.summary()["consumers"]["notify"]["delayed"] == 0 and router_events(svc) == []
+    await router.step(notify)  # the alert is still due
+    assert svc.store.summary()["consumers"]["notify"]["delayed"] == 1
+    assert [e["router"] for e in router_events(svc)] == ["delivery_delayed"]
+
+
 async def test_the_log_names_the_program_never_its_arguments(build, tmp_path, caplog):
     caplog.set_level(logging.DEBUG)
     marker = "argv-marker-0001"
@@ -262,11 +496,12 @@ async def test_run_delivers_in_the_background_and_stops(build, tmp_path):
     await asyncio.sleep(0)
     svc.ingest_order(order_row(), source="poll")  # tells the router through on_event
     for _ in range(300):
-        if out.exists():
+        if svc.store.summary()["consumers"]["notify"]["done"] == 1:
             break
         await asyncio.sleep(0.01)
     stop.set()
     await asyncio.wait_for(task, 5)
+    assert svc.store.summary()["consumers"]["notify"]["done"] == 1
     assert len(lines(out)) == 1
     assert os.environ.get("KITE_EVENT_CONSUMER") is None
 
