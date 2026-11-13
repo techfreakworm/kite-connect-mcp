@@ -9,22 +9,32 @@ It owns the store and the consumers config, and is the only place events are cre
 
 Every new event is written in one transaction with its order's state, the counter it moves (selftest_received) and a
 pending delivery per matching consumer, then the listeners (the router) are told; a doorbell is kept in one
-transaction with its counter (postback_accepted). So a StoreError means none of it was kept. Part 1B adds the doorbell
-worker, the poller, the router and start/stop.
+transaction with its counter (postback_accepted). So a StoreError means none of it was kept.
+
+It builds its parts (the doorbell worker, the poller, the router), and start()/stop() run them, with the housekeeping
+that prunes old events, as tasks on the event loop; the HTTP server starts the service as it comes up and stops it as
+it shuts down. One process serves a store: start() takes a lock file next to it (`<store>.lock`), so a second server
+on the same store fails to start instead of running the same consumers twice.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import logging
+import os
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from ..config import Settings
 from ..errors import ConfigError
 from ..timeutil import now_ist, to_ist
+from ._wait import wait_any
 from .consumers import ConsumersConfig
+from .doorbell import DoorbellWorker
 from .model import (
     ORDER_ID_RE,
     OrderView,
@@ -35,6 +45,8 @@ from .model import (
     selftest_event,
     session_event,
 )
+from .poll import Poller
+from .router import Router
 from .store import EventStore, StoreError
 
 if TYPE_CHECKING:
@@ -74,6 +86,7 @@ class EventService:
         clock: Callable[[], dt.datetime] = now_ist,
         store: EventStore | None = None,
         config: ConsumersConfig | None = None,
+        environ: Mapping[str, str] | None = None,
     ):
         if settings.events_db is None:
             raise ConfigError("the event service needs a store: set KITE_MCP_EVENTS=true or KITE_MCP_EVENTS_DB")
@@ -83,11 +96,17 @@ class EventService:
         self.clock = clock
         self.config = config if config is not None else ConsumersConfig.load(settings.events_consumers_file)
         self.store = store if store is not None else EventStore(settings.events_db)
-        self.doorbells: Any = None  # DoorbellWorker, part 1B
-        self.poller: Any = None  # Poller, part 1B
-        self.router: Any = None  # Router, part 1B
         self._event_listeners: list[Callable[[], None]] = []
         self._doorbell_listeners: list[Callable[[], None]] = []
+        # The workers' wake-ups (on_doorbell, on_event) set asyncio.Event objects, which is safe only on the event
+        # loop's thread. Every writer runs on the loop today (the postback route rings, the poller and the doorbell
+        # worker ingest, the router records its events); one on another thread needs loop.call_soon_threadsafe.
+        self.doorbells = DoorbellWorker(self)
+        self.poller = Poller(self)
+        self.router = Router(self, environ=environ)
+        self._stop: asyncio.Event | None = None
+        self._tasks: list[asyncio.Task[None]] = []
+        self._lock_fd: int | None = None
 
     # --- listeners ------------------------------------------------------------------------------------------------
 
@@ -234,6 +253,88 @@ class EventService:
 
     def status(self) -> dict[str, Any]:
         return describe_status(self.store, self.settings, self.clock(), [c.name for c in self.config.consumers])
+
+    # --- running --------------------------------------------------------------------------------------------------
+
+    HOUSEKEEPING_S = 6 * 3600
+
+    @property
+    def running(self) -> bool:
+        return bool(self._tasks)
+
+    async def start(self) -> None:
+        """Run the poll, the doorbell worker, the router and the housekeeping as tasks. Raises ConfigError when another
+        process already serves this store."""
+        if self._tasks:
+            return
+        self._take_lock()
+        self._stop = asyncio.Event()
+        jobs = {
+            "poller": self.poller.run,
+            "doorbells": self.doorbells.run,
+            "router": self.router.run,
+            "housekeeping": self._housekeeping,
+        }
+        self._tasks = [asyncio.create_task(job(self._stop), name=f"kite-events-{name}") for name, job in jobs.items()]
+        log.info("order events: started, %d consumer(s)", len(self.config.consumers))
+
+    async def stop(self) -> None:
+        """Stop the tasks (a part still busy after 10 s is cancelled; a consumer command still running is killed, and
+        its delivery stays pending for the next start), then release the lock and close the store. Calling it again,
+        or without start(), is harmless."""
+        if self._tasks and self._stop is not None:
+            self._stop.set()
+            _, pending = await asyncio.wait(self._tasks, timeout=10)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks = []
+            log.info("order events: stopped")
+        self._release_lock()
+        self.store.close()
+
+    def housekeep(self) -> int:
+        """Delete what is older than KITE_MCP_EVENTS_KEEP_DAYS (doorbells after two days). Returns the events
+        deleted."""
+        now = self.clock()
+        return self.store.prune(
+            now - dt.timedelta(days=self.settings.events_keep_days), doorbells_before=now - dt.timedelta(days=2)
+        )
+
+    async def _housekeeping(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                removed = self.housekeep()
+                if removed:
+                    log.info("order events: removed %d old event(s)", removed)
+            except Exception:
+                log.exception("order events: housekeeping failed")
+            await wait_any(self.HOUSEKEEPING_S, stop)
+
+    def _take_lock(self) -> None:
+        """Hold `<store>.lock` (flock) while running: the kernel drops the lock when the process ends, however it ends.
+        The file is not passed to consumer commands (Python opens it non-inheritable)."""
+        path = f"{self.store.path}.lock"
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as exc:
+            raise ConfigError(f"cannot open the lock file {path}: {exc.strerror}") from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if isinstance(exc, BlockingIOError):
+                raise ConfigError(f"another process is already serving order events from {self.store.path}") from None
+            raise ConfigError(f"cannot lock {path}: {exc.strerror}") from None
+        self._lock_fd = fd
+
+    def _release_lock(self) -> None:
+        fd, self._lock_fd = self._lock_fd, None
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)  # closing the file releases the lock too
 
 
 def last_closed_poll_day(settings: Settings, now: dt.datetime) -> dt.date | None:

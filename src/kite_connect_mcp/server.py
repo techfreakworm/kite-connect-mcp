@@ -57,6 +57,10 @@ def build_runtime(
     rt.instruments = InstrumentStore(settings, client, clock=clock)
     rt.ticker = TickerManager(settings, tokens, clock=clock, connect=ticker_connect)
     rt.login = LoginManager(settings, client, tokens, audit, clock=clock)
+    if settings.events:  # a bad consumers file is a ConfigError here, so the server does not start
+        from .events.service import EventService
+
+        rt.events = EventService(settings, client, tokens, clock=clock)
     return rt
 
 
@@ -186,7 +190,9 @@ def build_http_app(server: MCPServer, rt: Runtime) -> ASGIApp:
 
 
 class RuntimeLifespan:
-    """Close the runtime (HTTP client, ticker) when the ASGI server shuts down, inside the server's own event loop."""
+    """Start the event service (KITE_MCP_EVENTS=true) just before the ASGI server reports that it is up, and close the
+    runtime (event service, HTTP client, ticker) when the server shuts down, inside the server's own event loop. A
+    failure to start the service propagates, so the server does not come up with order events silently off."""
 
     def __init__(self, app: ASGIApp, rt: Runtime):
         self.app = app
@@ -198,6 +204,8 @@ class RuntimeLifespan:
             return
 
         async def send_wrapper(message: Any) -> None:
+            if message.get("type") == "lifespan.startup.complete" and self.rt.events is not None:
+                await self.rt.events.start()
             if message.get("type") == "lifespan.shutdown.complete":
                 with contextlib.suppress(Exception):
                     await self.rt.aclose()

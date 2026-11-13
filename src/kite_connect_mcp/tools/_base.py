@@ -52,6 +52,7 @@ from ..timeutil import now_ist
 
 if TYPE_CHECKING:  # the heavier pieces are created lazily by their own modules
     from ..auth.login import LoginManager
+    from ..events.service import EventService
     from ..instruments import InstrumentStore
     from ..ticker.manager import TickerManager
 
@@ -82,9 +83,12 @@ class Runtime:
     instruments: InstrumentStore | None = None
     ticker: TickerManager | None = None
     login: LoginManager | None = None
+    events: EventService | None = None  # order events (KITE_MCP_EVENTS=true)
     extras: dict[str, Any] = field(default_factory=dict)
 
     async def aclose(self) -> None:
+        if self.events is not None:  # first: its tasks use the client
+            await self.events.stop()
         if self.ticker is not None:
             await self.ticker.stop()
         await self.client.aclose()

@@ -3,7 +3,7 @@ Kite call goes to FakeKite, an in-memory stand-in for api.kite.trade.
 
     fake_kite           routes (method, path) -> canned answers; records every request it sees
     settings_factory    Settings from a test environment (temporary state/cache dirs, a valid token file)
-    runtime_factory     a Runtime wired to fake_kite, with a fixed clock and no real sleeping
+    runtime_factory     a Runtime wired to fake_kite, with a fixed clock and no real sleeping; closes its event store
     mcp_factory         (server, registrar, runtime) for in-process MCP tests via `mcp.Client(server)`
     service_factory     (event service, runtime) from tests/events_helpers.py make_service; closes its stores
 """
@@ -215,6 +215,9 @@ def runtime_factory(fake_kite: FakeKite, settings_factory: Callable[..., Setting
         return rt
 
     yield make
+    for rt in created:  # the store of an event service (KITE_MCP_EVENTS=true), also when the test failed before stop()
+        if rt.events is not None:
+            rt.events.store.close()
 
 
 @pytest.fixture
