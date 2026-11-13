@@ -228,11 +228,14 @@ def runtime_factory(fake_kite: FakeKite, settings_factory: Callable[..., Setting
         return rt
 
     yield make
-    # the store and lock of an event service (KITE_MCP_EVENTS=true), also when a test failed before stop()
+    # the store and lock of an event service (KITE_MCP_EVENTS=true), also when a test failed before stop(), and what
+    # the tool modules opened (the events tools' read-only store), which only aclose() closes otherwise
     for rt in created:
         if rt.events is not None:
             rt.events.store.close()
             rt.events._release_lock()
+        for close in rt.closers:
+            close()
 
 
 @pytest.fixture

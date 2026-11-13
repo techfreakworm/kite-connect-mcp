@@ -85,13 +85,18 @@ class Runtime:
     login: LoginManager | None = None
     events: EventService | None = None  # order events (KITE_MCP_EVENTS=true)
     extras: dict[str, Any] = field(default_factory=dict)
+    closers: list[Callable[[], None]] = field(default_factory=list)  # what tool modules opened, closed by aclose()
 
     async def aclose(self) -> None:
-        if self.events is not None:  # first: its tasks use the client
-            await self.events.stop()
-        if self.ticker is not None:
-            await self.ticker.stop()
-        await self.client.aclose()
+        try:
+            if self.events is not None:  # first: its tasks use the client
+                await self.events.stop()
+            if self.ticker is not None:
+                await self.ticker.stop()
+            await self.client.aclose()
+        finally:
+            for close in self.closers:
+                close()
 
 
 @dataclass(frozen=True)
