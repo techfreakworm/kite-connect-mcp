@@ -8,6 +8,7 @@ See `.env.example` for the full list with explanations.
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import re
 import stat
@@ -35,6 +36,7 @@ TOOLSETS = (
     "margins",
     "mf",
     "ticker",
+    "events",
     "safety",
 )
 
@@ -99,6 +101,53 @@ def _choice(env: Mapping[str, str], name: str, default: str, choices: tuple[str,
         problems.append(f"{name} must be one of {', '.join(choices)}, not {raw!r}")
         return default
     return value
+
+
+_DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _window(
+    env: Mapping[str, str], name: str, default: tuple[dt.time, dt.time], problems: list[str]
+) -> tuple[dt.time, dt.time]:
+    """'HH:MM-HH:MM' (IST), start before end."""
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*", raw)
+    try:
+        if not match:
+            raise ValueError
+        h1, m1, h2, m2 = (int(g) for g in match.groups())
+        start, end = dt.time(h1, m1), dt.time(h2, m2)
+    except ValueError:
+        problems.append(f"{name} must look like 09:00-16:00, not {raw!r}")
+        return default
+    if start >= end:
+        problems.append(f"{name}: the start must be before the end")
+        return default
+    return start, end
+
+
+def _days(env: Mapping[str, str], name: str, default: frozenset[int], problems: list[str]) -> frozenset[int]:
+    """Weekdays (Mon=0 .. Sun=6) from 'Mon-Fri', 'mon,wed,fri', 'Tue' or '*'."""
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    if raw.strip() == "*":
+        return frozenset(range(7))
+    days: set[int] = set()
+    for part in raw.split(","):
+        first, sep, last = part.strip().lower().partition("-")
+        try:
+            a = _DAY_NAMES.index(first[:3]) if len(first) >= 3 else -1
+            b = _DAY_NAMES.index(last[:3]) if sep and len(last) >= 3 else (a if not sep else -1)
+        except ValueError:
+            a = b = -1
+        if a < 0 or b < 0 or b < a:
+            problems.append(f"{name} must look like Mon-Fri or mon,wed,fri, not {raw!r}")
+            return default
+        days.update(range(a, b + 1))
+    return frozenset(days)
 
 
 def _list(env: Mapping[str, str], name: str) -> tuple[str, ...]:
@@ -224,6 +273,15 @@ class Settings:
     ticker_enabled: bool = True
     ticker_max_subscriptions: int = 1000
 
+    # --- order events (docs/EVENTS.md) ---
+    events: bool = False  # run the event service in this process (HTTP transport only)
+    events_db: Path | None = None  # the service's store; another process reads it with KITE_MCP_EVENTS_DB
+    events_consumers_file: Path | None = None
+    order_poll_interval_s: int = 60
+    order_poll_window: tuple[dt.time, dt.time] = (dt.time(9, 0), dt.time(16, 0))
+    order_poll_days: frozenset[int] = frozenset(range(5))
+    events_keep_days: int = 30
+
     log_level: str = "INFO"
 
     @property
@@ -245,6 +303,8 @@ class Settings:
                 out[f.name] = sorted(value)
             elif isinstance(value, Path | Decimal):
                 out[f.name] = str(value)
+            elif f.name == "order_poll_window":
+                out[f.name] = "-".join(t.strftime("%H:%M") for t in value)
             else:
                 out[f.name] = value
         return out
@@ -286,6 +346,13 @@ class Settings:
         for name, path in (("KITE_MCP_CALLBACK_PATH", callback_path), ("KITE_MCP_POSTBACK_PATH", postback_path)):
             if path is not None and (not path.startswith("/") or path.startswith("/mcp")):
                 problems.append(f"{name} must start with / and must not be under /mcp")
+
+        events = _bool(env, "KITE_MCP_EVENTS", False, problems)
+        events_db_raw = env.get("KITE_MCP_EVENTS_DB", "").strip()
+        events_db = (
+            Path(events_db_raw).expanduser() if events_db_raw else (state_dir / "events.sqlite3" if events else None)
+        )
+        consumers_raw = env.get("KITE_MCP_EVENTS_CONSUMERS_FILE", "").strip()
 
         settings = cls(
             api_key=_secret(env, "KITE_API_KEY", problems),
@@ -334,6 +401,13 @@ class Settings:
             excluded_tools=frozenset(t.lower() for t in _list(env, "KITE_MCP_EXCLUDED_TOOLS")),
             ticker_enabled=_bool(env, "KITE_MCP_TICKER_ENABLED", True, problems),
             ticker_max_subscriptions=_int(env, "KITE_MCP_TICKER_MAX_SUBSCRIPTIONS", 1000, problems, minimum=1),
+            events=events,
+            events_db=events_db,
+            events_consumers_file=Path(consumers_raw).expanduser() if consumers_raw else None,
+            order_poll_interval_s=_int(env, "KITE_MCP_ORDER_POLL_INTERVAL_S", 60, problems, minimum=10),
+            order_poll_window=_window(env, "KITE_MCP_ORDER_POLL_WINDOW", (dt.time(9, 0), dt.time(16, 0)), problems),
+            order_poll_days=_days(env, "KITE_MCP_ORDER_POLL_DAYS", frozenset(range(5)), problems),
+            events_keep_days=_int(env, "KITE_MCP_EVENTS_KEEP_DAYS", 30, problems, minimum=1),
             log_level=(env.get("KITE_MCP_LOG_LEVEL", "INFO").strip().upper() or "INFO"),
         )
         problems.extend(settings._consistency_problems())
@@ -362,6 +436,11 @@ class Settings:
             problems.append("KITE_MCP_BEARER_TOKEN must be at least 32 characters (try: openssl rand -hex 32)")
         if self.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             problems.append("KITE_MCP_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR or CRITICAL")
+        if self.events and self.transport != "http":
+            problems.append(
+                "KITE_MCP_EVENTS=true needs KITE_MCP_TRANSPORT=http: the event service is one long-lived process "
+                "(another process reads its store with KITE_MCP_EVENTS_DB)"
+            )
         return problems
 
     def require_api_key(self) -> str:
@@ -419,6 +498,13 @@ KNOWN_VARIABLES = frozenset(
         "KITE_MCP_EXCLUDED_TOOLS",
         "KITE_MCP_TICKER_ENABLED",
         "KITE_MCP_TICKER_MAX_SUBSCRIPTIONS",
+        "KITE_MCP_EVENTS",
+        "KITE_MCP_EVENTS_DB",
+        "KITE_MCP_EVENTS_CONSUMERS_FILE",
+        "KITE_MCP_ORDER_POLL_INTERVAL_S",
+        "KITE_MCP_ORDER_POLL_WINDOW",
+        "KITE_MCP_ORDER_POLL_DAYS",
+        "KITE_MCP_EVENTS_KEEP_DAYS",
         "KITE_MCP_LOG_LEVEL",
     }
 )
