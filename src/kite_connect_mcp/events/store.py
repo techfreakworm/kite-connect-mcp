@@ -8,6 +8,10 @@ An event, its order's new state and a delivery row for every matching consumer a
 (`write()`), so a crash leaves either all of them or none. Times are ISO 8601 in IST with milliseconds (`iso()`), so
 they compare correctly as text.
 
+A delivery stays pending until it is done, failed or skipped. The router's updates (retry_delivery, finish_delivery,
+mark_alerted) change only a pending delivery and say whether they did: a delivery decided elsewhere while its command
+ran (skipped by `events resume --skip-backlog`, removed by prune) is left as it is.
+
 The file records its SCHEMA_VERSION in meta; a file of another version is refused when it is opened, not misread.
 """
 
@@ -23,7 +27,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..errors import KiteMCPError
 from ..timeutil import to_ist
@@ -105,6 +109,11 @@ def _schema_version(con: sqlite3.Connection) -> str | None:
 
 @dataclass(frozen=True)
 class Delivery:
+    """One consumer's pending delivery of one event (`seq`). `order_key` groups the deliveries that go one at a time
+    and in order. `attempts` counts the failed tries so far, `first_try_at` is when the first of them was made (None
+    before any), `next_try_at` when the delivery is due, `last_error` the last error a try gave. `delayed_sent` says
+    whether the delivery_delayed alert for it has been recorded (mark_alerted), so that alert is sent once."""
+
     consumer: str
     seq: int
     order_key: str
@@ -409,23 +418,40 @@ class EventStore:
         next_try_at: dt.datetime,
         now: dt.datetime,
         error: str | None,
-    ) -> None:
+    ) -> bool:
+        """Record a failed try of a pending delivery, to be tried again at `next_try_at`. `attempts` counts these
+        calls. `first_try_at` is kept from the first call, and later values are ignored: the alert and the give-up
+        times count from it. A new `error` replaces the last one; None keeps it. False, with nothing changed, when the
+        delivery is no longer pending (decided elsewhere, see the module docstring)."""
         with self.write() as con:
-            con.execute(
+            cursor = con.execute(
                 "UPDATE deliveries SET attempts = attempts + 1, first_try_at = coalesce(first_try_at, ?), "
-                "next_try_at = ?, last_error = ?, updated_at = ? WHERE consumer = ? AND seq = ?",
+                "next_try_at = ?, last_error = coalesce(?, last_error), updated_at = ? "
+                "WHERE consumer = ? AND seq = ? AND status = 'pending'",
                 (iso(first_try_at), iso(next_try_at), error, iso(now), consumer, seq),
             )
+            return cursor.rowcount == 1
 
-    def finish_delivery(self, consumer: str, seq: int, status: str, now: dt.datetime, error: str | None = None) -> None:
+    def finish_delivery(
+        self,
+        consumer: str,
+        seq: int,
+        status: Literal["done", "failed", "skipped"],
+        now: dt.datetime,
+        error: str | None = None,
+    ) -> bool:
+        """Give a pending delivery its final status: done, failed (`events retry` can queue it again) or skipped. A
+        new `error` replaces the last one; None keeps it. False, with nothing changed, when the delivery is no longer
+        pending: an operator's skip stays a skip even when the outcome of the try in flight lands after it."""
         if status not in ("done", "failed", "skipped"):
             raise ValueError(f"not a final delivery status: {status!r}")
         with self.write() as con:
-            con.execute(
+            cursor = con.execute(
                 "UPDATE deliveries SET status = ?, last_error = coalesce(?, last_error), updated_at = ? "
-                "WHERE consumer = ? AND seq = ?",
+                "WHERE consumer = ? AND seq = ? AND status = 'pending'",
                 (status, error, iso(now), consumer, seq),
             )
+            return cursor.rowcount == 1
 
     def overdue_alerts(self, consumer: str, now: dt.datetime, alert_after_s: int) -> list[Delivery]:
         """Pending deliveries of `consumer` still retrying `alert_after_s` after their first try, not yet reported."""
@@ -438,6 +464,9 @@ class EventStore:
         return [_delivery(r) for r in rows]
 
     def next_alert_at(self, consumer: str, alert_after_s: int) -> dt.datetime | None:
+        """When the next alert of `consumer` falls due: `alert_after_s` after the earliest first try of its retrying
+        deliveries not yet reported, None when there are none. It can be a time in the past, when an alert is due
+        already (overdue_alerts lists those)."""
         rows = self._read(
             "SELECT min(first_try_at) AS t FROM deliveries WHERE consumer = ? AND status = 'pending' AND attempts > 0 "
             "AND delayed_sent = 0",
@@ -446,12 +475,20 @@ class EventStore:
         first = rows[0]["t"] if rows else None
         return parse_iso(first) + dt.timedelta(seconds=alert_after_s) if first else None
 
-    def mark_alerted(self, consumer: str, seq: int) -> None:
+    def mark_alerted(self, consumer: str, seq: int) -> bool:
+        """Note that the delivery_delayed alert of a pending delivery has been recorded, so it is sent once. False,
+        with nothing changed, when the delivery is no longer pending."""
         with self.write() as con:
-            con.execute("UPDATE deliveries SET delayed_sent = 1 WHERE consumer = ? AND seq = ?", (consumer, seq))
+            cursor = con.execute(
+                "UPDATE deliveries SET delayed_sent = 1 WHERE consumer = ? AND seq = ? AND status = 'pending'",
+                (consumer, seq),
+            )
+            return cursor.rowcount == 1
 
     def retry_failed(self, consumer: str, now: dt.datetime) -> int:
-        """Put `consumer`'s failed deliveries back in the queue, as new. Returns how many."""
+        """Put `consumer`'s failed deliveries back in the queue, as new (no tries, no alert, due `now`). Returns how
+        many. A re-sent event can arrive after later events of its order that were delivered already; consumers can
+        tell from seq. Later events of the order still pending wait behind it, as usual."""
         with self.write() as con:
             return int(
                 con.execute(
