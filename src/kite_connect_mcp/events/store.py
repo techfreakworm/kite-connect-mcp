@@ -20,6 +20,7 @@ import os
 import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -100,6 +101,42 @@ def _schema_version(con: sqlite3.Connection) -> str | None:
         return None
     row = con.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     return None if row is None else str(row[0])
+
+
+@dataclass(frozen=True)
+class Delivery:
+    consumer: str
+    seq: int
+    order_key: str
+    attempts: int
+    first_try_at: dt.datetime | None
+    next_try_at: dt.datetime
+    delayed_sent: bool
+    last_error: str | None
+
+
+def _delivery(row: sqlite3.Row) -> Delivery:
+    return Delivery(
+        consumer=row["consumer"],
+        seq=int(row["seq"]),
+        order_key=row["order_key"],
+        attempts=int(row["attempts"]),
+        first_try_at=parse_iso(row["first_try_at"]) if row["first_try_at"] else None,
+        next_try_at=parse_iso(row["next_try_at"]),
+        delayed_sent=bool(row["delayed_sent"]),
+        last_error=row["last_error"],
+    )
+
+
+_HEADS = """
+SELECT d.* FROM deliveries d
+WHERE d.consumer = ? AND d.status = 'pending'
+  AND NOT EXISTS (
+    SELECT 1 FROM deliveries e
+    WHERE e.consumer = d.consumer AND e.order_key = d.order_key AND e.status = 'pending' AND e.seq < d.seq
+  )
+ORDER BY d.seq
+"""
 
 
 class EventStore:
@@ -352,6 +389,156 @@ class EventStore:
     def counters(self) -> dict[str, dict[str, Any]]:
         rows = self._read("SELECT name, value, last_at, note FROM counters ORDER BY name")
         return {r["name"]: {"count": int(r["value"]), "last_at": r["last_at"], "note": r["note"]} for r in rows}
+
+    # --- deliveries -----------------------------------------------------------------------------------------------
+
+    def next_delivery(self, consumer: str, now: dt.datetime) -> tuple[Delivery | None, dt.datetime | None]:
+        """The first delivery of `consumer` that is due now, and when the next of the others becomes due. Each order's
+        deliveries go one at a time and in order, so an order still retrying holds back only its own later events."""
+        heads = [_delivery(r) for r in self._read(_HEADS, (consumer,))]
+        due = [d for d in heads if d.next_try_at <= now]
+        later = [d.next_try_at for d in heads if d.next_try_at > now]
+        return (due[0] if due else None), (min(later) if later else None)
+
+    def retry_delivery(
+        self,
+        consumer: str,
+        seq: int,
+        *,
+        first_try_at: dt.datetime,
+        next_try_at: dt.datetime,
+        now: dt.datetime,
+        error: str | None,
+    ) -> None:
+        with self.write() as con:
+            con.execute(
+                "UPDATE deliveries SET attempts = attempts + 1, first_try_at = coalesce(first_try_at, ?), "
+                "next_try_at = ?, last_error = ?, updated_at = ? WHERE consumer = ? AND seq = ?",
+                (iso(first_try_at), iso(next_try_at), error, iso(now), consumer, seq),
+            )
+
+    def finish_delivery(self, consumer: str, seq: int, status: str, now: dt.datetime, error: str | None = None) -> None:
+        if status not in ("done", "failed", "skipped"):
+            raise ValueError(f"not a final delivery status: {status!r}")
+        with self.write() as con:
+            con.execute(
+                "UPDATE deliveries SET status = ?, last_error = coalesce(?, last_error), updated_at = ? "
+                "WHERE consumer = ? AND seq = ?",
+                (status, error, iso(now), consumer, seq),
+            )
+
+    def overdue_alerts(self, consumer: str, now: dt.datetime, alert_after_s: int) -> list[Delivery]:
+        """Pending deliveries of `consumer` still retrying `alert_after_s` after their first try, not yet reported."""
+        cut = iso(now - dt.timedelta(seconds=alert_after_s))
+        rows = self._read(
+            "SELECT * FROM deliveries WHERE consumer = ? AND status = 'pending' AND attempts > 0 AND delayed_sent = 0 "
+            "AND first_try_at <= ? ORDER BY seq",
+            (consumer, cut),
+        )
+        return [_delivery(r) for r in rows]
+
+    def next_alert_at(self, consumer: str, alert_after_s: int) -> dt.datetime | None:
+        rows = self._read(
+            "SELECT min(first_try_at) AS t FROM deliveries WHERE consumer = ? AND status = 'pending' AND attempts > 0 "
+            "AND delayed_sent = 0",
+            (consumer,),
+        )
+        first = rows[0]["t"] if rows else None
+        return parse_iso(first) + dt.timedelta(seconds=alert_after_s) if first else None
+
+    def mark_alerted(self, consumer: str, seq: int) -> None:
+        with self.write() as con:
+            con.execute("UPDATE deliveries SET delayed_sent = 1 WHERE consumer = ? AND seq = ?", (consumer, seq))
+
+    def retry_failed(self, consumer: str, now: dt.datetime) -> int:
+        """Put `consumer`'s failed deliveries back in the queue, as new. Returns how many."""
+        with self.write() as con:
+            return int(
+                con.execute(
+                    "UPDATE deliveries SET status = 'pending', attempts = 0, first_try_at = NULL, delayed_sent = 0, "
+                    "next_try_at = ?, updated_at = ? WHERE consumer = ? AND status = 'failed'",
+                    (iso(now), iso(now), consumer),
+                ).rowcount
+            )
+
+    # --- pause ----------------------------------------------------------------------------------------------------
+
+    def pause(self, consumer: str, now: dt.datetime) -> None:
+        with self.write() as con:
+            con.execute("INSERT OR IGNORE INTO paused (consumer, since) VALUES (?, ?)", (consumer, iso(now)))
+
+    def resume(self, consumer: str, *, skip_backlog: bool, now: dt.datetime) -> int:
+        """Deliver again; with `skip_backlog` the waiting deliveries are marked skipped. Returns how many were
+        skipped."""
+        with self.write() as con:
+            con.execute("DELETE FROM paused WHERE consumer = ?", (consumer,))
+            if not skip_backlog:
+                return 0
+            return int(
+                con.execute(
+                    "UPDATE deliveries SET status = 'skipped', last_error = 'skipped by resume --skip-backlog', "
+                    "updated_at = ? WHERE consumer = ? AND status = 'pending'",
+                    (iso(now), consumer),
+                ).rowcount
+            )
+
+    def is_paused(self, consumer: str) -> bool:
+        return bool(self._read("SELECT 1 FROM paused WHERE consumer = ?", (consumer,)))
+
+    def paused(self) -> dict[str, str]:
+        return {r["consumer"]: r["since"] for r in self._read("SELECT consumer, since FROM paused ORDER BY consumer")}
+
+    # --- status ---------------------------------------------------------------------------------------------------
+
+    def summary(self) -> dict[str, Any]:
+        """Counts for `events status` (no payloads): deliveries per consumer, doorbells, counters, the last seq.
+        `pending` counts every pending delivery, the retrying ones too; `retrying` and `delayed` are subsets of it."""
+        consumers: dict[str, dict[str, Any]] = {}
+
+        def entry(name: str) -> dict[str, Any]:
+            return consumers.setdefault(
+                name,
+                {
+                    "pending": 0,
+                    "retrying": 0,
+                    "delayed": 0,
+                    "failed": 0,
+                    "done": 0,
+                    "skipped": 0,
+                    "last_done_at": None,
+                    "last_error": None,
+                },
+            )
+
+        for r in self._read(
+            "SELECT consumer, status, attempts > 0 AS retrying, delayed_sent, count(*) AS n FROM deliveries "
+            "GROUP BY consumer, status, retrying, delayed_sent"
+        ):
+            item = entry(r["consumer"])
+            item[r["status"]] = item.get(r["status"], 0) + int(r["n"])
+            if r["status"] == "pending" and r["retrying"]:
+                item["retrying"] += int(r["n"])
+                if r["delayed_sent"]:
+                    item["delayed"] += int(r["n"])
+        for r in self._read(
+            "SELECT consumer, max(updated_at) AS t FROM deliveries WHERE status = 'done' GROUP BY consumer"
+        ):
+            entry(r["consumer"])["last_done_at"] = r["t"]
+        for r in self._read(
+            "SELECT consumer, last_error FROM deliveries d WHERE status = 'failed' AND updated_at = "
+            "(SELECT max(updated_at) FROM deliveries e WHERE e.consumer = d.consumer AND e.status = 'failed') "
+            "ORDER BY seq"  # of failures stamped at the same time, the last one's error wins
+        ):
+            entry(r["consumer"])["last_error"] = r["last_error"]
+        return {
+            "last_seq": self.last_seq(),
+            "counters": self.counters(),
+            "doorbells_waiting": len(self.doorbells()),
+            "baseline_done": self.meta("baseline_done"),
+            "after_close_ok": self.meta("after_close_ok"),
+            "consumers": consumers,
+            "paused": self.paused(),
+        }
 
     # --- retention ------------------------------------------------------------------------------------------------
 
