@@ -6,22 +6,26 @@ import asyncio
 
 import pytest
 
-from conftest import ACCESS_TOKEN
-from events_helpers import ORDER_ID, PY, filled_row, make_service, order_row
+from conftest import ACCESS_TOKEN, FIXED_NOW
+from events_helpers import ORDER_ID, PY, filled_row, order_row
+from kite_connect_mcp.auth.tokenstore import TokenRecord
+from kite_connect_mcp.events import service as service_module
 from kite_connect_mcp.events._wait import wait_any
-from kite_connect_mcp.events.doorbell import DoorbellWorker
+from kite_connect_mcp.events.doorbell import MAX_TRIES, DoorbellWorker
 from kite_connect_mcp.events.store import StoreError
 
 NOTIFY = {"name": "notify", "command": [PY, "-c", "pass"], "match": {"kinds": ["order", "session"]}}
+OTHER_ID = "250101000000002"
+# Kite's answer to GET /orders/{id} for an id it does not know (checked against the real API with a read-only probe).
+UNKNOWN_ORDER = {"status": 404, "error_type": "GeneralException", "message": "Couldn't find that `order_id`."}
 
 
 @pytest.fixture
-def setup(runtime_factory, tmp_path, fake_kite):
-    svc, rt = make_service(runtime_factory, tmp_path, consumers=[NOTIFY])
+def setup(service_factory, fake_kite):
+    svc, _ = service_factory(consumers=[NOTIFY])
     worker = DoorbellWorker(svc)
     svc.doorbells = worker
     yield svc, worker, fake_kite
-    svc.store.close()
     assert fake_kite.writes() == []  # the doorbell only ever reads from Kite
 
 
@@ -39,13 +43,34 @@ async def test_the_order_is_re_read_and_kites_answer_is_stored(setup):
 
 async def test_an_order_kite_does_not_know_is_dropped_and_counted(setup):
     svc, worker, kite = setup
-    kite.on("GET", f"/orders/{ORDER_ID}", status=400, error_type="InputException", message="Couldn't find that order")
+    kite.on("GET", f"/orders/{ORDER_ID}", **UNKNOWN_ORDER)
     svc.ring(ORDER_ID)
-    svc.ring("250101000000002")  # unrouted: FakeKite answers 404 InputException
-    assert await worker.process() == 2
+    assert await worker.process() == 1
     assert svc.store.events() == []
     assert svc.store.doorbells() == []
-    assert svc.store.counters()["doorbell_unknown_order"]["count"] == 2
+    assert svc.store.counters()["doorbell_unknown_order"]["count"] == 1
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        None,  # unrouted: FakeKite answers 404 InputException "Route not found", as Kite does for a wrong path
+        {"status": 404, "body": b"<html><body>Not Found</body></html>", "content_type": "text/html"},  # a proxy
+        {"status": 404, "error_type": "GeneralException", "message": "Not found"},
+        {"status": 400, "error_type": "InputException", "message": "Couldn't find that `order_id`."},
+        {"status": 500, "error_type": "GeneralException", "message": "Couldn't find that `order_id`."},
+    ],
+)
+async def test_only_kites_unknown_order_answer_drops_a_doorbell(setup, answer):
+    """Any other 404 (a wrong base URL or route, a proxy's page) is a failed read: dropping on it would lose every
+    doorbell while the setup is wrong."""
+    svc, worker, kite = setup
+    if answer is not None:
+        kite.on("GET", f"/orders/{ORDER_ID}", **answer)
+    svc.ring(ORDER_ID)
+    assert await worker.process() == 0
+    assert svc.store.doorbells() == [(ORDER_ID, 1)]
+    assert "doorbell_unknown_order" not in svc.store.counters()
 
 
 async def test_an_empty_history_is_an_unknown_order(setup):
@@ -56,14 +81,13 @@ async def test_an_empty_history_is_an_unknown_order(setup):
     assert svc.store.doorbells() == [] and svc.store.counters()["doorbell_unknown_order"]["count"] == 1
 
 
-async def test_without_a_token_nothing_is_read_and_the_doorbell_waits(runtime_factory, tmp_path, fake_kite):
-    svc, _ = make_service(runtime_factory, tmp_path, KITE_TOKEN_FILE=str(tmp_path / "none.json"))
+async def test_without_a_token_nothing_is_read_and_the_doorbell_waits(service_factory, tmp_path, fake_kite):
+    svc, _ = service_factory(KITE_TOKEN_FILE=str(tmp_path / "none.json"))
     worker = DoorbellWorker(svc)
     svc.ring(ORDER_ID)
     assert await worker.process() == 0
     assert svc.store.doorbells() == [(ORDER_ID, 0)]
     assert fake_kite.requests == []
-    svc.store.close()
 
 
 async def test_a_rejected_token_raises_token_rejected_and_the_doorbell_waits(setup):
@@ -113,6 +137,13 @@ async def test_wait_any_returns_on_an_event_or_the_timeout():
     await asyncio.wait_for(wait_any(5, a, b), 1)
 
 
+async def test_wait_any_with_no_events_waits_the_timeout():
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait_for(wait_any(0.03), 1)
+    assert loop.time() - started >= 0.02
+
+
 # --- beyond the plan's tests ----------------------------------------------------------------------------------------
 
 
@@ -143,14 +174,15 @@ async def test_a_rejected_token_is_not_tried_on_the_other_doorbells(setup):
     assert svc.store.doorbells() == [(ORDER_ID, 1), ("250101000000002", 0)]
 
 
-async def test_an_answer_without_a_valid_order_id_settles_the_doorbell_without_an_event(setup, caplog):
+@pytest.mark.parametrize("other", ["not an order id!", OTHER_ID, None])
+async def test_an_answer_about_another_order_settles_the_doorbell_without_an_event(setup, caplog, other):
     svc, worker, kite = setup
-    kite.on("GET", f"/orders/{ORDER_ID}", [order_row(order_id="not an order id!")])
+    kite.on("GET", f"/orders/{ORDER_ID}", [filled_row(order_id=other)])
     svc.ring(ORDER_ID)
     assert await worker.process() == 1
     assert svc.store.events() == [] and svc.store.doorbells() == []
     assert "doorbell_unknown_order" not in svc.store.counters()
-    assert "no valid order id" in _doorbell_logs(caplog)
+    assert "about another order" in _doorbell_logs(caplog)
 
 
 async def test_the_logs_never_name_the_rung_order(setup, caplog):
@@ -192,3 +224,109 @@ async def test_the_worker_keeps_running_after_a_failed_round(setup, monkeypatch,
     stop.set()
     await asyncio.wait_for(task, 2)
     assert real_doorbells() == [] and len(svc.store.events()) == 1
+
+
+async def test_the_token_checked_is_the_token_sent_and_the_one_reported(setup, monkeypatch):
+    """Another process can replace the token file between the worker's check and the read: the read still uses the
+    token checked, so the client rejects that one and the session event names it."""
+    svc, worker, kite = setup
+    kite.on("GET", f"/orders/{ORDER_ID}", status=403, error_type="TokenException", message="Invalid session")
+    checked = svc.tokens.current()
+    replaced = TokenRecord.new("othertesttoken000000000000000002", FIXED_NOW)
+    answers = iter([checked])
+    monkeypatch.setattr(svc.tokens, "current", lambda: next(answers, replaced))
+    svc.ring(ORDER_ID)
+    await worker.process()
+    (request,) = kite.requests
+    assert request.headers["Authorization"].endswith(f":{ACCESS_TOKEN}")
+    assert svc.note_token_rejected(ACCESS_TOKEN) is None  # reported already
+    assert svc.note_token_rejected(replaced.access_token) is not None
+
+
+async def test_a_kite_failure_on_one_rung_order_does_not_hold_up_the_next(setup):
+    svc, worker, kite = setup
+    kite.on("GET", f"/orders/{ORDER_ID}", status=503, error_type="NetworkException", message="busy")
+    kite.on("GET", f"/orders/{OTHER_ID}", [filled_row(order_id=OTHER_ID)])
+    svc.ring(ORDER_ID)
+    svc.ring(OTHER_ID)
+    assert await worker.process() == 1
+    assert svc.store.doorbells() == [(ORDER_ID, 1)]
+    (event,) = svc.store.events()
+    assert event["order"]["order_id"] == OTHER_ID
+
+
+async def test_a_failure_before_kite_is_reached_keeps_the_doorbells(service_factory, fake_kite, caplog):
+    svc, _ = service_factory(KITE_API_KEY=None)  # every read fails with a ConfigError, no request is sent
+    worker = DoorbellWorker(svc)
+    svc.ring(ORDER_ID)
+    svc.ring(OTHER_ID)
+    assert await worker.process() == 0
+    assert svc.store.doorbells() == [(ORDER_ID, 1), (OTHER_ID, 1)]
+    assert fake_kite.requests == []
+    assert "KITE_API_KEY" in _doorbell_logs(caplog)
+
+
+@pytest.mark.parametrize("answer", [{"weird": 1}, "text", None, [1, 2], [filled_row(), "junk"]])
+async def test_an_answer_that_is_not_an_order_history_keeps_the_doorbell(setup, caplog, answer):
+    """Only an empty history says the order is unknown; a malformed answer says nothing about it."""
+    svc, worker, kite = setup
+    kite.on("GET", f"/orders/{ORDER_ID}", answer)
+    svc.ring(ORDER_ID)
+    assert await worker.process() == 0
+    assert svc.store.doorbells() == [(ORDER_ID, 1)] and svc.store.events() == []
+    assert "doorbell_unknown_order" not in svc.store.counters()
+    assert "not an order history" in _doorbell_logs(caplog)
+
+
+async def test_a_bug_with_one_rung_order_keeps_it_and_lets_the_others_settle(setup, monkeypatch, caplog):
+    svc, worker, kite = setup
+    kite.on("GET", f"/orders/{ORDER_ID}", [filled_row()])
+    kite.on("GET", f"/orders/{OTHER_ID}", [filled_row(order_id=OTHER_ID)])
+    real = service_module.order_event
+
+    def broken(view, **kwargs):
+        if view.order_id == ORDER_ID:
+            raise ValueError("unknown change")
+        return real(view, **kwargs)
+
+    monkeypatch.setattr(service_module, "order_event", broken)
+    svc.ring(ORDER_ID)
+    svc.ring(OTHER_ID)
+    assert await worker.process() == 1
+    assert svc.store.doorbells() == [(ORDER_ID, 1)]
+    (event,) = svc.store.events()
+    assert event["order"]["order_id"] == OTHER_ID
+    logs = _doorbell_logs(caplog)
+    assert "could not settle a rung order" in logs and ORDER_ID not in logs
+
+
+async def test_a_store_that_cannot_write_ends_the_round(setup, monkeypatch):
+    svc, worker, kite = setup
+    kite.on("GET", f"/orders/{ORDER_ID}", [filled_row()])
+    kite.on("GET", f"/orders/{OTHER_ID}", [filled_row(order_id=OTHER_ID)])
+
+    def failing(*args, **kwargs):
+        raise StoreError("cannot write the event store: disk I/O error")
+
+    monkeypatch.setattr(svc, "ingest_order", failing)
+    svc.ring(ORDER_ID)
+    svc.ring(OTHER_ID)
+    with pytest.raises(StoreError):
+        await worker.process()
+    assert svc.store.doorbells() == [(ORDER_ID, 0), (OTHER_ID, 0)]  # kept, and not counted as tried
+    assert len(kite.requests) == 1
+
+
+async def test_a_doorbell_that_failed_max_tries_times_is_given_up(setup, caplog):
+    svc, worker, kite = setup
+    kite.on("GET", f"/orders/{ORDER_ID}", status=500, error_type="GeneralException", message="boom")
+    svc.ring(ORDER_ID)
+    for _ in range(MAX_TRIES - 1):
+        assert await worker.process() == 0
+    assert svc.store.doorbells() == [(ORDER_ID, MAX_TRIES - 1)]
+    assert await worker.process() == 1
+    assert svc.store.doorbells() == [] and svc.store.events() == []
+    assert svc.store.counters()["doorbell_gave_up"]["count"] == 1
+    assert "doorbell_unknown_order" not in svc.store.counters()
+    assert len(kite.calls("GET", f"/orders/{ORDER_ID}")) == MAX_TRIES
+    assert "gave up" in _doorbell_logs(caplog)

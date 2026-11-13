@@ -397,6 +397,17 @@ class EventStore:
         with self.write() as con:
             con.execute("DELETE FROM doorbells WHERE order_id = ?", (order_id,))
 
+    def drop_doorbell(
+        self, order_id: str, now: dt.datetime, counter: Literal["doorbell_unknown_order", "doorbell_gave_up"]
+    ) -> bool:
+        """Delete the doorbell of `order_id` and count why in `counter`, in one transaction. False, with nothing
+        counted, when there is no such doorbell."""
+        with self.write() as con:
+            if con.execute("DELETE FROM doorbells WHERE order_id = ?", (order_id,)).rowcount == 0:
+                return False
+            _bump(con, counter, now)
+            return True
+
     # --- counters -------------------------------------------------------------------------------------------------
 
     def bump(

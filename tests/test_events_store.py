@@ -399,6 +399,20 @@ def test_a_counter_bumped_inside_a_write_is_kept_or_rolled_back_with_the_block(s
     assert store.counters()["selftest_received"]["count"] == 2
 
 
+def test_a_doorbell_is_dropped_with_its_count_or_not_at_all(store):
+    store.ring(ORDER_ID, FIXED_NOW)
+    assert store.drop_doorbell(ORDER_ID, FIXED_NOW, "doorbell_unknown_order")
+    assert store.doorbells() == [] and store.counters()["doorbell_unknown_order"]["count"] == 1
+    assert not store.drop_doorbell(ORDER_ID, FIXED_NOW, "doorbell_unknown_order")  # gone already: not counted again
+    assert store.counters()["doorbell_unknown_order"]["count"] == 1
+    store.ring(ORDER_ID, FIXED_NOW)
+    with store.write() as con:
+        con.execute("DROP TABLE counters")
+    with pytest.raises(StoreError):
+        store.drop_doorbell(ORDER_ID, FIXED_NOW, "doorbell_gave_up")
+    assert store.doorbells() == [(ORDER_ID, 0)]
+
+
 def test_a_ring_that_cannot_be_counted_keeps_no_doorbell(store):
     with store.write() as con:
         con.execute("DROP TABLE counters")
