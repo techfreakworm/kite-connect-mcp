@@ -103,6 +103,10 @@ def build_server(rt: Runtime) -> tuple[MCPServer, Registrar]:
     reg = Registrar(server, rt)
     for module in TOOL_MODULES:
         module.register(reg)
+    if rt.events is not None and settings.postback_path:
+        from .postback import ensure_postback_route
+
+        ensure_postback_route(rt)
     log.info("registered %d tools (%d skipped)", len(reg.registered), len(reg.skipped))
     return server, reg
 

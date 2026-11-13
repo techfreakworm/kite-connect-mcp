@@ -21,7 +21,7 @@ from typing import Annotated, Any
 from pydantic import Field
 
 from ..errors import InstrumentsUnavailable, KiteMCPError, ToolInputError
-from ..postback import PostbackRoute
+from ..postback import ensure_postback_route
 from ..ticker.manager import PLAN_NOTE, CachedTick, Mode, Target, TickerManager
 from ..timeutil import to_ist
 from ._base import Registrar, Runtime, parse_instrument
@@ -186,7 +186,12 @@ def register(reg: Registrar) -> None:
             """Whether live streaming is available. On this server the WebSocket ticker is DISABLED
             (KITE_MCP_TICKER_ENABLED=false): the answer explains how to enable it and what it needs."""
             answer: dict[str, Any] = {"enabled": False, "message": DISABLED_MESSAGE}
-            if settings.postback_path:
+            if settings.postback_path and rt.events is not None:
+                answer["postback"] = (
+                    f"KITE_MCP_POSTBACK_PATH is set ({settings.postback_path}): postbacks go to the order events "
+                    "(KITE_MCP_EVENTS=true), not to the ticker's order updates."
+                )
+            elif settings.postback_path:
                 answer["postback"] = (
                     f"KITE_MCP_POSTBACK_PATH is set ({settings.postback_path}) but the postback endpoint is off too: "
                     "order updates are only readable through the ticker tools."
@@ -196,9 +201,8 @@ def register(reg: Registrar) -> None:
         return
 
     if settings.postback_path and reg.enabled("ticker_order_updates", "ticker", "read") is None:
-        hooks = rt.extras.setdefault("http_routes", [])
-        if not any(isinstance(hook, PostbackRoute) for hook in hooks):
-            hooks.append(PostbackRoute(rt))
+        rt.extras["postback_to_ticker"] = True
+        ensure_postback_route(rt)
 
     @reg.tool("ticker_subscribe", title="Stream live ticks", toolset="ticker", kind="local")
     async def ticker_subscribe(

@@ -19,6 +19,10 @@ and Kite cannot send one. So it must defend itself:
 What the checksum does not cover: it binds the order_id and order_timestamp only, so a captured postback could be
 replayed or have its other fields altered and still verify. Treat what arrives as a notification and confirm anything
 that matters with the order book.
+
+With KITE_MCP_EVENTS=true the route is registered whenever KITE_MCP_POSTBACK_PATH is set, and a verified postback only
+rings the event service's doorbell (or records a selftest): the order is then re-read from Kite and nothing from the
+payload is stored (see events/doorbell.py). Every refusal is counted, under a fixed reason (service.REFUSALS).
 """
 
 from __future__ import annotations
@@ -33,9 +37,13 @@ from typing import TYPE_CHECKING, Any
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 
+from .events.model import ORDER_ID_RE, SELFTEST_PREFIX
+from .events.store import StoreError
+
 if TYPE_CHECKING:
     from mcp.server import MCPServer
 
+    from .events.service import Refusal
     from .tools._base import Runtime
 
 log = logging.getLogger(__name__)
@@ -63,6 +71,10 @@ def _bare(status: int) -> Response:
     return Response(status_code=status, headers={"Cache-Control": "no-store"})
 
 
+def _ok() -> Response:
+    return JSONResponse({"status": "ok"}, headers={"Cache-Control": "no-store"})
+
+
 async def _read_body(request: Request) -> bytes | None:
     """The request body, or None if it is over MAX_BODY_BYTES. Counts the bytes as they arrive, so an oversized or
     endless body is cut off instead of being buffered first."""
@@ -77,6 +89,13 @@ async def _read_body(request: Request) -> bytes | None:
     return bytes(body)
 
 
+def ensure_postback_route(rt: Runtime) -> None:
+    """Add the route hook once (`server.build_http_app` calls the hooks)."""
+    hooks = rt.extras.setdefault("http_routes", [])
+    if not any(isinstance(hook, PostbackRoute) for hook in hooks):
+        hooks.append(PostbackRoute(rt))
+
+
 class PostbackRoute:
     """The route hook: `rt.extras["http_routes"]` holds callables that take the MCPServer and add their routes."""
 
@@ -89,31 +108,58 @@ class PostbackRoute:
             server.custom_route(path, methods=["POST"], name="kite_postback", include_in_schema=False)(self.handle)
 
     async def handle(self, request: Request) -> Response:
+        events = self.rt.events
         secret = self.rt.settings.api_secret
+
+        def refuse(status: int, reason: Refusal, detail: str) -> Response:
+            """`reason` is one of service.REFUSALS (it is counted and shown in the status); `detail` is for the log."""
+            log.warning("postback refused: %s", detail)
+            if events is not None:
+                events.refused(reason)
+            return _bare(status)
+
         if not secret:
-            log.warning("postback refused: KITE_API_SECRET is not set, so the checksum cannot be verified")
-            return _bare(403)
+            return refuse(403, "no API secret", "KITE_API_SECRET is not set, so the checksum cannot be verified")
         try:
             body = await _read_body(request)
         except ClientDisconnect:
             return _bare(400)
         if body is None:
-            log.warning("postback refused: the body is over %d bytes", MAX_BODY_BYTES)
-            return _bare(413)
+            return refuse(413, "body over the cap", f"the body is over {MAX_BODY_BYTES} bytes")
         try:
             payload = json.loads(body)
         except (ValueError, RecursionError):
-            log.warning("postback refused: the body is not JSON")
-            return _bare(400)
+            return refuse(400, "body not JSON", "the body is not JSON")
         if not isinstance(payload, dict):
-            log.warning("postback refused: the body is not a JSON object")
-            return _bare(400)
+            return refuse(400, "body not a JSON object", "the body is not a JSON object")
         if not verify_checksum(payload, secret):
-            log.warning("postback refused: the checksum is missing or does not match")
-            return _bare(403)
-        ticker = self.rt.ticker
-        if ticker is None:
+            return refuse(403, "bad checksum", "the checksum is missing or does not match")
+        if events is None:
+            ticker = self.rt.ticker
+            if ticker is None:
+                return _bare(503)
+            ticker.record_order_update(payload, source="postback")
+            log.info("postback accepted")
+            return _ok()
+        order_id = payload["order_id"]  # a str: verify_checksum checked it
+        if not ORDER_ID_RE.fullmatch(order_id):
+            return refuse(400, "bad order id", "the order id has an unexpected form")
+        try:
+            if order_id.startswith(SELFTEST_PREFIX):
+                events.record_selftest(order_id)
+                log.info("postback selftest received")
+                return _ok()
+            if not events.user_allowed(payload.get("user_id")):
+                return refuse(
+                    403, "another account", "the postback is for another account than KITE_MCP_ALLOWED_USER_ID"
+                )
+            events.ring(order_id)
+        except ValueError:  # an id the service does not take: "selftest-" with nothing after it
+            return refuse(400, "bad order id", "the order id has an unexpected form")
+        except StoreError:
+            log.error("postback: the event store cannot write; answering 503 (the poll will catch up)")
             return _bare(503)
-        ticker.record_order_update(payload, source="postback")
+        if self.rt.extras.get("postback_to_ticker") and self.rt.ticker is not None:
+            self.rt.ticker.record_order_update(payload, source="postback")
         log.info("postback accepted")
-        return JSONResponse({"status": "ok"}, headers={"Cache-Control": "no-store"})
+        return _ok()
