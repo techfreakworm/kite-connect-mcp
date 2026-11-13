@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import errno
 import grp
 import json
 import os
 import pwd
 import re
+import shutil
 import stat
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -30,6 +34,7 @@ from kite_connect_mcp.events.model import OrderView, order_event, session_event
 # the tests is not used here because some CI images keep it below folders anyone can write (see the last tests).
 PROG = "/bin/sh"
 PREFIX = "KITE_MCP_EVENTS_CONSUMERS_FILE: "
+OTHER = os.geteuid() + 1  # a uid that is neither this user nor root
 
 
 def write(tmp_path, data, mode=0o600):
@@ -37,8 +42,12 @@ def write(tmp_path, data, mode=0o600):
 
 
 def write_text(tmp_path, text, mode=0o600):
+    return write_bytes(tmp_path, text.encode("utf-8"), mode)
+
+
+def write_bytes(tmp_path, raw, mode=0o600):
     path = tmp_path / "consumers.json"
-    path.write_text(text)
+    path.write_bytes(raw)
     path.chmod(mode)
     return path
 
@@ -237,23 +246,36 @@ def test_tag_labels_are_stripped_read_only_and_may_join_letters(tmp_path):
 
 def test_a_missing_or_broken_file_is_refused(tmp_path):
     refused(tmp_path / "nope.json", "cannot read the consumers file")
+    refused(tmp_path / "nope" / "consumers.json", f"cannot read the consumers file {tmp_path}/nope/consumers.json")
     refused(write_text(tmp_path, "{"), "is not valid JSON")
-    not_utf8 = tmp_path / "latin1.json"
-    not_utf8.write_bytes(b'{"tag_labels": {"t": "\xe9"}}')
-    not_utf8.chmod(0o600)
-    refused(not_utf8, "is not valid JSON")
+    refused(write_text(tmp_path, "[" * 100_000), "is not valid JSON")  # too deep for the parser: not a traceback
+    refused(write(tmp_path, {}) / "x", f"{tmp_path}/consumers.json/x: {os.strerror(errno.ENOTDIR)}")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b'{"tag_labels": {"t": "\xe9"}}', '{"consumers": []}'.encode("utf-16"), '{"consumers": []}'.encode("utf-32")],
+    ids=["latin-1", "utf-16", "utf-32"],
+)
+def test_a_file_that_is_not_utf8_is_refused(tmp_path, raw):
+    refused(write_bytes(tmp_path, raw), "is not UTF-8 text")
+
+
+def test_a_utf8_byte_order_mark_is_ignored(tmp_path):
+    path = write_bytes(tmp_path, b"\xef\xbb\xbf" + b'{"tag_labels": {"mytag": "my strategy"}}')
+    assert ConsumersConfig.load(path).tag_labels == {"mytag": "my strategy"}
 
 
 def test_a_reason_the_system_does_not_give_is_not_printed_as_none(tmp_path, monkeypatch):
     path = write(tmp_path, {"consumers": []})
-    real_stat = os.stat
+    real_lstat = os.lstat
 
-    def stat_without_reason(p, *args, **kwargs):
+    def lstat_without_reason(p, *args, **kwargs):
         if os.fspath(p) == os.fspath(path):
             raise OSError("no errno")
-        return real_stat(p, *args, **kwargs)
+        return real_lstat(p, *args, **kwargs)
 
-    monkeypatch.setattr(os, "stat", stat_without_reason)
+    monkeypatch.setattr(os, "lstat", lstat_without_reason)
     assert "None" not in refused(path, "cannot read the consumers file")
 
 
@@ -275,6 +297,41 @@ def groups_are(monkeypatch, *, private):
 
     monkeypatch.setattr(consumers_module, "_group_is_private", lookup)
     return lookups
+
+
+def acls_are(monkeypatch, *, present):
+    """Make every file and folder have a POSIX access ACL, or none. Returns the paths probed."""
+    probed = []
+
+    def probe(path):
+        probed.append(path)
+        return present
+
+    monkeypatch.setattr(consumers_module, "_has_access_acl", probe)
+    return probed
+
+
+def owned_by(monkeypatch, path, uid):
+    """Make the system report the entry at `path` itself (a link not followed) as owned by `uid`."""
+    real_lstat = os.lstat
+    faked = os.fspath(path)
+
+    def lstat(p, *args, **kwargs):
+        info = real_lstat(p, *args, **kwargs)
+        if os.fspath(p) != faked:
+            return info
+        fields = list(info[:10])
+        fields[4] = uid  # st_uid
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+
+def folders(tmp_path, *names):
+    made = [tmp_path / name for name in names]
+    for folder in made:
+        folder.mkdir()
+    return made
 
 
 def test_a_file_others_can_write_is_refused(tmp_path, monkeypatch):
@@ -310,9 +367,9 @@ def test_a_file_in_a_folder_others_can_write_is_refused_unless_the_folder_is_sti
     folder.mkdir()
     path = write(folder, {"consumers": []})
     folder.chmod(0o777)
-    refused(path, f"the folder {folder} above the consumers file")
+    refused(path, f"the folder {folder} on the path to the consumers file")
     folder.chmod(0o770)
-    refused(path, f"the folder {folder} above the consumers file")
+    refused(path, f"the folder {folder} on the path to the consumers file")
     folder.chmod(0o1777)  # like /tmp: others may add files but not replace this one
     assert ConsumersConfig.load(path).consumers == ()
 
@@ -327,9 +384,13 @@ def test_a_folder_its_private_group_can_write_is_accepted(tmp_path, monkeypatch)
     info = os.stat(folder)
     assert (info.st_gid, info.st_uid) in lookups  # the folder's own group and owner
     folder.chmod(0o777)
-    refused(path, f"the folder {folder} above the consumers file {path} is writable by group or others (mode 777)")
+    refused(
+        path, f"the folder {folder} on the path to the consumers file {path} is writable by group or others (mode 777)"
+    )
     folder.chmod(0o757)
-    refused(path, f"the folder {folder} above the consumers file {path} is writable by group or others (mode 757)")
+    refused(
+        path, f"the folder {folder} on the path to the consumers file {path} is writable by group or others (mode 757)"
+    )
     folder.chmod(0o1777)
     assert ConsumersConfig.load(path).consumers == ()
 
@@ -342,8 +403,8 @@ def test_a_folder_a_shared_group_can_write_is_refused(tmp_path, monkeypatch):
     folder.chmod(0o775)
     refused(
         path,
-        f"the folder {folder} above the consumers file {path} is writable by its group, which is not private to its "
-        f"owner (mode 775); run chmod g-w {folder}",
+        f"the folder {folder} on the path to the consumers file {path} is writable by its group, which is not private "
+        f"to its owner (mode 775); run chmod g-w {folder}",
     )
 
 
@@ -357,22 +418,42 @@ def test_a_link_counts_where_it_is_and_where_it_points(tmp_path):
     folder.chmod(0o777)
     open_link = folder / "link.json"
     open_link.symlink_to(target)
-    refused(open_link, f"the folder {folder} above the consumers file")  # anyone could point the link elsewhere
+    refused(
+        open_link, f"the folder {folder} on the path to the consumers file"
+    )  # anyone could point the link elsewhere
     open_target = folder / "consumers.json"
     open_target.write_text("{}")
     open_target.chmod(0o600)
     target.unlink()
     target.symlink_to(open_target)
-    refused(target, f"the folder {folder} above the consumers file")
+    refused(target, f"the folder {folder} on the path to the consumers file")
 
 
 def test_a_file_owned_by_someone_else_is_refused(tmp_path, monkeypatch):
+    path = write(tmp_path, {"consumers": []})
+    owned_by(monkeypatch, path, OTHER)
+    refused(path, f"the consumers file {path} is owned by uid {OTHER}, not by this user or root")
+
+
+def test_a_folder_owned_by_someone_else_is_refused(tmp_path, monkeypatch):
+    (folder,) = folders(tmp_path, "bin")
+    program = notify_program(folder)
+    owned_by(monkeypatch, folder, OTHER)
+    refused(
+        with_program(tmp_path, program),
+        f"consumer 'a': the folder {folder} on the path to the program {program} is owned by uid {OTHER}, not by this "
+        "user or root",
+    )
+
+
+def test_every_folder_up_to_the_root_must_be_owned_by_this_user_or_root(tmp_path, monkeypatch):
+    path = write(tmp_path, {"consumers": []})
     me = os.geteuid()
     if me == 0:
-        pytest.skip("root's files are always trusted, and root owns every file this test can make")
-    path = write(tmp_path, {"consumers": []})
+        pytest.skip("root owns every folder this test can make, and root's folders are always trusted")
     monkeypatch.setattr(os, "geteuid", lambda: me + 1)
-    refused(path, f"is owned by uid {me}, not by this user or root")
+    message = refused(path, f"on the path to the consumers file {path} is owned by uid {me}, not by this user or root")
+    assert re.search(r"the folder (\S+) on the path", message).group(1) in {str(p) for p in path.parents}
 
 
 def notify_program(folder, mode=0o700):
@@ -396,14 +477,14 @@ def test_a_program_others_can_change_is_refused(tmp_path):
     refused(with_program(tmp_path, program), f"consumer 'a': the program {program} is writable by group or others")
     program.chmod(0o700)
     folder.chmod(0o777)
-    refused(with_program(tmp_path, program), f"consumer 'a': the folder {folder} above the program")
+    refused(with_program(tmp_path, program), f"consumer 'a': the folder {folder} on the path to the program")
     folder.chmod(0o700)
     open_folder = tmp_path / "open"
     open_folder.mkdir()
     open_folder.chmod(0o777)
     link = open_folder / "notify"
     link.symlink_to(program)
-    refused(with_program(tmp_path, link), f"consumer 'a': the folder {open_folder} above the program")
+    refused(with_program(tmp_path, link), f"consumer 'a': the folder {open_folder} on the path to the program")
 
 
 def test_a_program_its_private_group_can_write_is_accepted_and_a_shared_one_refused(tmp_path, monkeypatch):
@@ -415,9 +496,9 @@ def test_a_program_its_private_group_can_write_is_accepted_and_a_shared_one_refu
     (c,) = ConsumersConfig.load(with_program(tmp_path, program)).consumers
     assert c.command == (str(program),)
     groups_are(monkeypatch, private=False)
+    refused(with_program(tmp_path, program), f"consumer 'a': the folder {folder} on the path to the program")
+    folder.chmod(0o755)  # the folders are checked on the way, before the program
     refused(with_program(tmp_path, program), f"consumer 'a': the program {program} is writable by its group")
-    program.chmod(0o755)
-    refused(with_program(tmp_path, program), f"consumer 'a': the folder {folder} above the program")
 
 
 def test_a_link_to_a_trusted_program_is_accepted(tmp_path):
@@ -425,6 +506,173 @@ def test_a_link_to_a_trusted_program_is_accepted(tmp_path):
     link.symlink_to(PROG)
     (c,) = ConsumersConfig.load(with_program(tmp_path, link)).consumers
     assert c.command == (str(link),)
+
+
+# --- links, followed one step at a time as the system does ----------------------------------------------------------
+
+
+def test_a_chain_of_links_through_a_folder_others_can_write_is_refused(tmp_path):
+    safe, open_ = folders(tmp_path, "safe", "open")
+    target = write(safe, {"consumers": []})
+    (open_ / "mid").symlink_to(target)
+    start = safe / "start"
+    start.symlink_to(open_ / "mid")  # safe/start -> open/mid -> safe/consumers.json: anyone can repoint mid
+    assert ConsumersConfig.load(start).consumers == ()
+    open_.chmod(0o777)
+    refused(
+        start, f"the folder {open_} on the path to the consumers file {start} is writable by group or others (mode 777)"
+    )
+
+
+def test_dot_dot_after_a_link_goes_up_from_where_the_link_leads(tmp_path):
+    safe, other, open_ = folders(tmp_path, "safe", "other", "open")
+    write(safe, {"tag_labels": {"mytag": "safe"}})
+    write(other, {"tag_labels": {"mytag": "other"}})
+    (other / "sub").mkdir()
+    link = safe / "link"
+    link.symlink_to(other / "sub")
+    path = Path(f"{link}/../consumers.json")  # the system reads other/consumers.json, not safe/consumers.json
+    assert json.loads(path.read_text())["tag_labels"] == {"mytag": "other"}
+    assert ConsumersConfig.load(path).tag_labels == {"mytag": "other"}  # checked and read where the system goes
+    (open_ / "sub").mkdir()
+    write(open_, {"tag_labels": {"mytag": "open"}})
+    open_.chmod(0o777)
+    link.unlink()
+    link.symlink_to(open_ / "sub")  # now .. leads into a folder anyone can write, whatever safe/consumers.json is
+    refused(path, f"the folder {open_} on the path to the consumers file {path} is writable by group or others")
+
+
+def test_a_link_someone_else_owns_is_refused_even_in_a_sticky_folder(tmp_path, monkeypatch):
+    # In a sticky folder such as /tmp, whoever owns a link may replace it, and so decides where it leads.
+    target = write(tmp_path, {"consumers": []})
+    (sticky,) = folders(tmp_path, "sticky")
+    sticky.chmod(0o1777)
+    link = sticky / "consumers.json"
+    link.symlink_to(target)
+    folder_link = sticky / "dir"
+    folder_link.symlink_to(tmp_path)
+    assert ConsumersConfig.load(link).consumers == ()  # links of this user's own are fine there
+    assert ConsumersConfig.load(folder_link / "consumers.json").consumers == ()
+    owned_by(monkeypatch, link, OTHER)
+    refused(link, f"the link {link} on the path to the consumers file {link} is owned by uid {OTHER}, not by this user")
+    owned_by(monkeypatch, folder_link, OTHER)
+    refused(folder_link / "consumers.json", f"the link {folder_link} on the path to the consumers file")
+
+
+def test_a_link_to_the_program_is_followed_one_step_at_a_time(tmp_path, monkeypatch):
+    safe, open_ = folders(tmp_path, "safe", "open")
+    program = notify_program(safe)
+    (open_ / "notify").symlink_to(program)
+    link = safe / "start"
+    link.symlink_to(open_ / "notify")
+    assert ConsumersConfig.load(with_program(tmp_path, link)).consumers[0].command == (str(link),)
+    open_.chmod(0o777)
+    refused(with_program(tmp_path, link), f"consumer 'a': the folder {open_} on the path to the program {link}")
+
+
+def test_at_most_40_links_are_followed(tmp_path):
+    target = write(tmp_path, {"consumers": []})
+    previous = target.name
+    for n in range(41):  # link<n> is n + 1 links away from the file
+        (tmp_path / f"link{n}").symlink_to(previous)
+        previous = f"link{n}"
+    assert check_owned_file(tmp_path / "link39", "the file") is None
+    too_many = os.strerror(errno.ELOOP)
+    assert check_owned_file(tmp_path / "link40", "the file") == f"cannot read the file {tmp_path}/link40: {too_many}"
+    if sys.platform == "linux":  # the same limit as the system's
+        os.stat(tmp_path / "link39")
+        with pytest.raises(OSError, match=too_many):
+            os.stat(tmp_path / "link40")
+    (tmp_path / "loop").symlink_to("loop")
+    assert check_owned_file(tmp_path / "loop", "the file") == f"cannot read the file {tmp_path}/loop: {too_many}"
+
+
+def test_a_relative_path_starts_from_the_current_folder(tmp_path, monkeypatch):
+    write(tmp_path, {"consumers": []})
+    (tmp_path / "link").symlink_to("consumers.json")
+    monkeypatch.chdir(tmp_path)
+    assert ConsumersConfig.load(Path("link")).consumers == ()
+    (open_,) = folders(tmp_path, "open")
+    write(open_, {"consumers": []})
+    open_.chmod(0o777)
+    refused(Path("open/consumers.json"), f"the folder {open_} on the path to the consumers file {open_}/consumers.json")
+    monkeypatch.chdir(open_)
+    # '..' is no entry anyone could replace, so nothing is looked up in the open folder on the way back out of it
+    assert ConsumersConfig.load(Path("../consumers.json")).consumers == ()
+
+
+# --- POSIX ACLs ------------------------------------------------------------------------------------------------------
+
+
+def test_group_write_is_refused_where_an_acl_could_let_others_write(tmp_path, monkeypatch):
+    # With an access ACL the group bits are its mask: users and groups the ACL names may write, whatever the group.
+    groups_are(monkeypatch, private=True)
+    probed = acls_are(monkeypatch, present=True)
+    path = write(tmp_path, {"consumers": []}, mode=0o660)
+    refused(
+        path,
+        f"the consumers file {path} has an access ACL, so the users and groups it names may write it (mode 660); "
+        f"run chmod g-w {path}",
+    )
+    assert probed == [str(path)]
+    path.chmod(0o640)  # the mask then keeps every entry of the ACL from writing
+    assert ConsumersConfig.load(path).consumers == ()
+    (folder,) = folders(tmp_path, "home")
+    inner = write(folder, {"consumers": []})
+    folder.chmod(0o775)
+    refused(inner, f"the folder {folder} on the path to the consumers file {inner} has an access ACL")
+    folder.chmod(0o1777)  # sticky: others may add entries but not replace this one, ACL or not
+    assert ConsumersConfig.load(inner).consumers == ()
+
+
+def test_the_acl_is_probed_only_when_the_group_is_private(tmp_path, monkeypatch):
+    groups_are(monkeypatch, private=False)
+    probed = acls_are(monkeypatch, present=False)
+    path = write(tmp_path, {"consumers": []}, mode=0o660)
+    refused(path, "is writable by its group, which is not private to its owner")
+    assert probed == []
+
+
+@pytest.mark.parametrize(
+    ("outcome", "has_acl"),
+    [
+        (b"\x02\x00\x00\x00", True),
+        (errno.ENODATA, False),
+        (errno.ENOTSUP, False),
+        (errno.EOPNOTSUPP, False),
+        (errno.EACCES, True),
+        (errno.EIO, True),
+    ],
+    ids=["present", "absent", "not-supported", "op-not-supported", "access-denied", "io-error"],
+)
+def test_the_acl_probe_counts_any_doubt_as_an_acl(monkeypatch, outcome, has_acl):
+    def getxattr(path, attribute, *, follow_symlinks=True):
+        assert (path, attribute, follow_symlinks) == ("/x", "system.posix_acl_access", False)
+        if isinstance(outcome, int):
+            raise OSError(outcome, os.strerror(outcome))
+        return outcome
+
+    monkeypatch.setattr(os, "getxattr", getxattr, raising=False)
+    assert consumers_module._has_access_acl("/x") is has_acl
+
+
+def test_a_system_that_cannot_read_extended_attributes_counts_as_having_an_acl(monkeypatch):
+    monkeypatch.delattr(os, "getxattr", raising=False)  # as on macOS
+    assert consumers_module._has_access_acl("/x") is True
+
+
+@pytest.mark.skipif(shutil.which("setfacl") is None, reason="needs setfacl")
+def test_a_real_acl_is_seen(tmp_path, monkeypatch):
+    groups_are(monkeypatch, private=True)
+    path = write(tmp_path, {"consumers": []}, mode=0o660)
+    assert consumers_module._has_access_acl(str(path)) is False
+    assert ConsumersConfig.load(path).consumers == ()
+    setfacl = subprocess.run(["setfacl", "-m", f"u:{OTHER}:rw", str(path)], capture_output=True, check=False)
+    if setfacl.returncode != 0:
+        pytest.skip("this filesystem keeps no ACLs")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o660  # the mode looks the same: the group bits are now the mask
+    assert consumers_module._has_access_acl(str(path)) is True
+    refused(path, f"the consumers file {path} has an access ACL")
 
 
 # --- whether a group is private to its owner ------------------------------------------------------------------------
@@ -471,6 +719,22 @@ def test_a_group_is_private_only_when_no_one_else_is_in_it(monkeypatch, users, m
     assert consumers_module._group_is_private(1000, 1000) is private
 
 
+@pytest.mark.parametrize(
+    ("members", "private"),
+    [([], False), (["me"], True), (["root"], False)],
+    ids=["no-one", "owner-member", "other-member"],
+)
+def test_a_group_is_private_only_when_its_owner_is_in_it(monkeypatch, members, private):
+    accounts(monkeypatch, [ME, ("root", 0, 0)], {50: members})  # 50 is no one's primary group
+    assert consumers_module._group_is_private(50, 1000) is private
+
+
+def test_an_empty_group_on_a_folder_of_root_is_shared(monkeypatch):
+    # A root-owned folder of mode 775 in an empty group: a setgid program of that group could write it.
+    accounts(monkeypatch, [("root", 0, 0), ME], {50: []})
+    assert consumers_module._group_is_private(50, 0) is False
+
+
 def test_a_group_or_owner_that_cannot_be_looked_up_counts_as_shared(monkeypatch):
     accounts(monkeypatch, [ME], {1000: []})
     assert consumers_module._group_is_private(4242, 1000) is False  # no such group
@@ -486,17 +750,22 @@ def test_the_folder_s_own_group_and_owner_are_looked_up(tmp_path, monkeypatch):
     accounts(monkeypatch, [("me", uid, gid)], {gid: []})
     assert ConsumersConfig.load(path).consumers == ()
     accounts(monkeypatch, [("me", uid, gid), ("other", uid + 1, gid)], {gid: []})
-    refused(path, f"the folder {folder} above the consumers file {path} is writable by its group, which is not private")
+    refused(
+        path,
+        f"the folder {folder} on the path to the consumers file {path} is writable by its group, which is not private",
+    )
 
 
 def _private_group(gid, uid):
-    """Whether no user but `uid` is in group `gid`, as a member or by primary group (an independent reckoning)."""
+    """Whether `uid` is in group `gid` and no other user is, as a member or by primary group (an independent
+    reckoning)."""
     try:
         group, owner = grp.getgrgid(gid), pwd.getpwuid(uid)
     except KeyError:
         return False
-    by_primary = {p.pw_name for p in pwd.getpwall() if p.pw_gid == gid and p.pw_uid != uid}
-    return not by_primary and set(group.gr_mem) <= {owner.pw_name}
+    by_primary = {p.pw_uid for p in pwd.getpwall() if p.pw_gid == gid}
+    owner_in = uid in by_primary or owner.pw_gid == gid or owner.pw_name in group.gr_mem
+    return owner_in and by_primary <= {uid} and set(group.gr_mem) <= {owner.pw_name}
 
 
 def test_the_real_lookup_of_my_own_primary_group():
@@ -512,21 +781,46 @@ def test_the_real_lookup_of_my_own_primary_group():
         assert consumers_module._group_is_private(root_group, uid) is False
 
 
+def _lookup_folders(path):
+    """The folders the system looks an entry up in to reach `path`, and the links it follows (an independent
+    reckoning, from os.path.realpath of every prefix)."""
+    folders, links = [], []
+    parts = [part for part in path.split("/") if part]
+    for n, part in enumerate(parts):
+        if part in (".", ".."):
+            continue
+        folder = os.path.realpath("/" + "/".join(parts[:n]))
+        folders.append(folder)
+        entry = os.path.join(folder, part)
+        if os.path.islink(entry):
+            links.append(entry)
+            more_folders, more_links = _lookup_folders(os.path.join(folder, os.readlink(entry)))
+            folders += more_folders
+            links += more_links
+    return folders, links
+
+
+def _may_have_acl(path):
+    try:
+        os.getxattr(path, "system.posix_acl_access")
+    except AttributeError:
+        return True
+    except OSError as exc:
+        return exc.errno not in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP)
+    return True
+
+
 def _open_folders(path):
-    """The folders above `path`, as written and resolved, that someone else could change (an independent reckoning)."""
+    """The folders and links on the way to `path` that someone else could change (an independent reckoning)."""
+    folders, links = _lookup_folders(path)
     found = []
-    for start in (os.path.abspath(path), os.path.realpath(path)):
-        folder = os.path.dirname(start)
-        while True:
-            info = os.stat(folder)
-            writable = info.st_mode & 0o002 or (info.st_mode & 0o020 and not _private_group(info.st_gid, info.st_uid))
-            open_mode = writable and not info.st_mode & stat.S_ISVTX
-            if open_mode or info.st_uid not in (os.geteuid(), 0):
-                found.append(folder)
-            if os.path.dirname(folder) == folder:
-                break
-            folder = os.path.dirname(folder)
-    return found
+    for folder in dict.fromkeys(folders):
+        info = os.stat(folder)
+        group_open = info.st_mode & 0o020 and (not _private_group(info.st_gid, info.st_uid) or _may_have_acl(folder))
+        open_mode = (info.st_mode & 0o002 or group_open) and not info.st_mode & stat.S_ISVTX
+        if open_mode or info.st_uid not in (os.geteuid(), 0):
+            found.append(folder)
+    return found + [link for link in links if os.lstat(link).st_uid not in (os.geteuid(), 0)]
 
 
 @pytest.mark.parametrize("resolve", [False, True], ids=["as-written", "resolved"])

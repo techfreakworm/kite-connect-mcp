@@ -23,14 +23,15 @@ After a failed try a delivery waits `retry.delays_s[n]` seconds, then `every_s` 
 The command is an argv list (no shell) whose program is an absolute path. Its arguments are visible to other users
 (`ps`): put secrets in the environment instead. `env_pass` names variables of the service's own environment to pass on;
 the service's KITE_* variables are never passed. The commands run as the service's user, who can read its Kite token,
-so the file and each program must be regular files that only that user or root can change, in folders only they can
-change (a sticky folder such as /tmp is fine, and so is group write by a group of the owner's own), like OpenSSH's
-StrictModes: see check_owned_file. A script given as an argument (["/usr/bin/python3", "/home/me/notify.py"]) is not
-checked: keep it writable by you or root only.
+so the file and each program must be regular files that only that user or root can change, reached through folders
+and links only they can change (a sticky folder such as /tmp is fine, and so is group write by a group of the owner's
+own when no ACL is set), like OpenSSH's StrictModes: see check_owned_file. A script given as an argument
+(["/usr/bin/python3", "/home/me/notify.py"]) is not checked: keep it writable by you or root only.
 """
 
 from __future__ import annotations
 
+import errno
 import grp
 import json
 import os
@@ -55,12 +56,15 @@ DEFAULT_ALERT_AFTER = 60
 MAX_TIMEOUT = 600
 MAX_SECONDS = 86400  # a day: the longest wait, alert or retry window
 MAX_LABEL_CHARS = 40
+MAX_LINKS = 40  # links followed on one path, as Linux allows (MAXSYMLINKS); one more is ELOOP
 EXIT_RETRY = 75  # EX_TEMPFAIL: "try again later"
 
 _NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,39}")
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _JOINERS = "\u200c\u200d"  # zero-width (non-)joiner: format characters that Indic scripts and emoji need in a label
 _MISSING: Any = object()
+_ACL_ATTRIBUTE = "system.posix_acl_access"  # where Linux keeps a POSIX access ACL
+_NO_ATTRIBUTE_ERRNOS = frozenset({errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP})  # no ACL, or none possible here
 _TOP_KEYS = {"consumers", "tag_labels"}
 _CONSUMER_KEYS = {"name", "command", "match", "timeout_s", "alert_after_s", "retry", "env_pass"}
 _RETRY_KEYS = {"delays_s", "every_s", "give_up_after_s"}
@@ -138,17 +142,20 @@ class ConsumersConfig:
         """The consumers of `path` (none without a file). Every problem is a ConfigError that names the setting."""
         if path is None:
             return cls()
-        problem = check_owned_file(path, "the consumers file")
-        if problem is not None:
-            raise ConfigError(f"{FILE_SETTING}: {problem}")
         try:
-            raw = path.read_bytes()
+            # Read the real file that was checked; only this user or root can change where `path` leads anyway.
+            raw = Path(_resolve_owned_file(path, "the consumers file")).read_bytes()
+        except _Untrusted as exc:
+            raise ConfigError(f"{FILE_SETTING}: {exc}") from None
         except OSError as exc:
             raise ConfigError(f"{FILE_SETTING}: cannot read the consumers file {path}: {_reason(exc)}") from None
         try:
-            # bytes: text that is not UTF-8 is a ValueError here too, and so is a key given twice
-            data = json.loads(raw, object_pairs_hook=_unique_keys)
-        except ValueError as exc:
+            text = raw.decode("utf-8-sig")  # a byte order mark is ignored, as JSON parsers may
+        except UnicodeDecodeError as exc:
+            raise ConfigError(f"{FILE_SETTING}: {path} is not UTF-8 text: {exc.reason} at byte {exc.start}") from None
+        try:
+            data = json.loads(text, object_pairs_hook=_unique_keys)  # a key given twice is a ValueError too
+        except (ValueError, RecursionError) as exc:  # RecursionError: nested deeper than the parser goes
             raise ConfigError(f"{FILE_SETTING}: {path} is not valid JSON: {exc}") from None
         problems: list[str] = []
         config = cls._parse(data, problems)
@@ -184,37 +191,98 @@ class ConsumersConfig:
 
 def check_owned_file(path: str | os.PathLike[str], what: str) -> str | None:
     """The reason not to trust the file at `path` (named `what` in the reason), or None when only this user or root
-    can change it: a regular file, owned by this user or root and writable by no one else, below folders that are
-    owned by this user or root and writable by no one else unless sticky (like /tmp, where others cannot replace a
-    file they do not own). The folders are checked on the path as written and on the path with every link resolved,
-    so a link in a folder anyone can write is refused like a file there. Not opening anything also means a FIFO
-    cannot make the caller wait.
+    can change it or change where `path` leads. Nothing is opened, so a FIFO cannot make the caller wait.
 
-    Group write on the file or a folder is accepted when that one's group is private to its owner, as Debian's
-    OpenSSH relaxes StrictModes: Ubuntu and Debian give each user a group of their own, and their umask 002 makes the
-    user's folders group-writable (mode 775). See _group_is_private. Write by others is refused, unless the folder is
-    sticky."""
-    written = os.path.abspath(path)
+    The path is followed one entry at a time, as the system follows it, from the root (or the current folder):
+    - every folder an entry is looked up in, including the folders a link leads through, must be owned by this user
+      or root and writable by no one else, unless it is sticky (like /tmp, where others cannot replace an entry they
+      do not own);
+    - every link followed must be owned by this user or root: in a sticky folder its owner may replace it;
+    - at most MAX_LINKS links are followed, and `..` goes up from where the links before it led, not from the path
+      as written;
+    - the file must be a regular file, owned by this user or root and writable by no one else.
+
+    Group write on the file or a folder is accepted when that one's group is private to its owner and it has no POSIX
+    ACL, as Debian's OpenSSH relaxes StrictModes: Ubuntu and Debian give each user a group of their own, and their
+    umask 002 makes the user's folders group-writable (mode 775). See _group_is_private and _has_access_acl. Write by
+    others is refused, unless the folder is sticky."""
     try:
-        real = os.path.realpath(written)
-        info = os.stat(real)
-    except OSError as exc:
-        return f"cannot read {what} {written}: {_reason(exc)}"
-    if not stat.S_ISREG(info.st_mode):
-        return f"{what} {written} is not a regular file"
-    problem = _owner_problem(info, f"{what} {written}") or _write_problem(info, f"{what} {written}", written)
-    if problem is not None:
-        return problem
-    for folder in dict.fromkeys([*_folders_above(written), *_folders_above(real)]):
-        name = f"the folder {folder} above {what} {written}"
-        try:
-            info = os.stat(folder)
-        except OSError as exc:
-            return f"cannot check {name}: {_reason(exc)}"
-        problem = _owner_problem(info, name) or _write_problem(info, name, folder)
-        if problem is not None:
-            return problem
+        _resolve_owned_file(path, what)
+    except _Untrusted as exc:
+        return str(exc)
     return None
+
+
+class _Untrusted(Exception):
+    """Why a file cannot be trusted (see check_owned_file)."""
+
+
+def _resolve_owned_file(path: str | os.PathLike[str], what: str) -> str:
+    """The real path of the file at `path` when check_owned_file trusts it, else _Untrusted with the reason."""
+    given = os.fspath(path)
+    if not os.path.isabs(given):  # not os.path.abspath: it takes `..` before the links in front of it are followed
+        try:
+            given = os.path.join(os.getcwd(), given)
+        except OSError as exc:
+            raise _Untrusted(f"cannot read {what} {given}: {_reason(exc)}") from None
+    name = f"{what} {given}"
+    todo = [part for part in reversed(given.split("/")) if part]  # a stack: the next entry to look up is last
+    current = "/"  # the real folder (or at the end the file) reached so far: it holds no link
+    links = 0
+    trusted: set[str] = set()
+    while todo:
+        part = todo.pop()
+        if part == ".":
+            continue
+        if part == "..":
+            current = os.path.dirname(current)  # only who can change the folder above `current` could move it
+            continue
+        if current not in trusted:
+            _check_folder(current, name)
+            trusted.add(current)
+        entry = os.path.join(current, part)
+        info = _lstat(entry, f"cannot read {name}")
+        if not stat.S_ISLNK(info.st_mode):
+            current = entry
+            continue
+        links += 1
+        if links > MAX_LINKS:
+            raise _Untrusted(f"cannot read {name}: {os.strerror(errno.ELOOP)}")
+        _raise(_owner_problem(info, f"the link {entry} on the path to {name}"))
+        try:
+            target = os.readlink(entry)
+        except OSError as exc:
+            raise _Untrusted(f"cannot read {name}: {_reason(exc)}") from None
+        if target.startswith("/"):
+            current = "/"
+        todo.extend(step for step in reversed(target.split("/")) if step)
+    info = _lstat(current, f"cannot read {name}")
+    if not stat.S_ISREG(info.st_mode):
+        raise _Untrusted(f"{name} is not a regular file")
+    _raise(_owner_problem(info, name) or _write_problem(info, name, current))
+    return current
+
+
+def _check_folder(folder: str, name: str) -> None:
+    """Refuse `folder`, where an entry on the path to `name` is looked up, unless only this user or root can change
+    what it holds."""
+    info = _lstat(folder, f"cannot check the folder {folder} on the path to {name}")
+    if not stat.S_ISDIR(info.st_mode):
+        raise _Untrusted(f"cannot read {name}: {os.strerror(errno.ENOTDIR)}")
+    described = f"the folder {folder} on the path to {name}"
+    _raise(_owner_problem(info, described) or _write_problem(info, described, folder))
+
+
+def _lstat(path: str, failure: str) -> os.stat_result:
+    try:
+        return os.lstat(path)
+    except OSError as exc:
+        raise _Untrusted(f"{failure}: {_reason(exc)}") from None
+
+
+def _raise(problem: str | None) -> None:
+    if problem is not None:
+        raise _Untrusted(problem)
 
 
 def consumer_env(consumer: Consumer, environ: Mapping[str, str]) -> dict[str, str]:
@@ -246,39 +314,56 @@ def _write_problem(info: os.stat_result, name: str, path: str) -> str | None:
         return None  # a sticky folder: others may add files, not replace one they do not own
     if mode & 0o002:
         return f"{name} is writable by group or others (mode {mode:o}); run chmod go-w {path}"
-    if mode & 0o020 and not _group_is_private(info.st_gid, info.st_uid):
-        return (
-            f"{name} is writable by its group, which is not private to its owner (mode {mode:o}); run chmod g-w {path}"
-        )
+    if mode & 0o020:
+        if not _group_is_private(info.st_gid, info.st_uid):
+            return (
+                f"{name} is writable by its group, which is not private to its owner (mode {mode:o}); "
+                f"run chmod g-w {path}"
+            )
+        if _has_access_acl(path):
+            return (
+                f"{name} has an access ACL, so the users and groups it names may write it (mode {mode:o}); "
+                f"run chmod g-w {path}"
+            )
     return None
 
 
 def _group_is_private(gid: int, owner_uid: int) -> bool:
-    """Whether group `gid` is private to user `owner_uid`, as Ubuntu's and Debian's user-private groups are: its
-    supplementary members are none or only the owner's name, and no user of another uid has it as primary group. A
-    group or owner that cannot be looked up counts as shared.
+    """Whether group `gid` is private to user `owner_uid`, as Ubuntu's and Debian's user-private groups are: the
+    owner is in it (as primary group or as its member), its members are none or only the owner's name, and no user of
+    another uid has it as primary group. A group no user is in is shared, as Debian's OpenSSH holds: a setgid program
+    of that group could write. A group or owner that cannot be looked up counts as shared.
 
     Users the system does not list (a directory service set not to enumerate them) are not seen; Debian's OpenSSH
     has the same limit."""
     try:
         members = grp.getgrgid(gid).gr_mem
-        owner = pwd.getpwuid(owner_uid).pw_name
+        owner = pwd.getpwuid(owner_uid)
     except KeyError:
         return False
-    if any(member != owner for member in members):
+    if any(member != owner.pw_name for member in members):
         return False
-    return not any(user.pw_gid == gid and user.pw_uid != owner_uid for user in pwd.getpwall())
+    owner_in_group = owner.pw_gid == gid or owner.pw_name in members
+    for user in pwd.getpwall():
+        if user.pw_gid == gid:
+            if user.pw_uid != owner_uid:
+                return False
+            owner_in_group = True  # another name for the owner's uid
+    return owner_in_group
 
 
-def _folders_above(path: str) -> list[str]:
-    folders = []
-    folder = os.path.dirname(path)
-    while True:
-        folders.append(folder)
-        parent = os.path.dirname(folder)
-        if parent == folder:
-            return folders
-        folder = parent
+def _has_access_acl(path: str) -> bool:
+    """Whether `path` (not a link) has a POSIX access ACL. Its group mode bits are then the ACL's mask, the most that
+    any user or group the ACL names may do, so group write no longer means the group alone. Any doubt counts as an
+    ACL: an error other than "no such attribute" or "not supported here", or a system without getxattr (macOS)."""
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:
+        return True
+    try:
+        getxattr(path, _ACL_ATTRIBUTE, follow_symlinks=False)
+    except OSError as exc:
+        return exc.errno not in _NO_ATTRIBUTE_ERRNOS
+    return True
 
 
 def _reason(exc: OSError) -> str:
