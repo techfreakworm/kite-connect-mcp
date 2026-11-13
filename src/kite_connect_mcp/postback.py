@@ -15,7 +15,7 @@ the bearer token protects /mcp only, and Kite cannot send one. So it must defend
 * nothing from the payload (no ids, no checksum, no user) is logged, and the buffer keeps only the documented order
   fields (see manager.clean_order);
 * a refusal is logged at most once a minute for each reason (the next line for it says how many were not), so junk
-  requests cannot flood the log;
+  requests cannot flood the log; so is the 503 answered while the event store cannot write;
 * with no API secret configured the endpoint refuses everything instead of accepting unverified data.
 
 What the checksum does not cover: it binds the order_id and order_timestamp only, so a captured postback could be
@@ -144,13 +144,13 @@ class RepeatGuard:
 class PostbackRoute:
     """The route hook: `rt.extras["http_routes"]` holds callables that take the MCPServer and add their routes."""
 
-    REFUSAL_LOG_S = 60.0  # the refusals for one reason are logged at most once in this many seconds
+    REFUSAL_LOG_S = 60.0  # the refusals for one reason, and the 503s, are each logged at most once in this many seconds
 
     def __init__(self, rt: Runtime):
         self.rt = rt
         self.to_ticker = False  # see ensure_postback_route
         self.recent = RepeatGuard()
-        self._refusal_log: dict[str, tuple[dt.datetime, int]] = {}  # reason -> (last logged at, refusals not logged)
+        self._log_times: dict[str, tuple[dt.datetime, int]] = {}  # what -> (last logged at, lines not logged since)
 
     def __call__(self, server: MCPServer) -> None:
         path = self.rt.settings.postback_path
@@ -163,7 +163,7 @@ class PostbackRoute:
 
         def refuse(status: int, reason: Refusal, detail: str) -> Response:
             """`reason` is one of service.REFUSALS (it is counted and shown in the status); `detail` is for the log."""
-            self._log_refusal(reason, detail)
+            self._log_limited(reason, logging.WARNING, f"postback refused: {detail}")
             if events is not None:
                 events.refused(reason)
             return _bare(status)
@@ -210,22 +210,23 @@ class PostbackRoute:
             else:
                 events.ring(order_id)
         except StoreError as exc:  # its text is the store's path and SQLite's message, nothing from the payload
-            log.error("postback: answering 503 (the poll will catch up): %s", exc)
+            self._log_limited("503", logging.ERROR, f"postback: answering 503 (the poll will catch up): {exc}")
             return _bare(503)
         self.recent.remember(key, now)
         log.info("postback selftest received" if selftest else "postback accepted")
         return _ok()
 
-    def _log_refusal(self, reason: str, detail: str) -> None:
-        """Log a refusal, at most once every REFUSAL_LOG_S for each reason: the ones in between are only counted, and
-        the next line for that reason says how many there were. `detail` is fixed text, never from the request."""
+    def _log_limited(self, what: str, level: int, line: str) -> None:
+        """Log `line`, at most once every REFUSAL_LOG_S for each `what` (a refusal's reason, or "503"): the lines in
+        between are only counted, and the next one logged says how many there were. `line` never holds text from the
+        request."""
         now = self.rt.clock()
-        since, unlogged = self._refusal_log.get(reason, (None, 0))
+        since, unlogged = self._log_times.get(what, (None, 0))
         if since is not None and dt.timedelta(0) <= now - since < dt.timedelta(seconds=self.REFUSAL_LOG_S):
-            self._refusal_log[reason] = (since, unlogged + 1)
+            self._log_times[what] = (since, unlogged + 1)
             return
         if unlogged:
-            log.warning("postback refused: %s (%d more like it since the last such line)", detail, unlogged)
+            log.log(level, "%s (%d more like it since the last such line)", line, unlogged)
         else:
-            log.warning("postback refused: %s", detail)
-        self._refusal_log[reason] = (now, 0)
+            log.log(level, "%s", line)
+        self._log_times[what] = (now, 0)

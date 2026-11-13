@@ -135,6 +135,23 @@ async def test_a_store_that_cannot_write_answers_503_with_the_cause_in_the_log(m
     assert item["source"] == "postback"
 
 
+async def test_a_store_that_cannot_write_logs_its_503_once_a_minute(make_app, http, caplog):
+    rt, app = make_app()
+    rt.clock = clock = Clock()
+    rt.events.store.close()
+    client = http(app)
+    for _ in range(3):
+        assert (await post(client, signed())).status_code == 503  # a 503 is not remembered: Kite's retry rings again
+
+    def lines() -> list[str]:
+        return [r.getMessage() for r in caplog.records if "answering 503" in r.getMessage()]
+
+    assert len(lines()) == 1
+    clock.advance(60)
+    assert (await post(client, signed())).status_code == 503
+    assert len(lines()) == 2 and lines()[-1].endswith("(2 more like it since the last such line)")
+
+
 @pytest.mark.parametrize("overrides", [{"KITE_MCP_TICKER_ENABLED": "false"}, {"KITE_MCP_TOOLSETS": "account"}, {}])
 async def test_the_route_does_not_depend_on_the_ticker(make_app, http, overrides):
     rt, app = make_app(**overrides)
@@ -177,7 +194,7 @@ async def test_an_exact_repeat_within_ten_seconds_is_answered_without_ringing_ag
     client = http(app)
     first = signed(status="OPEN")
     assert (await post(client, first)).status_code == 200
-    rt.events.store.doorbell_done(ORDER_ID)  # the worker read the order
+    rt.events.store.doorbell_done(ORDER_ID, rings=1)  # the worker read the order
     clock.advance(9)
     assert (await post(client, first)).status_code == 200  # a resend, or a replay: nothing written
     assert rt.events.store.doorbells() == [] and rt.events.store.counters()["postback_accepted"]["count"] == 1
@@ -194,7 +211,7 @@ async def test_a_new_update_of_the_same_order_is_rung_at_once(make_app, http):
     rt, app = make_app()
     client = http(app)
     await post(client, signed(status="OPEN", filled_quantity=0))
-    rt.events.store.doorbell_done(ORDER_ID)
+    rt.events.store.doorbell_done(ORDER_ID, rings=1)
     await post(client, signed(status="COMPLETE", filled_quantity=25))
     assert rt.events.store.doorbells() == [(ORDER_ID, 0)]
     assert rt.events.store.counters()["postback_accepted"]["count"] == 2

@@ -61,7 +61,9 @@ CREATE TABLE IF NOT EXISTS order_state (
 CREATE TABLE IF NOT EXISTS doorbells (
     order_id TEXT PRIMARY KEY,
     first_rung_at TEXT NOT NULL,
-    tries INTEGER NOT NULL DEFAULT 0
+    rings INTEGER NOT NULL DEFAULT 1,
+    tries INTEGER NOT NULL DEFAULT 0,
+    tried_at TEXT
 );
 CREATE TABLE IF NOT EXISTS deliveries (
     consumer TEXT NOT NULL,
@@ -80,6 +82,9 @@ CREATE INDEX IF NOT EXISTS deliveries_open ON deliveries (consumer, status, orde
 CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL, last_at TEXT, note TEXT);
 CREATE TABLE IF NOT EXISTS paused (consumer TEXT PRIMARY KEY, since TEXT NOT NULL);
 """
+
+
+DoorbellDrop = Literal["doorbell_unknown_order", "doorbell_wrong_order", "doorbell_gave_up"]  # why, and its counter
 
 
 class StoreError(KiteMCPError):
@@ -119,6 +124,20 @@ def _schema_version(con: sqlite3.Connection) -> str | None:
         return None
     row = con.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     return None if row is None else str(row[0])
+
+
+@dataclass(frozen=True)
+class Doorbell:
+    """A rung order waiting to be read from Kite. `rings` counts its rings since it was kept: the worker reads it before
+    it asks Kite, and settles or drops the doorbell only while it is unchanged (doorbell_done, drop_doorbell), so a
+    ring that lands during the read is not lost. Rings are counted, not timed: two rings in one millisecond, or on a
+    clock that stepped back, still tell apart. `tries` counts the failed reads counted so far, `tried_at` is when the
+    last of them was counted (None before any)."""
+
+    order_id: str
+    tries: int
+    rings: int
+    tried_at: dt.datetime | None
 
 
 @dataclass(frozen=True)
@@ -229,9 +248,9 @@ class EventStore:
         """One write transaction (BEGIN IMMEDIATE ... COMMIT) on the connection it yields: what the block does is
         committed together, or rolled back together when it raises. Any SQLite error becomes StoreError.
 
-        Keep the block synchronous (no await inside it), and inside it call only the methods that take `con`: a method
-        that writes on its own (ring, bump, set_meta, ...) would open a second transaction, so it raises StoreError
-        ("nested write") and the whole block rolls back."""
+        Keep the block synchronous (no await inside it), and inside it call only the methods that take `con`, and pass
+        it (bump(..., con=con) is fine): a method that writes on its own (ring, set_meta, bump without con, ...) would
+        open a second transaction, so it raises StoreError ("nested write") and the whole block rolls back."""
         if self.readonly:
             raise StoreError("the event store is open read-only")
         with self._lock:
@@ -387,12 +406,12 @@ class EventStore:
     # --- doorbells ------------------------------------------------------------------------------------------------
 
     def ring(self, order_id: str, now: dt.datetime) -> None:
-        """Keep a doorbell for `order_id` (one per order, however often it rings) and count the ring in
-        `postback_accepted`, in one transaction: on a StoreError neither is kept."""
+        """Keep a doorbell for `order_id` (one per order, however often it rings; each ring adds one to its `rings`)
+        and count the ring in `postback_accepted`, in one transaction: on a StoreError neither is kept."""
         with self.write() as con:
             con.execute(
-                "INSERT INTO doorbells (order_id, first_rung_at, tries) VALUES (?, ?, 0) "
-                "ON CONFLICT(order_id) DO NOTHING",
+                "INSERT INTO doorbells (order_id, first_rung_at) VALUES (?, ?) "
+                "ON CONFLICT(order_id) DO UPDATE SET rings = doorbells.rings + 1",
                 (order_id, iso(now)),
             )
             _bump(con, "postback_accepted", now)
@@ -402,21 +421,33 @@ class EventStore:
         rows = self._read("SELECT order_id, tries FROM doorbells ORDER BY first_rung_at, order_id")
         return [(r["order_id"], int(r["tries"])) for r in rows]
 
-    def doorbell_tried(self, order_id: str) -> None:
-        with self.write() as con:
-            con.execute("UPDATE doorbells SET tries = tries + 1 WHERE order_id = ?", (order_id,))
+    def doorbell(self, order_id: str) -> Doorbell | None:
+        """The doorbell of `order_id` as it is now, None when there is none."""
+        rows = self._read("SELECT order_id, tries, rings, tried_at FROM doorbells WHERE order_id = ?", (order_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        tried_at = parse_iso(row["tried_at"]) if row["tried_at"] else None
+        return Doorbell(row["order_id"], tries=int(row["tries"]), rings=int(row["rings"]), tried_at=tried_at)
 
-    def doorbell_done(self, order_id: str) -> None:
+    def doorbell_tried(self, order_id: str, now: dt.datetime) -> None:
+        """Count a failed read of the doorbell of `order_id`, made `now`."""
         with self.write() as con:
-            con.execute("DELETE FROM doorbells WHERE order_id = ?", (order_id,))
+            con.execute("UPDATE doorbells SET tries = tries + 1, tried_at = ? WHERE order_id = ?", (iso(now), order_id))
 
-    def drop_doorbell(
-        self, order_id: str, now: dt.datetime, counter: Literal["doorbell_unknown_order", "doorbell_gave_up"]
-    ) -> bool:
-        """Delete the doorbell of `order_id` and count why in `counter`, in one transaction. False, with nothing
-        counted, when there is no such doorbell."""
+    def doorbell_done(self, order_id: str, *, rings: int) -> bool:
+        """Delete the doorbell of `order_id` if it has rung `rings` times, as when its read began (see Doorbell).
+        False, with the doorbell kept, when it rang again since (or is gone)."""
         with self.write() as con:
-            if con.execute("DELETE FROM doorbells WHERE order_id = ?", (order_id,)).rowcount == 0:
+            sql = "DELETE FROM doorbells WHERE order_id = ? AND rings = ?"
+            return con.execute(sql, (order_id, rings)).rowcount == 1
+
+    def drop_doorbell(self, order_id: str, now: dt.datetime, counter: DoorbellDrop, *, rings: int) -> bool:
+        """doorbell_done, and count why in `counter`, in one transaction. False, with nothing counted, when the
+        doorbell rang again since its read began, or is gone."""
+        with self.write() as con:
+            sql = "DELETE FROM doorbells WHERE order_id = ? AND rings = ?"
+            if con.execute(sql, (order_id, rings)).rowcount == 0:
                 return False
             _bump(con, counter, now)
             return True

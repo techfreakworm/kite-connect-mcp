@@ -13,7 +13,7 @@ import pytest
 from conftest import FIXED_NOW
 from events_helpers import ORDER_ID, filled_row, order_row
 from kite_connect_mcp.events.model import OrderView, judge, order_event, session_event
-from kite_connect_mcp.events.store import MAX_EVENTS_LIMIT, EventStore, StoreError, iso
+from kite_connect_mcp.events.store import MAX_EVENTS_LIMIT, Doorbell, EventStore, StoreError, iso
 
 
 @pytest.fixture
@@ -77,11 +77,28 @@ def test_doorbells(store):
     store.ring(ORDER_ID, FIXED_NOW)  # ringing twice keeps one
     store.ring("250101000000002", FIXED_NOW + dt.timedelta(seconds=1))
     assert store.doorbells() == [(ORDER_ID, 0), ("250101000000002", 0)]
-    store.doorbell_tried(ORDER_ID)
+    assert store.doorbell(ORDER_ID) == Doorbell(ORDER_ID, tries=0, rings=2, tried_at=None)
+    assert store.doorbell("250101000000003") is None
+    store.doorbell_tried(ORDER_ID, FIXED_NOW + dt.timedelta(seconds=5))
     assert store.doorbells()[0] == (ORDER_ID, 1)
-    store.doorbell_done(ORDER_ID)
+    assert store.doorbell(ORDER_ID).tried_at == FIXED_NOW + dt.timedelta(seconds=5)
+    assert store.doorbell_done(ORDER_ID, rings=2)
     assert store.doorbells() == [("250101000000002", 0)]
     assert store.counters()["postback_accepted"]["count"] == 3  # every ring is counted, a repeat too
+
+
+def test_a_doorbell_rung_again_since_it_was_read_is_kept(store):
+    """The worker reads a doorbell's rings before it asks Kite; a ring after that may report what Kite's answer does
+    not show yet, so neither settling nor dropping removes the doorbell then. Rings are counted, not timed: two rings
+    in one millisecond, or a clock that steps back, still tell apart."""
+    store.ring(ORDER_ID, FIXED_NOW)
+    read = store.doorbell(ORDER_ID)
+    store.ring(ORDER_ID, FIXED_NOW)  # the same time
+    assert not store.doorbell_done(ORDER_ID, rings=read.rings)
+    assert not store.drop_doorbell(ORDER_ID, FIXED_NOW, "doorbell_unknown_order", rings=read.rings)
+    assert store.doorbells() == [(ORDER_ID, 0)] and "doorbell_unknown_order" not in store.counters()
+    assert store.doorbell_done(ORDER_ID, rings=store.doorbell(ORDER_ID).rings)
+    assert store.doorbells() == []
 
 
 def test_counters(store):
@@ -427,15 +444,15 @@ def test_a_counter_bumped_inside_a_write_is_kept_or_rolled_back_with_the_block(s
 
 def test_a_doorbell_is_dropped_with_its_count_or_not_at_all(store):
     store.ring(ORDER_ID, FIXED_NOW)
-    assert store.drop_doorbell(ORDER_ID, FIXED_NOW, "doorbell_unknown_order")
+    assert store.drop_doorbell(ORDER_ID, FIXED_NOW, "doorbell_unknown_order", rings=1)
     assert store.doorbells() == [] and store.counters()["doorbell_unknown_order"]["count"] == 1
-    assert not store.drop_doorbell(ORDER_ID, FIXED_NOW, "doorbell_unknown_order")  # gone already: not counted again
+    assert not store.drop_doorbell(ORDER_ID, FIXED_NOW, "doorbell_unknown_order", rings=1)  # gone: not counted again
     assert store.counters()["doorbell_unknown_order"]["count"] == 1
     store.ring(ORDER_ID, FIXED_NOW)
     with store.write() as con:
         con.execute("DROP TABLE counters")
     with pytest.raises(StoreError):
-        store.drop_doorbell(ORDER_ID, FIXED_NOW, "doorbell_gave_up")
+        store.drop_doorbell(ORDER_ID, FIXED_NOW, "doorbell_gave_up", rings=1)
     assert store.doorbells() == [(ORDER_ID, 0)]
 
 
