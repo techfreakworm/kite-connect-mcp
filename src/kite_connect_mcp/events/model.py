@@ -7,7 +7,12 @@ or the rest of meta.
 
 judge() compares a view with the order's last stored state and names the change it reports, or None when it reports
 nothing new. Progress only moves forward: after a final status nothing more is reported, and a read whose filled
-quantity, or exchange update time, is behind the stored one is dropped, so a late, older read never reaches a consumer.
+quantity, or exchange update time, is behind the stored one is dropped (see judge() for the one case it cannot tell).
+
+An order event's id chains to the order's previous event: it digests the order id, the id of the event the store holds
+last for the order, and the new state. Two reads judged against the same stored state, such as a postback and the poll
+reporting one change, get the same id and are stored once; an order that goes back to an earlier state (a price moved
+and moved back) gets a new id each time. `state_id` is the plain digest of the order and its state.
 
 Every event is a JSON object with `kind`, `event_id`, `source`, `received_at` and `text`, a one-line English summary
 that never holds an id, a user or a link. The store adds `seq` when it reads an event back.
@@ -20,7 +25,7 @@ import hashlib
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any
 
 from ..timeutil import parse_kite_datetime, to_ist
@@ -34,10 +39,11 @@ TRANSACTION_TYPES = ("BUY", "SELL")
 SESSION_TEXT = {
     "token_rejected": "Kite rejected the stored access token: log in again to resume the order events.",
 }
-ORDER_ID_RE = re.compile(r"[A-Za-z0-9_\-]{1,64}")  # the client's door accepts no other order id
+ORDER_ID_RE = re.compile(r"[A-Za-z0-9_\-]{1,64}")  # the only order-id shape passed to GET /orders/{id}
 SELFTEST_PREFIX = "selftest-"
 MAX_REASON_CHARS = 160
 MAX_ERROR_CHARS = 200
+MAX_EXPONENT = 30  # no price or quantity needs more digits; a number further out is not one
 
 _FINAL_CHANGE = {"COMPLETE": "filled", "CANCELLED": "cancelled", "REJECTED": "rejected"}
 _ACCOUNT_RE = re.compile(r"(?i)\baccount-[A-Za-z0-9]+")
@@ -56,18 +62,21 @@ def normalize_status(raw: object) -> str:
 
 
 def canonical(value: object) -> str:
-    """A number as canonical decimal text, so that 5, 5.0 and "5.00" are all "5". Anything else is ""."""
+    """A number as canonical decimal text, so that 5, 5.0 and "5.00" are all "5". Anything else, including a number
+    with more than MAX_EXPONENT digits before or after the point, is ""."""
     if value is None or isinstance(value, bool):
         return ""
     try:
         number = Decimal(str(value).strip())
-    except (InvalidOperation, ValueError):
+        if not number.is_finite():
+            return ""
+        if number == 0:
+            return "0"
+        if abs(number.adjusted()) > MAX_EXPONENT:
+            return ""
+        return format(number.normalize(), "f")
+    except (ArithmeticError, ValueError):  # decimal's InvalidOperation and Overflow are ArithmeticErrors
         return ""
-    if not number.is_finite():
-        return ""
-    if number == 0:
-        return "0"
-    return format(number.normalize(), "f")
 
 
 def _number(value: object) -> int | float | None:
@@ -200,12 +209,14 @@ class OrderView:
 
 @dataclass(frozen=True)
 class Previous:
-    """What the store holds for an order: its last state."""
+    """What the store holds for an order: its last state, and the event_id of its last stored event ("" when the state
+    was recorded without an event, as the first poll's baseline is)."""
 
     state: tuple[str, ...]
     final: bool
     filled: Decimal
     exchange_update_timestamp: str | None
+    event_id: str
 
 
 def _older(new: str | None, old: str | None) -> bool:
@@ -218,9 +229,17 @@ def _older(new: str | None, old: str | None) -> bool:
 
 
 def judge(view: OrderView, previous: Previous | None) -> str | None:
-    """The change this read reports against the order's last stored state, or None when it reports nothing new."""
+    """The change this read reports against the order's last stored state, or None when it reports nothing new.
+
+    The first sight of an order is `placed`, `partial_fill` when it is open with a fill already (the service started
+    after the fill), or `seen_final`. A read whose exchange update time is older than the stored one is dropped. Known
+    limit: when either read lacks that time, or both carry the same second, a late read of an earlier state cannot be
+    told from a real modification back to it, and is reported as `modified`.
+    """
     if previous is None:
-        return "seen_final" if view.final else "placed"
+        if view.final:
+            return "seen_final"
+        return "partial_fill" if view.filled > 0 else "placed"
     if previous.final or view.filled < previous.filled:
         return None
     if _older(view.exchange_update_timestamp, previous.exchange_update_timestamp):
@@ -271,7 +290,9 @@ def text_for(view: OrderView, change: str, tag_labels: Mapping[str, str] | None 
     head = f"{view.transaction_type or '?'} {_qty(view.quantity)} {view.tradingsymbol or '?'} ({view.exchange or '?'})"
     if view.gtt:
         head += " (GTT)"
-    what = _FINAL_CHANGE.get(view.status, change) if change == "seen_final" else change
+    if change == "seen_final" and not view.final:
+        raise ValueError("seen_final needs a final status")
+    what = _FINAL_CHANGE[view.status] if change == "seen_final" else change
     if what == "placed":
         line = f"{head} placed: {_terms(view)}"
     elif what == "modified":
@@ -301,13 +322,23 @@ def stamp(moment: dt.datetime) -> str:
 
 
 def order_event(
-    view: OrderView, *, change: str, source: str, received_at: dt.datetime, tag_labels: Mapping[str, str] | None
+    view: OrderView,
+    *,
+    change: str,
+    source: str,
+    received_at: dt.datetime,
+    tag_labels: Mapping[str, str] | None,
+    previous_event_id: str = "",
 ) -> dict[str, Any]:
-    state_id = view.state_id()
+    """`previous_event_id` is Previous.event_id of the state the change was judged against ("" for a first sight)."""
+    if change not in CHANGES:
+        raise ValueError(f"unknown change {change!r}")
+    if source not in ORDER_SOURCES:
+        raise ValueError(f"unknown order event source {source!r}")
     return {
         "kind": "order",
-        "event_id": state_id,
-        "state_id": state_id,
+        "event_id": digest("order", view.order_id, previous_event_id, *view.state()),
+        "state_id": view.state_id(),
         "source": source,
         "received_at": stamp(received_at),
         "change": change,
@@ -318,6 +349,8 @@ def order_event(
 
 def session_event(name: str, *, seed: str, received_at: dt.datetime) -> dict[str, Any]:
     """`seed` makes the id: the same seed (e.g. a fingerprint of one token) gives the same event, stored once."""
+    if name not in SESSION_TEXT:
+        raise ValueError(f"unknown session event {name!r}")
     return {
         "kind": "session",
         "event_id": digest("session", name, seed),
@@ -328,14 +361,23 @@ def session_event(name: str, *, seed: str, received_at: dt.datetime) -> dict[str
     }
 
 
+def _clean_error(error: str | None) -> str | None:
+    """A failed delivery's error, often a command's stderr: one line, links as "[link]", clipped to MAX_ERROR_CHARS.
+    Links go before the clip, so a clipped error never shows part of one."""
+    if not error:
+        return None
+    return _LINK_RE.sub("[link]", " ".join(error.split()))[:MAX_ERROR_CHARS].rstrip() or None
+
+
 def router_event(
     name: str, *, consumer: str, about: Mapping[str, Any], error: str | None, seed: str, received_at: dt.datetime
 ) -> dict[str, Any]:
     about_text = str(about.get("text") or about.get("kind") or "an event")
+    clean_error = _clean_error(error)
     if name == "delivery_delayed":
         text = f"Delivery to {consumer} is delayed and still retrying: {about_text}"
     elif name == "delivery_failed":
-        text = f"Delivery to {consumer} failed: {about_text}" + (f" ({error[:MAX_ERROR_CHARS]})" if error else "")
+        text = f"Delivery to {consumer} failed: {about_text}" + (f" ({clean_error})" if clean_error else "")
     else:
         raise ValueError(f"unknown router event {name!r}")
     return {
@@ -347,12 +389,14 @@ def router_event(
         "consumer": consumer,
         "about_seq": about.get("seq"),
         "about_event_id": about.get("event_id"),
-        "error": error[:MAX_ERROR_CHARS] if error else None,
+        "error": clean_error,
         "text": text,
     }
 
 
 def selftest_event(order_id: str, *, received_at: dt.datetime) -> dict[str, Any]:
+    if not (order_id.startswith(SELFTEST_PREFIX) and order_id != SELFTEST_PREFIX and ORDER_ID_RE.fullmatch(order_id)):
+        raise ValueError("not a self-test order id")
     return {
         "kind": "selftest",
         "event_id": digest("selftest", order_id),

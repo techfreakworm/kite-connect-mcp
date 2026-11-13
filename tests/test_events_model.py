@@ -63,6 +63,12 @@ def test_normalize_status(raw, expected):
         (True, ""),
         ("abc", ""),
         (float("nan"), ""),
+        (float("inf"), ""),
+        ("1e30", "1" + "0" * 30),
+        ("1e31", ""),  # no price or quantity is this large: a number this far out is not one
+        ("1e-31", ""),
+        ("1e999999", ""),
+        ("1e9999999", ""),  # beyond Decimal's exponent range: no Overflow escapes
     ],
 )
 def test_canonical(value, expected):
@@ -122,9 +128,9 @@ def test_the_state_id_depends_on_the_order_and_the_state():
     assert OrderView.from_row(order_row(status="UPDATE")).state_id() == base.state_id()  # both OPEN
 
 
-def previous_of(row) -> Previous:
+def previous_of(row, event_id: str = "") -> Previous:
     view = OrderView.from_row(row)
-    return Previous(view.state(), view.final, view.filled, view.exchange_update_timestamp)
+    return Previous(view.state(), view.final, view.filled, view.exchange_update_timestamp, event_id)
 
 
 def test_judge_the_first_sight():
@@ -201,7 +207,8 @@ def test_the_order_event_body():
     view = OrderView.from_row(filled_row())
     body = order_event(view, change="filled", source="postback", received_at=FIXED_NOW, tag_labels={})
     assert body["kind"] == "order" and body["source"] == "postback" and body["change"] == "filled"
-    assert body["event_id"] == body["state_id"] == view.state_id()
+    assert body["state_id"] == view.state_id()
+    assert len(body["event_id"]) == 32 and int(body["event_id"], 16) >= 0
     assert body["received_at"] == "2026-11-04T10:00:00+05:30"
     assert body["order"]["order_id"] == ORDER_ID
     assert order_key(body) == ORDER_ID
@@ -266,3 +273,91 @@ def test_a_long_delivery_error_is_clipped():
     )
     assert len(failed["error"]) == 200
     assert failed["text"].endswith("x" * 200 + ")")
+
+
+def test_judge_the_first_sight_of_an_order_that_has_a_fill_already():
+    partial = order_row(filled_quantity=10, pending_quantity=15, average_price=1234.5)
+    assert judge(OrderView.from_row(partial), None) == "partial_fill"
+
+
+def _order(row, change, previous_event_id="", source="poll"):
+    view = OrderView.from_row(row)
+    return order_event(
+        view, change=change, source=source, received_at=FIXED_NOW, tag_labels={}, previous_event_id=previous_event_id
+    )
+
+
+def test_event_ids_chain_so_a_return_to_an_earlier_state_is_a_new_event():
+    placed = _order(order_row(), "placed")
+    modified = _order(order_row(price=1230), "modified", placed["event_id"])
+    back = _order(order_row(), "modified", modified["event_id"])
+    again = _order(order_row(price=1230), "modified", back["event_id"])
+    assert len({e["event_id"] for e in (placed, modified, back, again)}) == 4
+    assert back["state_id"] == placed["state_id"] and again["state_id"] == modified["state_id"]
+
+
+def test_a_postback_and_a_poll_of_one_change_share_the_event_id():
+    by_postback = _order(filled_row(), "filled", "e0", source="postback")
+    by_poll = _order(filled_row(), "filled", "e0", source="poll")
+    assert by_postback["event_id"] == by_poll["event_id"]
+    assert _order(filled_row(), "filled", "e1")["event_id"] != by_poll["event_id"]  # judged against another state
+
+
+def test_an_order_event_needs_a_known_change_and_source():
+    with pytest.raises(ValueError, match="change"):
+        _order(order_row(), "exploded")
+    with pytest.raises(ValueError, match="source"):
+        _order(order_row(), "placed", source="service")
+
+
+def test_seen_final_needs_a_final_status():
+    with pytest.raises(ValueError, match="seen_final needs a final status"):
+        text_for(OrderView.from_row(order_row()), "seen_final")
+
+
+def test_an_unknown_session_event_is_refused():
+    with pytest.raises(ValueError, match="unknown session event"):
+        session_event("token_lost", seed="s", received_at=FIXED_NOW)
+
+
+@pytest.mark.parametrize("order_id", ["250101000000001", "selftest-", "selftest-bad id", "selftest-" + "a" * 56])
+def test_a_selftest_event_needs_a_selftest_order_id(order_id):
+    with pytest.raises(ValueError, match="self-test order id"):
+        selftest_event(order_id, received_at=FIXED_NOW)
+
+
+def test_a_delivery_error_is_one_line_without_links():
+    about = {"seq": 1, "event_id": "e1", "kind": "order", "text": "BUY 25 ABCD (NSE) placed: MARKET"}
+    error = "exit 1: curl failed\nhttps://hooks.example.com/T000/secret\n\tretrying  later "
+    failed = router_event(
+        "delivery_failed", consumer="notify", about=about, error=error, seed="t", received_at=FIXED_NOW
+    )
+    assert failed["error"] == "exit 1: curl failed [link] retrying later"
+    assert (
+        failed["text"]
+        == "Delivery to notify failed: BUY 25 ABCD (NSE) placed: MARKET (exit 1: curl failed [link] retrying later)"
+    )
+    assert "example.com" not in json.dumps(failed)
+
+
+def test_a_link_is_removed_before_the_error_is_clipped():
+    about = {"seq": 1, "event_id": "e1", "kind": "order", "text": "BUY 25 ABCD (NSE) placed: MARKET"}
+    error = "x" * 190 + " https://hooks.example.com/T000/secret"
+    failed = router_event(
+        "delivery_failed", consumer="notify", about=about, error=error, seed="t", received_at=FIXED_NOW
+    )
+    assert failed["error"] == "x" * 190 + " [link]"
+
+
+def test_a_blank_delivery_error_is_none():
+    about = {"seq": 1, "event_id": "e1", "kind": "order", "text": "BUY 25 ABCD (NSE) placed: MARKET"}
+    failed = router_event(
+        "delivery_failed", consumer="notify", about=about, error=" \n ", seed="t", received_at=FIXED_NOW
+    )
+    assert failed["error"] is None
+    assert failed["text"] == "Delivery to notify failed: BUY 25 ABCD (NSE) placed: MARKET"
+
+
+def test_a_number_out_of_range_does_not_break_a_view():
+    view = OrderView.from_row(order_row(quantity="1e9999999", price="1e999999"))
+    assert view.quantity is None and view.price is None

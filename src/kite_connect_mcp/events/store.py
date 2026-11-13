@@ -183,6 +183,7 @@ class EventStore:
             bool(row["final"]),
             Decimal(row["filled"]),
             row["exchange_update_timestamp"],
+            "",
         )
 
     def save_state(self, con: sqlite3.Connection, view: OrderView, now: dt.datetime) -> None:
