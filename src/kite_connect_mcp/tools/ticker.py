@@ -8,8 +8,10 @@ Instruments are EXCHANGE:TRADINGSYMBOL names or numeric instrument tokens. Names
 instrument master when the manager does not already know them; numeric tokens always work.
 
 With KITE_MCP_TICKER_ENABLED=false only `ticker_status` exists, and it says why nothing else does. With
-KITE_MCP_POSTBACK_PATH set, this module also adds the postback HTTP route (see postback.py); both feed the same
-order-update buffer that `ticker_order_updates` reads.
+KITE_MCP_POSTBACK_PATH set and `ticker_order_updates` on, this module asks for the postback HTTP route (see
+postback.py), and verified postbacks go to the same order-update buffer as the WebSocket's updates. With
+KITE_MCP_EVENTS=true the server adds the route anyway, for the order events, and the buffer gets a copy only while
+`ticker_order_updates` is on.
 """
 
 from __future__ import annotations
@@ -201,8 +203,7 @@ def register(reg: Registrar) -> None:
         return
 
     if settings.postback_path and reg.enabled("ticker_order_updates", "ticker", "read") is None:
-        rt.extras["postback_to_ticker"] = True
-        ensure_postback_route(rt)
+        ensure_postback_route(rt, to_ticker=True)
 
     @reg.tool("ticker_subscribe", title="Stream live ticks", toolset="ticker", kind="local")
     async def ticker_subscribe(

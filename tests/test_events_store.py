@@ -93,6 +93,17 @@ def test_counters(store):
     assert out["last_at"].startswith("2026-11-04T10:00:05")
 
 
+def test_a_counter_can_move_by_more_than_one(store):
+    store.bump("postback_refused", FIXED_NOW, "bad checksum", by=5)
+    store.bump("postback_refused", FIXED_NOW, by=2)
+    with store.write() as con:
+        store.bump("postback_refused", FIXED_NOW, "body not JSON", by=3, con=con)
+    out = store.counters()["postback_refused"]
+    assert out["count"] == 10 and out["note"] == "body not JSON"
+    with pytest.raises(ValueError, match="by"):
+        store.bump("postback_refused", FIXED_NOW, by=0)
+
+
 def test_meta(store):
     assert store.meta("baseline_done") is None
     store.set_meta("baseline_done", "x")

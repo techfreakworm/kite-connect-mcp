@@ -6,7 +6,7 @@ It owns the store and the consumers config, and is the only place events are cre
     record_selftest       a verified selftest postback -> a selftest event
     fail_delivery         a delivery that failed for good -> its failure and a delivery_failed router event
     alert_delayed         a delivery still retrying past its alert point -> a delivery_delayed router event, once
-    ring / refused        the postback route's doorbell and its refusal counter
+    ring / refused        the postback route's doorbell and its refusal counter (written at most once a second)
 
 A router event never goes to the consumer it is about, and nothing is raised about a router event itself.
 
@@ -112,6 +112,12 @@ class EventService:
         self._tasks: list[asyncio.Task[None]] = []
         self._lock_fd: int | None = None
         self._stopped = False  # stop() closed the store: start() refuses from then on
+        # refused postbacks not yet written: how many, the last one's reason and time (see refused())
+        self._refused_count = 0
+        self._refused_note: Refusal | None = None
+        self._refused_at: dt.datetime | None = None
+        self._refused_written_at: dt.datetime | None = None  # the last write of them, or try
+        self._refused_timer: asyncio.TimerHandle | None = None
 
     # --- listeners ------------------------------------------------------------------------------------------------
 
@@ -291,16 +297,49 @@ class EventService:
         self.store.ring(order_id, self.clock())
         self._tell(self._doorbell_listeners)
 
+    REFUSAL_WRITE_S = 1.0  # refused postbacks are written to the store at most this often
+
     def refused(self, reason: Refusal) -> None:
         """Count a refused postback (a wrong secret shows up here as "bad checksum"). `reason` is one of REFUSALS,
         never text from the request: it is shown to MCP clients. Any other reason is a bug in the caller and raises
-        ValueError; a store that cannot write is only logged."""
+        ValueError; a store that cannot write is only logged.
+
+        Anyone can send junk to the route, and each write of the store waits for the disk (synchronous=FULL) on the
+        event loop, so refusals are counted in memory and written at most once every REFUSAL_WRITE_S, in one write
+        (postback_refused moves by their number; its note is the last one's reason): the first after a quiet spell
+        is written at once, the ones after it by a timer when the interval is over, by the next refusal after it, or
+        by stop()."""
         if reason not in REFUSALS:
             raise ValueError("refused() takes one of REFUSALS")
+        now = self.clock()
+        self._refused_count += 1
+        self._refused_note = reason
+        self._refused_at = now
+        interval = dt.timedelta(seconds=self.REFUSAL_WRITE_S)
+        last = self._refused_written_at
+        if last is None or not dt.timedelta(0) <= now - last < interval:  # a clock that went back holds nothing
+            self.flush_refusals()
+        elif self._refused_timer is None:
+            with contextlib.suppress(RuntimeError):  # no running event loop: the next refusal or stop() writes them
+                delay = (last + interval - now).total_seconds()
+                self._refused_timer = asyncio.get_running_loop().call_later(delay, self.flush_refusals)
+
+    def flush_refusals(self) -> None:
+        """Write the refusals counted in memory, in one write. A store that cannot write is logged, and they stay
+        counted for the next try."""
+        timer, self._refused_timer = self._refused_timer, None
+        if timer is not None:
+            timer.cancel()
+        if not self._refused_count or self._refused_at is None:
+            return
+        count = self._refused_count
+        self._refused_written_at = self.clock()
         try:
-            self.store.bump("postback_refused", self.clock(), reason)
-        except StoreError:
-            log.warning("order events: could not count a refused postback")
+            self.store.bump("postback_refused", self._refused_at, self._refused_note, by=count)
+        except StoreError as exc:
+            log.warning("order events: could not count %d refused postback(s): %s", count, exc)
+            return
+        self._refused_count = 0
 
     def user_allowed(self, user_id: object) -> bool:
         """With KITE_MCP_ALLOWED_USER_ID set, a postback must name that account. (Plan 2 adds the hash pin.)"""
@@ -362,6 +401,7 @@ class EventService:
                 await asyncio.gather(*tasks, return_exceptions=True)
             finally:
                 self._tasks = []
+                self.flush_refusals()
                 # the store first: the lock covers this process's last use of the file (SQLite tidies its WAL on close)
                 self.store.close()
                 self._release_lock()

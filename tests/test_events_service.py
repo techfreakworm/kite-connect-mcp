@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 
@@ -12,7 +13,7 @@ from events_helpers import ORDER_ID, PY, Clock, filled_row, make_service, order_
 from kite_connect_mcp.errors import ConfigError
 from kite_connect_mcp.events.model import OrderView, order_event
 from kite_connect_mcp.events.service import REFUSALS
-from kite_connect_mcp.events.store import StoreError, iso
+from kite_connect_mcp.events.store import EventStore, StoreError, iso
 from kite_connect_mcp.timeutil import IST
 
 NOTIFY = {
@@ -412,8 +413,84 @@ def test_refused_takes_only_the_known_reasons(svc):
         svc.refused(reason)
     with pytest.raises(ValueError, match="REFUSALS"):
         svc.refused("user AB1234 sent this")  # text from a request never reaches the status
+    svc.flush_refusals()  # all in one second: the first was written at once, the rest waited in memory
     out = svc.store.counters()["postback_refused"]
     assert out["count"] == len(REFUSALS) and out["note"] == "another account"
+
+
+def refused_count(svc):
+    return svc.store.counters()["postback_refused"]["count"]
+
+
+def test_a_burst_of_refusals_is_written_once_a_second_and_ends_with_the_exact_count(service_factory, monkeypatch):
+    clock = Clock()
+    svc, _ = service_factory(clock=clock)
+    writes = []
+    bump = svc.store.bump
+    monkeypatch.setattr(svc.store, "bump", lambda *a, **k: (writes.append(k.get("by", 1)), bump(*a, **k)))
+    svc.refused("bad checksum")  # the first after a quiet second: written at once
+    assert svc.store.counters()["postback_refused"] == {"count": 1, "last_at": iso(clock.now), "note": "bad checksum"}
+    for _ in range(99):
+        svc.refused("body not JSON")
+    clock.advance(0.5)
+    svc.refused("bad checksum")
+    assert refused_count(svc) == 1  # the rest of that second waits in memory
+    last = clock.advance(0.5)  # a second after the write
+    svc.refused("another account")
+    assert svc.store.counters()["postback_refused"] == {"count": 102, "last_at": iso(last), "note": "another account"}
+    assert writes == [1, 101]
+
+
+def test_a_clock_that_went_back_does_not_hold_the_writes(service_factory):
+    clock = Clock()
+    svc, _ = service_factory(clock=clock)
+    svc.refused("bad checksum")
+    clock.advance(-3600)
+    svc.refused("bad checksum")
+    assert refused_count(svc) == 2
+
+
+async def test_refusals_left_in_memory_are_written_a_moment_later(service_factory):
+    svc, _ = service_factory()
+    svc.REFUSAL_WRITE_S = 0.05
+    svc.refused("bad checksum")
+    svc.refused("bad checksum")
+    svc.refused("body not JSON")
+    assert refused_count(svc) == 1
+    await asyncio.sleep(0.2)
+    out = svc.store.counters()["postback_refused"]
+    assert out["count"] == 3 and out["note"] == "body not JSON"
+
+
+async def test_stop_writes_the_refusals_still_in_memory(service_factory):
+    svc, _ = service_factory()
+    for _ in range(50):
+        svc.refused("bad checksum")
+    assert refused_count(svc) == 1
+    await svc.stop()
+    store = EventStore(svc.store.path, readonly=True)
+    try:
+        assert store.counters()["postback_refused"]["count"] == 50
+    finally:
+        store.close()
+
+
+def test_refusals_the_store_could_not_take_wait_for_the_next_write(service_factory, monkeypatch, caplog):
+    clock = Clock()
+    svc, _ = service_factory(clock=clock)
+    bump = svc.store.bump
+
+    def broken(*args, **kwargs):
+        raise StoreError("cannot write the event store: disk I/O error")
+
+    monkeypatch.setattr(svc.store, "bump", broken)
+    svc.refused("bad checksum")  # never raises for the store
+    svc.refused("bad checksum")
+    assert "could not count" in caplog.text
+    monkeypatch.setattr(svc.store, "bump", bump)
+    clock.advance(1)
+    svc.refused("bad checksum")
+    assert refused_count(svc) == 3
 
 
 def test_an_event_stored_already_brings_the_order_state_up_to_date(svc):

@@ -411,8 +411,19 @@ def router_event(
     }
 
 
+def is_selftest_id(order_id: object) -> bool:
+    """True for the id of a selftest postback: SELFTEST_PREFIX and at least one more character, in the order-id shape
+    (ORDER_ID_RE). The postback route and selftest_event both decide with this, so they cannot drift apart."""
+    return (
+        isinstance(order_id, str)
+        and len(order_id) > len(SELFTEST_PREFIX)
+        and order_id.startswith(SELFTEST_PREFIX)
+        and ORDER_ID_RE.fullmatch(order_id) is not None
+    )
+
+
 def selftest_event(order_id: str, *, received_at: dt.datetime) -> dict[str, Any]:
-    if not (order_id.startswith(SELFTEST_PREFIX) and order_id != SELFTEST_PREFIX and ORDER_ID_RE.fullmatch(order_id)):
+    if not is_selftest_id(order_id):
         raise ValueError("not a self-test order id")
     return {
         "kind": "selftest",

@@ -23,6 +23,7 @@ from .auth.tokenstore import TokenFile, TokenProvider
 from .client.http import KiteClient
 from .client.ratelimit import RateLimiter
 from .config import Settings
+from .postback import ensure_postback_route
 from .safety.audit import AuditLog
 from .safety.confirm import ConfirmationStore
 from .safety.pipeline import WritePipeline
@@ -104,8 +105,6 @@ def build_server(rt: Runtime) -> tuple[MCPServer, Registrar]:
     for module in TOOL_MODULES:
         module.register(reg)
     if rt.events is not None and settings.postback_path:
-        from .postback import ensure_postback_route
-
         ensure_postback_route(rt)
     log.info("registered %d tools (%d skipped)", len(reg.registered), len(reg.skipped))
     return server, reg

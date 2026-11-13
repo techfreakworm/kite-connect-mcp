@@ -5,39 +5,48 @@ order_id + order_timestamp + the app's API secret; only Kite (and we) can comput
 tells a real postback from a forged one. Accepted updates go to the same bounded buffer as the WebSocket's order
 updates (source "postback"), where `ticker_order_updates` reads them.
 
-The route is enabled by KITE_MCP_POSTBACK_PATH, added through the `rt.extras["http_routes"]` hook that
-`server.build_http_app` calls, and is public like /health and the login callback: the bearer token protects /mcp only,
-and Kite cannot send one. So it must defend itself:
+The route is enabled by KITE_MCP_POSTBACK_PATH, added once (ensure_postback_route) through the
+`rt.extras["http_routes"]` hook that `server.build_http_app` calls, and is public like /health and the login callback:
+the bearer token protects /mcp only, and Kite cannot send one. So it must defend itself:
 
 * every failure is a bare response with no body, and checks that fail on the checksum all give the same 403, so a prober
   learns nothing about which part was wrong;
 * the body is capped (MAX_BODY_BYTES) while it is read, not after;
 * nothing from the payload (no ids, no checksum, no user) is logged, and the buffer keeps only the documented order
   fields (see manager.clean_order);
+* a refusal is logged at most once a minute for each reason (the next line for it says how many were not), so junk
+  requests cannot flood the log;
 * with no API secret configured the endpoint refuses everything instead of accepting unverified data.
 
 What the checksum does not cover: it binds the order_id and order_timestamp only, so a captured postback could be
 replayed or have its other fields altered and still verify. Treat what arrives as a notification and confirm anything
 that matters with the order book.
 
-With KITE_MCP_EVENTS=true the route is registered whenever KITE_MCP_POSTBACK_PATH is set, and a verified postback only
-rings the event service's doorbell (or records a selftest): the order is then re-read from Kite and nothing from the
-payload is stored (see events/doorbell.py). Every refusal is counted, under a fixed reason (service.REFUSALS).
+With KITE_MCP_EVENTS=true the route is registered whenever KITE_MCP_POSTBACK_PATH is set, the ticker on or off, and a
+verified postback rings the event service's doorbell (or records a selftest): the order is then re-read from Kite and
+nothing from the payload is stored (see events/doorbell.py). With KITE_MCP_ALLOWED_USER_ID set, a postback for another
+account is refused. When the ticker's order updates are on (`ticker_order_updates`), an accepted postback also goes to
+their buffer, as without the events. Every refusal is counted under a fixed reason (service.REFUSALS), and written at
+most once a second (EventService.refused). An exact repeat of a postback accepted in the last ten seconds (Kite sending
+it twice, or a replay) is answered 200 without ringing again (RepeatGuard). Only the whole body makes a repeat: the
+checksum covers only order_id and order_timestamp, so an order's later updates can carry the same one.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import hmac
 import json
 import logging
+from collections import OrderedDict
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 
-from .events.model import ORDER_ID_RE, SELFTEST_PREFIX
+from .events.model import ORDER_ID_RE, SELFTEST_PREFIX, is_selftest_id
 from .events.store import StoreError
 
 if TYPE_CHECKING:
@@ -89,18 +98,59 @@ async def _read_body(request: Request) -> bytes | None:
     return bytes(body)
 
 
-def ensure_postback_route(rt: Runtime) -> None:
-    """Add the route hook once (`server.build_http_app` calls the hooks)."""
+def ensure_postback_route(rt: Runtime, *, to_ticker: bool = False) -> PostbackRoute:
+    """Add the route hook once (`server.build_http_app` calls the hooks) and return it. `to_ticker` (the ticker tools
+    ask for it when `ticker_order_updates` is on) makes it copy accepted postbacks to the ticker's buffer when the event
+    service is on too; without the service the buffer is where they go anyway."""
     hooks = rt.extras.setdefault("http_routes", [])
-    if not any(isinstance(hook, PostbackRoute) for hook in hooks):
-        hooks.append(PostbackRoute(rt))
+    route = next((hook for hook in hooks if isinstance(hook, PostbackRoute)), None)
+    if route is None:
+        route = PostbackRoute(rt)
+        hooks.append(route)
+    route.to_ticker = route.to_ticker or to_ticker
+    return route
+
+
+class RepeatGuard:
+    """The postbacks accepted in the last WINDOW_S seconds, by the SHA-256 of their body (nothing else is kept), at most
+    MAX_ENTRIES of them. A repeat is answered without ringing again, so a replayed postback costs no disk write. A new
+    update of the same order has another body, and is rung at once."""
+
+    WINDOW_S = 10.0
+    MAX_ENTRIES = 1000
+
+    def __init__(self) -> None:
+        self._seen: OrderedDict[bytes, dt.datetime] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._seen)
+
+    def _fresh(self, at: dt.datetime, now: dt.datetime) -> bool:
+        return dt.timedelta(0) <= now - at < dt.timedelta(seconds=self.WINDOW_S)  # a clock that went back holds nothing
+
+    def is_repeat(self, key: bytes, now: dt.datetime) -> bool:
+        at = self._seen.get(key)
+        return at is not None and self._fresh(at, now)
+
+    def remember(self, key: bytes, now: dt.datetime) -> None:
+        self._seen.pop(key, None)
+        self._seen[key] = now
+        while self._seen and (
+            len(self._seen) > self.MAX_ENTRIES or not self._fresh(next(iter(self._seen.values())), now)
+        ):
+            self._seen.popitem(last=False)  # the oldest first
 
 
 class PostbackRoute:
     """The route hook: `rt.extras["http_routes"]` holds callables that take the MCPServer and add their routes."""
 
+    REFUSAL_LOG_S = 60.0  # the refusals for one reason are logged at most once in this many seconds
+
     def __init__(self, rt: Runtime):
         self.rt = rt
+        self.to_ticker = False  # see ensure_postback_route
+        self.recent = RepeatGuard()
+        self._refusal_log: dict[str, tuple[dt.datetime, int]] = {}  # reason -> (last logged at, refusals not logged)
 
     def __call__(self, server: MCPServer) -> None:
         path = self.rt.settings.postback_path
@@ -113,7 +163,7 @@ class PostbackRoute:
 
         def refuse(status: int, reason: Refusal, detail: str) -> Response:
             """`reason` is one of service.REFUSALS (it is counted and shown in the status); `detail` is for the log."""
-            log.warning("postback refused: %s", detail)
+            self._log_refusal(reason, detail)
             if events is not None:
                 events.refused(reason)
             return _bare(status)
@@ -142,24 +192,40 @@ class PostbackRoute:
             log.info("postback accepted")
             return _ok()
         order_id = payload["order_id"]  # a str: verify_checksum checked it
-        if not ORDER_ID_RE.fullmatch(order_id):
+        selftest = is_selftest_id(order_id)
+        # a selftest id, or an order id that does not take the selftest prefix ("selftest-" alone is neither)
+        if not selftest and (order_id.startswith(SELFTEST_PREFIX) or not ORDER_ID_RE.fullmatch(order_id)):
             return refuse(400, "bad order id", "the order id has an unexpected form")
+        if not selftest and not events.user_allowed(payload.get("user_id")):
+            return refuse(403, "another account", "the postback is for another account than KITE_MCP_ALLOWED_USER_ID")
+        now = self.rt.clock()
+        key = hashlib.sha256(body).digest()
+        if self.recent.is_repeat(key, now):
+            return _ok()  # accepted moments ago (Kite sent it twice, or a replay): rung already, nothing to write
+        if not selftest and self.to_ticker and self.rt.ticker is not None:
+            self.rt.ticker.record_order_update(payload, source="postback")  # first: the buffer does not need the store
         try:
-            if order_id.startswith(SELFTEST_PREFIX):
+            if selftest:
                 events.record_selftest(order_id)
-                log.info("postback selftest received")
-                return _ok()
-            if not events.user_allowed(payload.get("user_id")):
-                return refuse(
-                    403, "another account", "the postback is for another account than KITE_MCP_ALLOWED_USER_ID"
-                )
-            events.ring(order_id)
-        except ValueError:  # an id the service does not take: "selftest-" with nothing after it
-            return refuse(400, "bad order id", "the order id has an unexpected form")
-        except StoreError:
-            log.error("postback: the event store cannot write; answering 503 (the poll will catch up)")
+            else:
+                events.ring(order_id)
+        except StoreError as exc:  # its text is the store's path and SQLite's message, nothing from the payload
+            log.error("postback: answering 503 (the poll will catch up): %s", exc)
             return _bare(503)
-        if self.rt.extras.get("postback_to_ticker") and self.rt.ticker is not None:
-            self.rt.ticker.record_order_update(payload, source="postback")
-        log.info("postback accepted")
+        self.recent.remember(key, now)
+        log.info("postback selftest received" if selftest else "postback accepted")
         return _ok()
+
+    def _log_refusal(self, reason: str, detail: str) -> None:
+        """Log a refusal, at most once every REFUSAL_LOG_S for each reason: the ones in between are only counted, and
+        the next line for that reason says how many there were. `detail` is fixed text, never from the request."""
+        now = self.rt.clock()
+        since, unlogged = self._refusal_log.get(reason, (None, 0))
+        if since is not None and dt.timedelta(0) <= now - since < dt.timedelta(seconds=self.REFUSAL_LOG_S):
+            self._refusal_log[reason] = (since, unlogged + 1)
+            return
+        if unlogged:
+            log.warning("postback refused: %s (%d more like it since the last such line)", detail, unlogged)
+        else:
+            log.warning("postback refused: %s", detail)
+        self._refusal_log[reason] = (now, 0)

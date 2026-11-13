@@ -100,12 +100,16 @@ def _body(row: sqlite3.Row) -> dict[str, Any]:
     return body
 
 
-def _bump(con: sqlite3.Connection, name: str, now: dt.datetime, note: str | None = None) -> None:
-    """Add one to counter `name` in the write that `con` belongs to. A new `note` replaces the last; None keeps it."""
+def _bump(con: sqlite3.Connection, name: str, now: dt.datetime, note: str | None = None, by: int = 1) -> None:
+    """Add `by` (one or more) to counter `name` in the write that `con` belongs to. A new `note` replaces the last;
+    None keeps it."""
+    if by < 1:
+        raise ValueError("a counter moves by one or more")
     con.execute(
-        "INSERT INTO counters (name, value, last_at, note) VALUES (?, 1, ?, ?) ON CONFLICT(name) DO UPDATE SET "
-        "value = counters.value + 1, last_at = excluded.last_at, note = coalesce(excluded.note, counters.note)",
-        (name, iso(now), note),
+        "INSERT INTO counters (name, value, last_at, note) VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET "
+        "value = counters.value + excluded.value, last_at = excluded.last_at, "
+        "note = coalesce(excluded.note, counters.note)",
+        (name, by, iso(now), note),
     )
 
 
@@ -418,15 +422,22 @@ class EventStore:
     # --- counters -------------------------------------------------------------------------------------------------
 
     def bump(
-        self, name: str, now: dt.datetime, note: str | None = None, *, con: sqlite3.Connection | None = None
+        self,
+        name: str,
+        now: dt.datetime,
+        note: str | None = None,
+        *,
+        by: int = 1,
+        con: sqlite3.Connection | None = None,
     ) -> None:
-        """Add one to counter `name`. A new `note` replaces the last one; None keeps it. With `con`, inside that
-        write(), so the count is kept or rolled back with what the block writes; without, in a write of its own."""
+        """Add `by` (one or more; ValueError otherwise) to counter `name`. A new `note` replaces the last one; None
+        keeps it. With `con`, inside that write(), so the count is kept or rolled back with what the block writes;
+        without, in a write of its own."""
         if con is not None:
-            _bump(con, name, now, note)
+            _bump(con, name, now, note, by)
             return
         with self.write() as own:
-            _bump(own, name, now, note)
+            _bump(own, name, now, note, by)
 
     def counters(self) -> dict[str, dict[str, Any]]:
         rows = self._read("SELECT name, value, last_at, note FROM counters ORDER BY name")

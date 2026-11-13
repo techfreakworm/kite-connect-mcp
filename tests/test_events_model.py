@@ -16,6 +16,7 @@ from kite_connect_mcp.events.model import (
     canonical,
     clean_error_text,
     clean_reason,
+    is_selftest_id,
     judge,
     normalize_status,
     order_event,
@@ -334,6 +335,24 @@ def test_an_unknown_session_event_is_refused():
 def test_a_selftest_event_needs_a_selftest_order_id(order_id):
     with pytest.raises(ValueError, match="self-test order id"):
         selftest_event(order_id, received_at=FIXED_NOW)
+
+
+@pytest.mark.parametrize(
+    ("order_id", "expected"),
+    [
+        ("selftest-0a1b2c3d4e5f", True),
+        ("selftest-x", True),
+        ("selftest-", False),  # the prefix alone
+        ("selftest-bad id", False),
+        ("selftest-" + "a" * 56, False),  # over the order-id length
+        ("250101000000001", False),
+        ("Selftest-0a1b", False),
+        (None, False),
+        (12, False),
+    ],
+)
+def test_is_selftest_id(order_id, expected):
+    assert is_selftest_id(order_id) is expected
 
 
 def test_a_delivery_error_is_one_line_without_links():
