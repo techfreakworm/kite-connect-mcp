@@ -5,12 +5,23 @@ login links".
     SkipDates            the skip-dates file (KITE_MCP_LOGIN_REMINDER_SKIP_DATES_FILE), re-read at each use
     allowed_day          a reminder day (KITE_MCP_LOGIN_REMINDER_DAYS) that is not a skip date
     next_scheduled       the next reminder time after a moment
+    latest_slot          the latest reminder time at or before a moment, while it is at most CATCH_UP_WITHIN old
     link_env             the command's environment: PATH, HOME, LANG and KITE_MCP_LOGIN_LINK_ENV_PASS, never KITE_*
     program_problem      why the command cannot be trusted or run (events/trust.py, as for consumer programs)
     run_link_command     run it once with the link on stdin: None when it exited 0, else a short error
-    serving_problem      the links need the HTTP transport: checked when `serve` starts (cli.py) and by LoginLinks
-    LoginLinks           the service: send() issues one link and gives it to the command, once, and records the attempt
+    serving_problem      the links need the HTTP transport: checked when `serve` starts (cli.py) and by
+                         LoginLinks.start()
+    LoginLinks           the service: send() issues one link and gives it to the command, once, and records the attempt;
+                         tick() sends the link after a rejected token and the due slot; start() runs the loop, a task
+                         of the HTTP server's lifespan (server.py), and stop() ends it
     describe_links       the `login_links` status: the times, the days, the next time, the last slot and attempt
+
+The slot rule. A slot is a reminder time on a date. Each tick runs the latest slot at or before now that is on an
+allowed day, at most CATCH_UP_WITHIN (3 hours) old and later than the last slot handled; every scheduled attempt (sent,
+skipped because a valid token exists, or failed) records its slot. So a slot runs at its time; a slot missed while the
+server was down, the loop stalled or the machine slept runs when the loop comes back within 3 hours; only the latest
+missed slot runs, once, and an older one is dropped; and a restart never runs a slot again. The tick reads the clock
+and the state file each time: a first start, a restart and a stalled loop follow the one rule.
 
     <state_dir>/login_links.json    mode 600, never a link: the last attempt (`last`), the last slot handled
                                     (`last_scheduled_for`, so neither the loop nor a restart runs a slot twice) and the
@@ -40,6 +51,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from ..errors import ConfigError, KiteMCPError
+from ..events._wait import wait_any
 from ..events.model import MAX_ERROR_CHARS, clean_error_text, clip_words
 from ..events.trust import check_owned_file
 from ..timeutil import IST, now_ist, to_ist
@@ -67,6 +79,11 @@ SOURCES: dict[Reason, str] = {"scheduled": "scheduled", "token_rejected": "token
 
 Outcome = Literal["sent", "skipped", "failed"]
 OUTCOMES: tuple[Outcome, ...] = get_args(Outcome)
+
+CATCH_UP_WITHIN = dt.timedelta(hours=3)  # a slot missed (the server down, the machine asleep) still runs this late
+LATE_NOTE_AFTER = dt.timedelta(minutes=1)  # a slot run later than this is logged as caught up
+TICK_S = 30.0  # the loop ticks this often at most, sooner for the next reminder time or a wake-up
+STOP_TIMEOUT_S = 10.0  # how long stop() lets a link command still running finish before it is killed
 
 
 class SkipDates:
@@ -151,6 +168,25 @@ def next_scheduled(settings: Settings, now: dt.datetime, skip: SkipDates) -> dt.
             moment = dt.datetime.combine(day, at, tzinfo=IST)
             if moment > local:
                 return moment
+    return None
+
+
+def latest_slot(settings: Settings, now: dt.datetime, skip: SkipDates) -> dt.datetime | None:
+    """The latest reminder time at or before `now` on an allowed day, if it is at most CATCH_UP_WITHIN old; else None.
+    An older time is dropped: only the latest missed time is ever sent, and only while it is still of use."""
+    if not settings.login_reminder_times:
+        return None
+    local = to_ist(now)
+    earliest = local - CATCH_UP_WITHIN
+    skipped = skip.dates()
+    day = local.date()
+    while day >= earliest.date():
+        if allowed_day(settings, day, skipped):
+            for at in reversed(settings.login_reminder_times):
+                moment = dt.datetime.combine(day, at, tzinfo=IST)
+                if moment <= local:
+                    return moment if moment >= earliest else None
+        day -= dt.timedelta(days=1)
     return None
 
 
@@ -371,7 +407,8 @@ def describe_links(settings: Settings, now: dt.datetime, skip: SkipDates | None 
 class LoginLinks:
     """The scheduled links and the links after a rejected token, sent through the link command. See the module
     docstring. Built for every process with a link command (cheap: nothing is read until used), so any process can
-    show its status; its loop runs only in the HTTP server."""
+    show its status; its loop runs only in the HTTP server (start(), from the lifespan in server.py, after the event
+    service, whose token_rejected it listens to)."""
 
     def __init__(
         self,
@@ -399,6 +436,16 @@ class LoginLinks:
         self._last_slot: dt.datetime | None = None
         self._rejected_at: dt.datetime | None = None
         self._warned_future_slot = False
+        # the loop: a rejected token waits here for the next tick, which _wake brings at once
+        self._rejected = False
+        self._wake = asyncio.Event()
+        self._stop: asyncio.Event | None = None
+        self._task: asyncio.Task[None] | None = None
+
+    @property
+    def running(self) -> bool:
+        """True between start() and stop(), while the loop runs."""
+        return self._task is not None and not self._task.done()
 
     def valid_token(self) -> bool:
         return self.login.tokens.current() is not None
@@ -437,7 +484,11 @@ class LoginLinks:
         when the command fails (run_link_command: an exit code, a signal, the timeout). A ConfigError from issue_link,
         when no link may be issued now (forcing off with a valid token), propagates and nothing is recorded: the
         caller decides. So does any other exception. ValueError for a scheduled attempt without a slot, or another
-        attempt with one."""
+        attempt with one.
+
+        A send cancelled while the command runs (stop(), as the server stops) kills the command and records nothing,
+        on purpose: the killed command most likely delivered nothing, so a restart within CATCH_UP_WITHIN sends that
+        slot again."""
         if (slot is None) == (reason == "scheduled"):
             raise ValueError("a scheduled attempt needs its slot, and no other attempt has one")
         slot = to_ist(slot) if slot is not None else None
@@ -487,3 +538,127 @@ class LoginLinks:
         except OSError as exc:
             log.warning("login links: could not write %s (%s)", self._state_path, exc.strerror or type(exc).__name__)
         return attempt
+
+    # --- the loop -----------------------------------------------------------------------------------------------------
+
+    def due_slot(self, now: dt.datetime) -> dt.datetime | None:
+        """The slot to run now, or None: latest_slot, unless it already had an attempt (handled_slot)."""
+        slot = latest_slot(self.settings, now, self.skip)
+        if slot is None:
+            return None
+        done = self.handled_slot()
+        return slot if done is None or slot > done else None
+
+    def token_rejected(self) -> None:
+        """The event service raised token_rejected (EventService.on_token_rejected): a link at the next tick, which
+        comes at once. Call it on the event loop's thread."""
+        self._rejected = True
+        self._wake.set()
+
+    async def tick(self) -> None:
+        """One step of the loop: the link after a rejected token, if one waits; then the due slot, if any. With a valid
+        token the slot is recorded as skipped (so it is not caught up later either); otherwise its link is sent. It
+        reads the clock and the state file each time, so a start, a restart and a stalled loop follow the same rule."""
+        now = to_ist(self.clock())
+        if self._rejected:
+            self._rejected = False
+            await self._after_rejection(now)
+        slot = self.due_slot(now)
+        if slot is None:
+            return
+        if now - slot > LATE_NOTE_AFTER:
+            late = int((now - slot).total_seconds() // 60)
+            log.info(
+                "login links: the %s slot of %s runs %d minutes late (caught up)",
+                slot.strftime("%H:%M"),
+                slot.date().isoformat(),
+                late,
+            )
+        if self.valid_token():
+            log.info("login links: the %s slot is skipped: a valid token exists", slot.strftime("%H:%M"))
+            self._record(Attempt(now, "scheduled", "skipped"), slot)
+            return
+        await self._safe_send("scheduled", slot)
+
+    async def _safe_send(self, reason: Reason, slot: dt.datetime | None = None) -> Attempt:
+        """send() for the loop: nothing it raises stops the loop, and every outcome is recorded (with its slot). A
+        ConfigError from issue_link with a valid token (a login came between the check and the link, and forcing is
+        off) is a skipped attempt; any other error a failed one. A cancel is not caught: see send()."""
+        try:
+            return await self.send(reason, slot=slot)
+        except ConfigError as exc:
+            if self.valid_token():
+                log.info("login links: no %s link: a login came in the meantime", reason)
+                return self._record(Attempt(self.clock(), reason, "skipped"), slot)
+            error = _short(str(exc)) or type(exc).__name__
+            log.warning("login links: no %s link could be issued (%s)", reason, error)
+            return self._record(Attempt(self.clock(), reason, "failed", error), slot)
+        except Exception as exc:
+            log.exception("login links: sending a %s link failed", reason)
+            error = f"an unexpected error ({type(exc).__name__})"
+            return self._record(Attempt(self.clock(), reason, "failed", error), slot)
+
+    async def _after_rejection(self, now: dt.datetime) -> None:
+        """The link after a rejected token: none while the last one went out less than REJECTED_EVERY ago (every
+        attempt counts, whatever its outcome; token_rejected_link_at survives a restart), nor once a valid token exists
+        again (a new login came). Neither the days nor the skip dates apply: a token was in use that day."""
+        last = self.token_rejected_link_at()
+        if last is not None and dt.timedelta(0) <= now - last < REJECTED_EVERY:
+            log.info(
+                "login links: a link for a rejected token went out at %s; no other within two hours",
+                to_ist(last).strftime("%H:%M"),
+            )
+            return
+        if self.valid_token():
+            return
+        await self._safe_send("token_rejected")  # _record starts the two hours, whatever the outcome
+
+    def _wait_s(self) -> float:
+        """How long the loop waits after a tick: TICK_S at most, less when the next reminder time comes sooner."""
+        now = to_ist(self.clock())
+        upcoming = next_scheduled(self.settings, now, self.skip)
+        return TICK_S if upcoming is None else min(TICK_S, max(0.05, (upcoming - now).total_seconds()))
+
+    async def run(self, stop: asyncio.Event) -> None:
+        """Tick until `stop` is set: then wait TICK_S at most, less for the next reminder time, and no longer once a
+        wake-up (token_rejected) or the stop comes. A tick that fails is logged; the next one tries again."""
+        while not stop.is_set():
+            self._wake.clear()
+            try:
+                await self.tick()
+            except Exception:
+                log.exception("login links: a tick failed; the next one tries again")
+            try:
+                wait = self._wait_s()
+            except Exception:
+                wait = TICK_S
+            await wait_any(wait, self._wake, stop)
+
+    async def start(self) -> None:
+        """Check, then run the loop as a task. ConfigError for a server not on the HTTP transport (serving_problem) or a
+        command that cannot be trusted or run (program_problem): the server does not come up. A second call while the
+        loop runs does nothing."""
+        if self._task is not None:
+            return
+        problem = serving_problem(self.settings)
+        if problem is None and (bad := await asyncio.to_thread(program_problem, self.command)) is not None:
+            problem = f"KITE_MCP_LOGIN_LINK_COMMAND: {bad}"
+        if problem is not None:
+            raise ConfigError(problem)
+        self._stop = asyncio.Event()
+        self._task = asyncio.create_task(self.run(self._stop), name="kite-login-links")
+        log.info("login links: started (%d time(s) a day)", len(self.settings.login_reminder_times))
+
+    async def stop(self) -> None:
+        """Stop the loop. A command still running gets STOP_TIMEOUT_S to finish; then it is killed (run_link_command)
+        and its attempt is not recorded (see send()). Harmless before start() and when called again."""
+        task, self._task = self._task, None
+        if task is None:
+            return
+        if self._stop is not None:
+            self._stop.set()
+        try:
+            await asyncio.wait({task}, timeout=STOP_TIMEOUT_S)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

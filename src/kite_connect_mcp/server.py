@@ -51,7 +51,7 @@ def build_runtime(
     With the events on, Kite's rejections of tokens are kept in the store (events/rejections.py); a command beside the
     service reads them read-only when it first asks. With the events on, a rejection of the token in use raises
     token_rejected whichever call meets it first. With KITE_MCP_LOGIN_LINK_COMMAND the login link service is built
-    too (auth/reminders.py); nothing is read until it is used."""
+    too (auth/reminders.py); nothing is read until it is used. With both, the links listen to token_rejected."""
     token_file = TokenFile(settings.token_file, writable=settings.auth_mode == "managed")
     tokens = TokenProvider(token_file=token_file, env_token=settings.access_token, clock=clock)
     client = KiteClient(settings, tokens, transport=transport, limiter=limiter or RateLimiter(sleep=sleep), sleep=sleep)
@@ -84,6 +84,8 @@ def build_runtime(
         from .auth.reminders import LoginLinks
 
         rt.links = LoginLinks(settings, rt.login, clock=clock)
+        if rt.events is not None:  # a link after a rejected token (at most one every two hours)
+            rt.events.on_token_rejected(rt.links.token_rejected)
     return rt
 
 
@@ -215,9 +217,11 @@ def build_http_app(server: MCPServer, rt: Runtime) -> ASGIApp:
 
 
 class RuntimeLifespan:
-    """Start the event service (KITE_MCP_EVENTS=true) just before the ASGI server reports that it is up, and close the
-    runtime (event service, HTTP client, ticker) when the server shuts down, inside the server's own event loop. A
-    failure to start the service propagates, so the server does not come up with order events silently off."""
+    """Start the event service (KITE_MCP_EVENTS=true), then the login links (KITE_MCP_LOGIN_LINK_COMMAND), just before
+    the ASGI server reports that it is up, and close the runtime (login links, event service, ticker, HTTP client) when
+    the server shuts down, inside the server's own event loop. A failure to start either propagates, so the server does
+    not come up with order events or login links silently off; a part that fails to start stops those started before
+    it."""
 
     def __init__(self, app: ASGIApp, rt: Runtime):
         self.app = app
@@ -229,14 +233,32 @@ class RuntimeLifespan:
             return
 
         async def send_wrapper(message: Any) -> None:
-            if message.get("type") == "lifespan.startup.complete" and self.rt.events is not None:
-                await self.rt.events.start()
+            if message.get("type") == "lifespan.startup.complete":
+                await self._start_parts()
             if message.get("type") == "lifespan.shutdown.complete":
                 with contextlib.suppress(Exception):
                     await self.rt.aclose()
             await send(message)
 
         await self.app(scope, receive, send_wrapper)
+
+    async def _start_parts(self) -> None:
+        """The event service, then the login links (they listen to it). A part that fails to start stops the parts
+        started before it, and the failure propagates: the server does not come up with either silently off."""
+        rt = self.rt
+        try:
+            if rt.events is not None:
+                await rt.events.start()
+            if rt.links is not None:
+                await rt.links.start()
+        except BaseException:
+            if rt.links is not None:
+                with contextlib.suppress(Exception):
+                    await rt.links.stop()
+            if rt.events is not None:
+                with contextlib.suppress(Exception):
+                    await rt.events.stop()  # harmless on a service that did not start (EventService.stop)
+            raise
 
 
 async def run_stdio(server: MCPServer, rt: Runtime) -> None:

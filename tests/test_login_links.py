@@ -8,17 +8,21 @@ import asyncio
 import json
 import logging
 import stat
+from pathlib import Path
 
 import pytest
+import uvicorn
+from uvicorn.lifespan.on import LifespanOn
 
-from conftest import BEARER, close_runtimes
+from conftest import ACCESS_TOKEN, BEARER, close_runtimes, write_token_file
 from events_helpers import Clock
 from kite_connect_mcp.auth import reminders
-from kite_connect_mcp.auth.reminders import STATE_FILE, LoginLinks
+from kite_connect_mcp.auth.reminders import STATE_FILE, LoginLinks, SkipDates, latest_slot
+from kite_connect_mcp.cli import main
 from kite_connect_mcp.errors import ConfigError, KiteMCPError
-from kite_connect_mcp.server import build_runtime
+from kite_connect_mcp.server import build_http_app, build_runtime, build_server
 from kite_login import state_of
-from links_helpers import at, link_command, links_env
+from links_helpers import BACKGROUND, at, ended, link_command, links_env, pids, script, until
 
 HTTP = {"KITE_MCP_TRANSPORT": "http", "KITE_MCP_BEARER_TOKEN": BEARER}
 EVENTS = {**HTTP, "KITE_MCP_EVENTS": "true"}
@@ -331,3 +335,381 @@ def test_an_error_read_back_from_the_state_file_is_clean_and_short(links):
     assert error.startswith("line1 line2 word word") and len(error) <= 200 and "\x1b" not in error
     path.write_text(json.dumps({"last": {**last, "error": "\x1b[31m\n"}}))
     assert rt.links.status()["last"]["error"] is None  # nothing left of it
+
+
+# --- the schedule, the links after a rejected token, the lifespan (Task 9) ------------------------------------------
+
+COMMAND = Path("/usr/local/bin/send-link")  # settings only: never run
+
+
+@pytest.mark.parametrize(
+    ("now", "expected"),
+    [
+        (at(2, 7, 29), None),  # Monday before the first time; Friday's last one is days old
+        (at(2, 7, 30), at(2, 7, 30)),
+        (at(2, 8, 29), at(2, 7, 30)),
+        (at(2, 10, 0), at(2, 8, 30)),  # the latest one, not 07:30
+        (at(2, 11, 30), at(2, 8, 30)),  # exactly 3 hours: still
+        (at(2, 11, 31), None),  # more than 3 hours: dropped, and 07:30 is older still
+        (at(7, 8, 0), None),  # Saturday: not a reminder day, and Friday's 08:30 is a day old
+    ],
+)
+def test_the_latest_slot(settings_factory, now, expected):
+    s = settings_factory(**links_env(COMMAND, **TIMES))
+    assert latest_slot(s, now, SkipDates(None)) == expected
+
+
+def test_an_evening_slot_is_caught_up_after_midnight_and_stays_its_days(settings_factory):
+    s = settings_factory(**links_env(COMMAND, KITE_MCP_LOGIN_REMINDER_TIMES="23:30"))
+    assert latest_slot(s, at(3, 1, 0), SkipDates(None)) == at(2, 23, 30)
+    assert latest_slot(s, at(7, 1, 0), SkipDates(None)) == at(6, 23, 30)  # Friday's slot, caught up early on Saturday
+
+
+def test_no_latest_slot_without_times(settings_factory):
+    s = settings_factory(**links_env(COMMAND))  # a link command for requested links only
+    assert latest_slot(s, at(2, 7, 30), SkipDates(None)) is None
+
+
+async def test_a_slot_is_sent_at_its_time_and_once(links):
+    make, out = links
+    clock = Clock(at(2, 7, 29))  # Monday
+    rt = logged_out(make(clock))
+    await rt.links.tick()
+    assert issued(rt) == []
+    clock.now = at(2, 7, 30)
+    await rt.links.tick()
+    assert json.loads(out.read_text())["reason"] == "scheduled"
+    clock.now = at(2, 7, 31)
+    await rt.links.tick()
+    assert issued(rt) == ["scheduled"]
+    status = rt.links.status()
+    assert status["last_scheduled_for"] == "2026-11-02T07:30+05:30" and status["next_at"] == "2026-11-02T08:30+05:30"
+
+
+async def test_with_a_valid_token_the_slot_is_skipped_and_never_caught_up_later(links):
+    make, out = links
+    clock = Clock(at(2, 7, 30))
+    rt = make(clock)
+    write_token_file(rt.settings.token_file, logged_in_at=at(2, 7, 0))
+    await rt.links.tick()
+    assert not out.exists() and rt.links.status()["last"]["outcome"] == "skipped"
+    rt.settings.token_file.unlink()  # the token goes later that morning
+    clock.now = at(2, 7, 45)
+    await rt.links.tick()
+    assert issued(rt) == []  # the 07:30 slot had its attempt
+
+
+async def test_a_slot_missed_while_down_is_caught_up_once_within_three_hours(links, caplog):
+    make, out = links
+    clock = Clock(at(2, 7, 50))  # the server comes up 20 minutes after the 07:30 slot
+    rt = logged_out(make(clock))
+    with caplog.at_level(logging.INFO):
+        await rt.links.tick()
+    assert json.loads(out.read_text())["reason"] == "scheduled" and "late" in caplog.text
+    await rt.links.tick()
+    restarted = make(clock)  # a restart: the state file says 07:30 was handled
+    await restarted.links.tick()
+    assert issued(rt) == ["scheduled"]  # the same audit log: the same state folder
+
+
+@pytest.mark.parametrize(("now", "sent"), [(at(2, 11, 30), True), (at(2, 11, 31), False)])
+async def test_a_slot_is_caught_up_up_to_three_hours_late_and_dropped_after(links, now, sent):
+    make, out = links
+    rt = logged_out(make(Clock(now)))
+    await rt.links.tick()
+    if sent:
+        assert issued(rt) == ["scheduled"] and rt.links.status()["last_scheduled_for"] == "2026-11-02T08:30+05:30"
+    else:
+        assert not out.exists() and rt.links.status()["next_at"] == "2026-11-03T07:30+05:30"
+
+
+async def test_only_the_latest_missed_slot_is_sent(links):
+    make, _ = links
+    rt = logged_out(make(Clock(at(2, 9, 0))))  # down through 07:30 and 08:30
+    await rt.links.tick()
+    await rt.links.tick()
+    assert issued(rt) == ["scheduled"] and rt.links.status()["last_scheduled_for"] == "2026-11-02T08:30+05:30"
+
+
+@pytest.mark.parametrize("holiday", [True, False])
+async def test_no_slot_on_a_skip_date_or_a_day_that_is_not_allowed(links, tmp_path, holiday):
+    make, out = links
+    skip = tmp_path / "skip.txt"
+    skip.write_text("2026-11-02\n")
+    if holiday:  # Monday 2 November is in the skip-dates file
+        rt = logged_out(make(Clock(at(2, 7, 45)), KITE_MCP_LOGIN_REMINDER_SKIP_DATES_FILE=str(skip)))
+        next_at = "2026-11-03T07:30+05:30"
+    else:  # Saturday is not in Mon-Fri
+        rt = logged_out(make(Clock(at(7, 7, 45))))
+        next_at = "2026-11-09T07:30+05:30"
+    await rt.links.tick()
+    assert not out.exists() and rt.links.status()["next_at"] == next_at
+    assert rt.links.status()["last_scheduled_for"] is None
+
+
+async def test_requested_and_token_rejected_links_leave_the_slot_to_run(links):
+    make, _ = links
+    clock = Clock(at(2, 7, 20))
+    rt = logged_out(make(clock))
+    await rt.links.send("requested")
+    await rt.links.send("token_rejected")
+    clock.now = at(2, 7, 30)
+    await rt.links.tick()
+    assert issued(rt) == ["tool", "token_rejected", "scheduled"]
+
+
+async def test_a_rejected_token_brings_one_link_every_two_hours_at_most(links):
+    make, out = links
+    clock = Clock(at(2, 12, 0))  # more than 3 hours after 08:30: no slot to catch up
+    rt = make(clock, **EVENTS)
+    write_token_file(rt.settings.token_file, logged_in_at=at(2, 7, 35))
+    rt.tokens.reject(ACCESS_TOKEN)  # the client's mark when Kite refuses the token
+    rt.events.note_token_rejected(ACCESS_TOKEN)  # the event; its listener wakes the links
+    await rt.links.tick()
+    assert json.loads(out.read_text())["reason"] == "token_rejected"
+    out.unlink()
+    clock.now = at(2, 13, 0)
+    rt.links.token_rejected()
+    await rt.links.tick()
+    assert not out.exists()
+    restarted = make(clock, **EVENTS)  # a restart: the token is still marked (the store), and so is the last link
+    restarted.links.token_rejected()
+    await restarted.links.tick()
+    assert not out.exists()
+    clock.now = at(2, 14, 1)
+    rt.links.token_rejected()
+    await rt.links.tick()
+    assert json.loads(out.read_text())["reason"] == "token_rejected"
+
+
+async def test_no_link_for_a_rejected_token_once_a_new_login_came(links):
+    make, out = links
+    clock = Clock(at(2, 12, 0))
+    rt = make(clock)
+    write_token_file(rt.settings.token_file, logged_in_at=at(2, 11, 0))  # the newest token is valid
+    rt.links.token_rejected()
+    await rt.links.tick()
+    assert not out.exists()
+
+
+async def test_a_failed_link_for_a_rejected_token_counts_toward_the_two_hours(links, tmp_path):
+    make, out = links
+    clock = Clock(at(2, 12, 0))
+    rt = logged_out(make(clock, command=link_command(tmp_path, "fails", exit_code=3)))
+    rt.links.token_rejected()
+    await rt.links.tick()
+    assert rt.links.status()["last"]["outcome"] == "failed" and rt.links.token_rejected_link_at() == at(2, 12, 0)
+    clock.now = at(2, 13, 0)
+    rt.links.token_rejected()
+    await rt.links.tick()
+    assert issued(rt) == ["token_rejected"]  # one link only: no retry within two hours
+
+
+async def test_a_rejection_waits_for_one_tick_only(links):
+    make, _ = links
+    clock = Clock(at(2, 12, 0))
+    rt = logged_out(make(clock))
+    rt.links.token_rejected()
+    await rt.links.tick()
+    clock.now = at(2, 14, 30)  # past the two hours, with no new rejection
+    await rt.links.tick()
+    assert issued(rt) == ["token_rejected"]
+
+
+async def test_a_state_file_that_cannot_be_written_still_sends_a_slot_once(links, monkeypatch):
+    make, _ = links
+    clock = Clock(SLOT)
+    rt = logged_out(make(clock))
+    monkeypatch.setattr(reminders, "write_state", _cannot_write)
+    await rt.links.tick()
+    clock.now = at(2, 7, 31)
+    await rt.links.tick()
+    assert issued(rt) == ["scheduled"] and not (rt.settings.state_dir / STATE_FILE).exists()
+
+
+async def test_a_link_refused_because_a_login_came_in_between_skips_the_slot(links, monkeypatch):
+    make, out = links
+    rt = logged_out(make(Clock(SLOT), KITE_MCP_LOGIN_ALLOW_FORCE="false"))
+    real = rt.login.issue_link
+
+    async def login_comes_first(**kwargs):
+        write_token_file(rt.settings.token_file, logged_in_at=at(2, 7, 29))  # a login between the check and the link
+        return await real(**kwargs)
+
+    monkeypatch.setattr(rt.login, "issue_link", login_comes_first)
+    await rt.links.tick()
+    assert not out.exists() and issued(rt) == []
+    assert rt.links.status()["last"]["outcome"] == "skipped" and rt.links.handled_slot() == SLOT
+    assert [e["source"] for e in rt.audit.read() if e["event"] == "login_link_refused"] == ["scheduled"]
+
+
+@pytest.mark.parametrize(
+    ("raised", "error"),
+    [
+        (ConfigError("no link: KITE_API_SECRET\nis not set"), "no link: KITE_API_SECRET is not set"),
+        (RuntimeError("a bug"), "an unexpected error (RuntimeError)"),
+    ],
+)
+async def test_a_link_the_loop_cannot_issue_fails_its_slot_and_the_loop_goes_on(links, monkeypatch, raised, error):
+    make, out = links
+    clock = Clock(SLOT)
+    rt = logged_out(make(clock))
+
+    async def refused(**_):
+        raise raised
+
+    with monkeypatch.context() as m:
+        m.setattr(rt.login, "issue_link", refused)
+        await rt.links.tick()
+    last = rt.links.status()["last"]
+    assert (last["outcome"], last["error"]) == ("failed", error) and rt.links.handled_slot() == SLOT
+    clock.now = at(2, 8, 30)
+    await rt.links.tick()  # the next slot runs as usual
+    assert json.loads(out.read_text())["reason"] == "scheduled"
+
+
+async def test_stopping_while_the_command_runs_kills_it_and_records_nothing(links, tmp_path, monkeypatch):
+    """The server stops while the command sends: it is killed and the attempt is not recorded, on purpose (the killed
+    command likely delivered nothing), so a restart within three hours sends that slot again."""
+    make, _ = links
+    pid_out = tmp_path / "pids"
+    monkeypatch.setenv("PID_OUT", str(pid_out))
+    command = script(tmp_path, "hangs", 'cat > "$LINK_OUT"\n' + BACKGROUND)
+    clock = Clock(SLOT)
+    env = {**HTTP, "KITE_MCP_LOGIN_LINK_ENV_PASS": "LINK_OUT,PID_OUT"}
+    rt = logged_out(make(clock, command=command, **env))
+    monkeypatch.setattr(reminders, "STOP_TIMEOUT_S", 0)  # no grace: the command would run for 30 s
+    await rt.links.start()
+    await until(lambda: bool(pids(pid_out)), "the command did not start")
+    await rt.links.stop()
+    shell, child = pids(pid_out)
+    await until(lambda: ended(shell) and ended(child), "the command or its child runs on after stop()")
+    assert not rt.links.running and issued(rt) == ["scheduled"]  # issued, and handed to a command that was killed
+    assert rt.links.status()["last"] is None and rt.links.handled_slot() is None
+    restarted = make(clock)  # a restart within three hours
+    await restarted.links.tick()
+    assert restarted.links.status()["last"]["outcome"] == "sent" and issued(rt) == ["scheduled", "scheduled"]
+
+
+async def test_stop_before_start_and_twice_is_harmless(links):
+    make, _ = links
+    rt = make(Clock(at(2, 5, 0)), **HTTP)
+    await rt.links.stop()
+    assert not rt.links.running
+    await rt.links.start()
+    await rt.links.start()  # a second start keeps the one loop
+    assert rt.links.running
+    assert len([t for t in asyncio.all_tasks() if t.get_name() == "kite-login-links"]) == 1
+    await rt.links.stop()
+    await rt.links.stop()
+    assert not rt.links.running
+
+
+async def test_a_wake_up_runs_a_tick_at_once(links):
+    make, out = links
+    rt = logged_out(make(Clock(at(2, 12, 0)), **HTTP))  # no slot due: the loop then waits up to TICK_S
+    await rt.links.start()
+    try:
+        await asyncio.sleep(0)
+        rt.links.token_rejected()
+        await until(lambda: rt.links.status()["last"] is not None, "the wake-up did not run a tick")  # after the run
+        assert rt.links.status()["last"]["outcome"] == "sent"
+        assert json.loads(out.read_text())["reason"] == "token_rejected"
+    finally:
+        await rt.links.stop()
+
+
+async def test_aclose_stops_the_links_before_the_events(links, fake_kite, monkeypatch):
+    fake_kite.on("GET", "/orders", [])
+    make, _ = links
+    rt = make(Clock(at(2, 5, 0)), **EVENTS)
+    await rt.events.start()
+    await rt.links.start()
+    order = []
+    for name, part in (("links", rt.links), ("events", rt.events)):
+        real = part.stop
+
+        async def stop(real=real, name=name):
+            order.append(name)
+            await real()
+
+        monkeypatch.setattr(part, "stop", stop)
+    await rt.aclose()
+    assert order == ["links", "events"] and not rt.links.running and not rt.events.running
+
+
+def _lifespan(rt) -> LifespanOn:
+    server, _ = build_server(rt)
+    return LifespanOn(uvicorn.Config(build_http_app(server, rt), lifespan="on", log_config=None))
+
+
+async def test_the_http_lifespan_starts_the_events_then_the_links_and_stops_both(links, fake_kite, monkeypatch):
+    fake_kite.on("GET", "/orders", [])
+    make, _ = links
+    rt = make(Clock(at(2, 5, 0)), **EVENTS)
+    order = []
+    for name, part in (("events", rt.events), ("links", rt.links)):
+        real = part.start
+
+        async def start(real=real, name=name):
+            order.append(name)
+            await real()
+
+        monkeypatch.setattr(part, "start", start)
+    lifespan = _lifespan(rt)
+    await lifespan.startup()
+    assert not lifespan.should_exit and order == ["events", "links"] and rt.links.running and rt.events.running
+    await lifespan.shutdown()
+    assert not rt.links.running and not rt.events.running
+    assert [t for t in asyncio.all_tasks() if t.get_name() == "kite-login-links" and not t.done()] == []
+
+
+async def test_the_http_lifespan_starts_the_links_without_the_events(links):
+    make, _ = links
+    rt = make(Clock(at(2, 5, 0)), **HTTP)
+    lifespan = _lifespan(rt)
+    await lifespan.startup()
+    assert not lifespan.should_exit and rt.events is None and rt.links.running
+    await lifespan.shutdown()
+    assert not rt.links.running
+
+
+async def test_a_part_that_fails_to_start_stops_the_parts_started_before_it(links, fake_kite):
+    fake_kite.on("GET", "/orders", [])
+    make, _ = links
+    rt = make(Clock(at(2, 5, 0)), **EVENTS)
+    rt.links.command.chmod(0o777)  # the links refuse to start, after the events have started
+    lifespan = _lifespan(rt)
+    await lifespan.startup()
+    assert lifespan.should_exit and lifespan.startup_failed
+    assert not rt.events.running and not rt.links.running
+    assert [t for t in asyncio.all_tasks() if t.get_name().startswith("kite-") and not t.done()] == []
+
+
+async def test_an_untrusted_command_stops_the_links_from_starting(links):
+    make, _ = links
+    rt = make(Clock(at(2, 5, 0)), **HTTP)
+    rt.links.command.chmod(0o777)
+    with pytest.raises(ConfigError, match="KITE_MCP_LOGIN_LINK_COMMAND"):
+        await rt.links.start()
+
+
+async def test_the_links_do_not_start_on_the_stdio_transport(links):
+    make, _ = links
+    rt = make(Clock(at(2, 5, 0)))  # stdio, the default
+    with pytest.raises(ConfigError, match="HTTP transport"):
+        await rt.links.start()
+    assert not rt.links.running
+
+
+def test_serve_refuses_the_stdio_transport_with_links(cli_env, monkeypatch, tmp_path, capsys):
+    import anyio
+
+    def served(*args, **kwargs):
+        raise AssertionError("the stdio server ran: the check must come first")
+
+    monkeypatch.setattr(anyio, "run", served)
+    for key, value in links_env(link_command(tmp_path), **TIMES).items():
+        monkeypatch.setenv(key, value)
+    assert main(["serve"]) == 2
+    assert "HTTP transport" in capsys.readouterr().err

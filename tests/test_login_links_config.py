@@ -11,12 +11,10 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from events_helpers import folders
 from kite_connect_mcp.auth.reminders import (
     LOOKAHEAD_DAYS,
     REASONS,
@@ -31,7 +29,7 @@ from kite_connect_mcp.auth.reminders import (
 from kite_connect_mcp.config import WEEKDAYS, Settings, unknown_variables
 from kite_connect_mcp.errors import ConfigError
 from kite_connect_mcp.timeutil import IST
-from links_helpers import at, link_command
+from links_helpers import BACKGROUND, at, ended, link_command, pids, script, until
 
 LINKS = {"KITE_MCP_PUBLIC_URL": "https://kite.example.com", "KITE_MCP_LOGIN_LINK_COMMAND": "/usr/local/bin/send-link"}
 NAMES = (
@@ -325,17 +323,8 @@ async def test_the_runner_kills_a_command_past_its_timeout(tmp_path):
     assert error == "timed out after 0.3 s" and time.monotonic() - started < 10
 
 
-def _script(parent, name, body):
-    """A program `name` in a new mode-700 folder of `parent`, running the shell `body`."""
-    (folder,) = folders(parent, f"{name}-bin")
-    path = folder / name
-    path.write_text(f"#!/bin/sh\n{body}\n")
-    path.chmod(0o700)
-    return path
-
-
 async def test_the_runner_names_the_signal_that_killed_the_command(tmp_path):
-    command = _script(tmp_path, "killed", "kill -TERM $$\nexit 0")
+    command = script(tmp_path, "killed", "kill -TERM $$\nexit 0")
     assert (
         await run_link_command(command, b"{}\n", env={"PATH": os.environ["PATH"]}, timeout_s=10) == "killed by SIGTERM"
     )
@@ -344,7 +333,7 @@ async def test_the_runner_names_the_signal_that_killed_the_command(tmp_path):
 @pytest.mark.parametrize(("code", "expected"), [(0, None), (4, "exit 4")])
 async def test_a_command_that_does_not_read_its_stdin_ends_by_its_exit(tmp_path, code, expected):
     """A payload larger than a pipe holds, to a command that never reads it: the broken pipe is not an error."""
-    command = _script(tmp_path, "deaf", f"exit {code}")
+    command = script(tmp_path, "deaf", f"exit {code}")
     payload = b"x" * (1 << 20)
     assert await run_link_command(command, payload, env={"PATH": os.environ["PATH"]}, timeout_s=10) == expected
 
@@ -367,53 +356,25 @@ async def test_the_command_gets_only_its_environment(tmp_path):
     assert {"PATH", "LANG", "LINK_OUT"} <= names and not names & {"KITE_API_SECRET", "OTHER"}
 
 
-BACKGROUND = 'sleep 30 &\necho $$ $! > "$PID_OUT"\nwait'  # the shell's pid and its background child's
-
-
-def _ended(pid: int) -> bool:
-    """Whether the process `pid` has ended: gone, or a zombie that its new parent has not reaped yet."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-    except FileNotFoundError:  # gone between the two looks, where /proc shows the processes
-        return Path("/proc/self").is_dir()
-
-
-async def _until(condition: Callable[[], bool], failure: str) -> None:
-    for _ in range(500):
-        if condition():
-            return
-        await asyncio.sleep(0.01)
-    pytest.fail(failure)
-
-
-def _pids(path: Path) -> tuple[int, ...]:
-    text = path.read_text() if path.exists() else ""
-    return tuple(int(n) for n in text.split()) if text.endswith("\n") else ()
-
-
 async def test_a_timeout_kills_the_commands_whole_process_group(tmp_path):
     """Not the command alone: what it started in the background goes too."""
     out = tmp_path / "pids"
     env = {"PATH": os.environ["PATH"], "PID_OUT": str(out)}
-    command = _script(tmp_path, "group", BACKGROUND)
+    command = script(tmp_path, "group", BACKGROUND)
     assert await run_link_command(command, b"{}\n", env=env, timeout_s=1) == "timed out after 1 s"
-    shell, child = _pids(out)
-    await _until(lambda: _ended(shell) and _ended(child), "the command or its child runs on after the timeout")
+    shell, child = pids(out)
+    await until(lambda: ended(shell) and ended(child), "the command or its child runs on after the timeout")
 
 
 async def test_cancelling_the_runner_kills_the_commands_whole_process_group(tmp_path):
     """The server stops while a command runs: the command and what it started are killed, the cancel goes on."""
     out = tmp_path / "pids"
     env = {"PATH": os.environ["PATH"], "PID_OUT": str(out)}
-    command = _script(tmp_path, "group", BACKGROUND)
+    command = script(tmp_path, "group", BACKGROUND)
     task = asyncio.create_task(run_link_command(command, b"{}\n", env=env, timeout_s=30))
-    await _until(lambda: bool(_pids(out)), "the command did not start")
+    await until(lambda: bool(pids(out)), "the command did not start")
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    shell, child = _pids(out)
-    await _until(lambda: _ended(shell) and _ended(child), "the command or its child runs on after the cancel")
+    shell, child = pids(out)
+    await until(lambda: ended(shell) and ended(child), "the command or its child runs on after the cancel")

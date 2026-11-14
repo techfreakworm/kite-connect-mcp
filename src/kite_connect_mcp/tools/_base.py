@@ -91,7 +91,9 @@ class Runtime:
 
     async def aclose(self) -> None:
         try:
-            if self.events is not None:  # first: its tasks use the client
+            if self.links is not None:  # first: it listens to the event service, and its link command may still run
+                await self.links.stop()
+            if self.events is not None:  # then the events: their tasks use the client
                 await self.events.stop()
             if self.ticker is not None:
                 await self.ticker.stop()

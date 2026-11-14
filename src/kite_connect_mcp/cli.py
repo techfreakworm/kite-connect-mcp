@@ -53,6 +53,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         KITE_MCP_PORT=str(args.port) if args.port else None,
     )
     _setup_logging(settings.log_level)
+    from .auth.reminders import serving_problem
+
+    if (problem := serving_problem(settings)) is not None:  # before anything is built: stdio has no lifespan
+        raise ConfigError(problem)
     from .server import build_http_app, build_runtime, build_server
 
     rt = build_runtime(settings)
