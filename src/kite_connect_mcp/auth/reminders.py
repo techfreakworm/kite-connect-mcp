@@ -24,9 +24,10 @@ import logging
 import os
 import re
 import signal
+import stat
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, get_args
 
 from ..events.trust import check_owned_file
 from ..timeutil import IST, to_ist
@@ -37,18 +38,22 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 Reason = Literal["scheduled", "token_rejected", "requested"]
-REASONS: tuple[Reason, ...] = ("scheduled", "token_rejected", "requested")
+REASONS: tuple[Reason, ...] = get_args(Reason)
 LOOKAHEAD_DAYS = 31  # next_scheduled looks this far; a longer run of skipped days shows no next time
+SKIP_DATES_MAX_BYTES = 64 * 1024  # years of dates: a larger skip-dates file is refused whole
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+# open without waiting: a FIFO or a device named by mistake must not hold the event loop, nor become our terminal
+_OPEN_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 
 Spawn = Callable[..., Awaitable[asyncio.subprocess.Process]]
 
 
 class SkipDates:
     """The skip-dates file: one YYYY-MM-DD per line; `#` starts a comment, on a line of its own or after a date; blank
-    lines are fine. Re-read at each use, so a file another job rewrites takes effect without a restart. A missing or
-    unreadable file, or a line that is not a date, is logged as a warning once per distinct problem (a line by its
-    number, never its text) and skips nothing: a link on a holiday is better than none on a trading day."""
+    lines are fine; a UTF-8 byte-order mark is too. Re-read at each use, so a file another job rewrites takes effect
+    without a restart. A missing or unreadable file, a path that is not a regular file, a file larger than
+    SKIP_DATES_MAX_BYTES, or a line that is not a date, is logged as a warning once per distinct problem (a line by
+    its number, never its text) and skips nothing: a link on a holiday is better than none on a trading day."""
 
     def __init__(self, path: Path | None) -> None:
         self.path = path
@@ -57,11 +62,8 @@ class SkipDates:
     def dates(self) -> frozenset[dt.date]:
         if self.path is None:
             return frozenset()
-        try:
-            text = self.path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            why = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
-            self._warn(f"cannot read the skip-dates file {self.path} ({why}): no day is skipped")
+        text = self._read(self.path)
+        if text is None:
             return frozenset()
         found: set[dt.date] = set()
         for number, line in enumerate(text.splitlines(), 1):
@@ -78,6 +80,31 @@ class SkipDates:
                 )
         return frozenset(found)
 
+    def _read(self, path: Path) -> str | None:
+        """The file's text, or None after a warning. It is opened without waiting and read only when it is a regular
+        file of at most SKIP_DATES_MAX_BYTES. A larger one is refused whole rather than read in part: the simpler rule,
+        and a file that size is no list of holidays."""
+        try:
+            fd = os.open(path, _OPEN_FLAGS)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):  # before fdopen, which refuses a folder in its own words
+                    self._warn(f"the skip-dates file {path} is not a regular file: no day is skipped")
+                    return None
+                with os.fdopen(fd, "rb", closefd=False) as file:
+                    data = file.read(SKIP_DATES_MAX_BYTES + 1)
+            finally:
+                os.close(fd)
+            if len(data) > SKIP_DATES_MAX_BYTES:
+                self._warn(
+                    f"the skip-dates file {path} is larger than {SKIP_DATES_MAX_BYTES // 1024} KiB: no day is skipped"
+                )
+                return None
+            return data.decode("utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
+            why = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
+            self._warn(f"cannot read the skip-dates file {path} ({why}): no day is skipped")
+            return None
+
     def _warn(self, problem: str) -> None:
         if problem not in self._warned:
             self._warned.add(problem)
@@ -85,6 +112,7 @@ class SkipDates:
 
 
 def allowed_day(settings: Settings, day: dt.date, skipped: frozenset[dt.date]) -> bool:
+    """Whether `day` may have scheduled links: one of KITE_MCP_LOGIN_REMINDER_DAYS, and not in `skipped`."""
     return day.weekday() in settings.login_reminder_days and day not in skipped
 
 
@@ -121,7 +149,11 @@ def program_problem(program: Path) -> str | None:
     that only this user or root can change, reached through folders and links only they can change."""
     if not program.is_absolute():
         return f"{program} is not an absolute path"
-    if not (program.is_file() and os.access(program, os.X_OK)):
+    try:
+        runnable = program.is_file() and os.access(program, os.X_OK)
+    except OSError as exc:  # pathlib passes on all but "not found": a folder we cannot search, a name too long
+        return f"cannot check the login link command {program}: {exc.strerror or type(exc).__name__}"
+    if not runnable:
         return f"{program} is not an executable file"
     return check_owned_file(program, "the login link command")
 

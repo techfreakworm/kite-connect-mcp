@@ -46,7 +46,8 @@ DEFAULT_LOGIN_URL = "https://kite.zerodha.com/connect/login"
 DEFAULT_TICKER_URL = "wss://ws.kite.trade"
 DEFAULT_PORT = 8765
 DEFAULT_ORDER_POLL_WINDOW = (dt.time(9, 0), dt.time(16, 0))  # IST, a little wider than the market's hours
-DEFAULT_ORDER_POLL_DAYS = frozenset(range(5))  # Mon-Fri (Mon=0 .. Sun=6)
+WEEKDAYS = frozenset(range(5))  # Mon-Fri (Mon=0 .. Sun=6)
+DEFAULT_ORDER_POLL_DAYS = WEEKDAYS
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
@@ -224,9 +225,17 @@ def _env_names(env: Mapping[str, str], name: str, problems: list[str]) -> tuple[
     return tuple(n for n in names if _ENV_NAME_RE.fullmatch(n) and n not in kite)
 
 
-def _path(env: Mapping[str, str], name: str) -> Path | None:
+def _path(env: Mapping[str, str], name: str, problems: list[str]) -> Path | None:
+    """A path with `~` expanded, or None when unset. A `~user` this system does not know is a problem that names the
+    setting without echoing its value (the link command's might hold arguments)."""
     raw = env.get(name, "").strip()
-    return Path(raw).expanduser() if raw else None
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser()
+    except RuntimeError:  # pathlib: "Could not determine home directory."
+        problems.append(f"{name} starts with a ~ whose home folder cannot be found: give the full path")
+        return None
 
 
 def _upper_set(env: Mapping[str, str], name: str) -> frozenset[str] | None:
@@ -361,7 +370,7 @@ class Settings:
 
     # --- login links (auth/reminders.py, docs/EVENTS.md "Scheduled login links") ---
     login_reminder_times: tuple[dt.time, ...] = ()  # IST
-    login_reminder_days: frozenset[int] = DEFAULT_ORDER_POLL_DAYS
+    login_reminder_days: frozenset[int] = WEEKDAYS
     login_reminder_skip_dates_file: Path | None = None
     login_link_command: Path | None = None  # one program, no arguments
     login_link_env_pass: tuple[str, ...] = ()
@@ -499,9 +508,9 @@ class Settings:
             order_poll_days=_days(env, "KITE_MCP_ORDER_POLL_DAYS", DEFAULT_ORDER_POLL_DAYS, problems),
             events_keep_days=_int(env, "KITE_MCP_EVENTS_KEEP_DAYS", 30, problems, minimum=1),
             login_reminder_times=_times(env, "KITE_MCP_LOGIN_REMINDER_TIMES", problems),
-            login_reminder_days=_days(env, "KITE_MCP_LOGIN_REMINDER_DAYS", DEFAULT_ORDER_POLL_DAYS, problems),
-            login_reminder_skip_dates_file=_path(env, "KITE_MCP_LOGIN_REMINDER_SKIP_DATES_FILE"),
-            login_link_command=_path(env, "KITE_MCP_LOGIN_LINK_COMMAND"),
+            login_reminder_days=_days(env, "KITE_MCP_LOGIN_REMINDER_DAYS", WEEKDAYS, problems),
+            login_reminder_skip_dates_file=_path(env, "KITE_MCP_LOGIN_REMINDER_SKIP_DATES_FILE", problems),
+            login_link_command=_path(env, "KITE_MCP_LOGIN_LINK_COMMAND", problems),
             login_link_env_pass=_env_names(env, "KITE_MCP_LOGIN_LINK_ENV_PASS", problems),
             login_link_timeout_s=_int(env, "KITE_MCP_LOGIN_LINK_TIMEOUT_S", 30, problems, minimum=1),
             log_level=(env.get("KITE_MCP_LOG_LEVEL", "INFO").strip().upper() or "INFO"),
@@ -567,10 +576,11 @@ class Settings:
                 "KITE_MCP_LOGIN_REMINDER_TIMES and KITE_MCP_LOGIN_LINK_COMMAND need KITE_MCP_PUBLIC_URL: a link is "
                 "only of use when Kite's redirect reaches this server's callback"
             )
-        if self.login_link_command is not None and not self.login_link_command.is_absolute():
-            problems.append(
-                "KITE_MCP_LOGIN_LINK_COMMAND must be an absolute path to one program (no arguments: wrap them in a "
-                "script)"
+        command = self.login_link_command
+        if command is not None and (not command.is_absolute() or re.search(r"\s", str(command))):
+            problems.append(  # the value is not echoed: what follows a space may be an argument such as a chat id
+                "KITE_MCP_LOGIN_LINK_COMMAND must be an absolute path to one program, with no arguments and no spaces: "
+                "wrap arguments in a script, and reach a program whose path has a space through a link without one"
             )
         if self.login_link_timeout_s > 600:
             problems.append("KITE_MCP_LOGIN_LINK_TIMEOUT_S cannot exceed 600")
