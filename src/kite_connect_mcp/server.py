@@ -50,7 +50,8 @@ def build_runtime(
 
     With the events on, Kite's rejections of tokens are kept in the store (events/rejections.py); a command beside the
     service reads them read-only when it first asks. With the events on, a rejection of the token in use raises
-    token_rejected whichever call meets it first."""
+    token_rejected whichever call meets it first. With KITE_MCP_LOGIN_LINK_COMMAND the login link service is built
+    too (auth/reminders.py); nothing is read until it is used."""
     token_file = TokenFile(settings.token_file, writable=settings.auth_mode == "managed")
     tokens = TokenProvider(token_file=token_file, env_token=settings.access_token, clock=clock)
     client = KiteClient(settings, tokens, transport=transport, limiter=limiter or RateLimiter(sleep=sleep), sleep=sleep)
@@ -79,6 +80,10 @@ def build_runtime(
         from .events.rejections import SnapshotRejections
 
         tokens.keep_rejections_in(SnapshotRejections(settings.events_db))
+    if settings.login_link_command is not None:  # in every process, so any of them can show the links' status
+        from .auth.reminders import LoginLinks
+
+        rt.links = LoginLinks(settings, rt.login, clock=clock)
     return rt
 
 

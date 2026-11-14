@@ -52,6 +52,7 @@ from ..timeutil import now_ist
 
 if TYPE_CHECKING:  # the heavier pieces are created lazily by their own modules
     from ..auth.login import LoginManager
+    from ..auth.reminders import LoginLinks
     from ..events.service import EventService
     from ..instruments import InstrumentStore
     from ..ticker.manager import TickerManager
@@ -84,6 +85,7 @@ class Runtime:
     ticker: TickerManager | None = None
     login: LoginManager | None = None
     events: EventService | None = None  # order events (KITE_MCP_EVENTS=true)
+    links: LoginLinks | None = None  # login links (KITE_MCP_LOGIN_LINK_COMMAND)
     extras: dict[str, Any] = field(default_factory=dict)
     closers: list[Callable[[], None]] = field(default_factory=list)  # what tool modules opened, closed by aclose()
 

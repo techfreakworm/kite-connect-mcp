@@ -9,6 +9,13 @@ login links".
     program_problem      why the command cannot be trusted or run (events/trust.py, as for consumer programs)
     run_link_command     run it once with the link on stdin: None when it exited 0, else a short error
     serving_problem      the links need the HTTP transport: checked when `serve` starts (cli.py) and by LoginLinks
+    LoginLinks           the service: send() issues one link and gives it to the command, once, and records the attempt
+    describe_links       the `login_links` status: the times, the days, the next time, the last slot and attempt
+
+    <state_dir>/login_links.json    mode 600, never a link: the last attempt (`last`), the last slot handled
+                                    (`last_scheduled_for`, so neither the loop nor a restart runs a slot twice) and the
+                                    last link after a rejected token (`token_rejected_link_at`: the two hours start
+                                    there). A missing or damaged file reads as nothing.
 
 The link is a bearer credential for one Kite login until it expires. It is never stored (auth/loginstate.py keeps only
 its state's digest), never logged, never put in an event, a status or an error. The command's stdout and stderr go to
@@ -20,20 +27,25 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import json
 import logging
 import os
 import re
 import signal
 import stat
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, get_args
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
+from ..errors import ConfigError, KiteMCPError
 from ..events.trust import check_owned_file
-from ..timeutil import IST, to_ist
+from ..timeutil import IST, now_ist, to_ist
+from .tokenstore import write_private_file
 
 if TYPE_CHECKING:
     from ..config import Settings
+    from .login import LoginManager
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +58,13 @@ _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _OPEN_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 
 Spawn = Callable[..., Awaitable[asyncio.subprocess.Process]]
+
+STATE_FILE = "login_links.json"  # under the state folder: the last attempt, the last slot, the last rejected-token link
+REJECTED_EVERY = dt.timedelta(hours=2)  # at most one token_rejected link this often
+MAX_ERROR_CHARS = 200  # an attempt's error, as kept and shown
+SOURCES: dict[Reason, str] = {"scheduled": "scheduled", "token_rejected": "token_rejected", "requested": "tool"}
+
+Outcome = Literal["sent", "skipped", "failed"]
 
 
 class SkipDates:
@@ -227,3 +246,196 @@ async def run_link_command(
     if code is not None and code < 0:
         return f"killed by {_signal_name(-code)}"
     return f"exit {code}"
+
+
+# --- the service ------------------------------------------------------------------------------------------------------
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= MAX_ERROR_CHARS else text[: MAX_ERROR_CHARS - 3] + "..."
+
+
+def _iso(moment: dt.datetime | None) -> str | None:
+    return to_ist(moment).isoformat(timespec="seconds") if moment is not None else None
+
+
+def _when(value: object) -> dt.datetime | None:
+    """A moment from the state file; anything else (missing, damaged, without an offset) is None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else None
+
+
+def _later(*moments: dt.datetime | None) -> dt.datetime | None:
+    return max((m for m in moments if m is not None), default=None)
+
+
+@dataclass(frozen=True)
+class Attempt:
+    """One link attempt: when, why, how it went, a short error when it failed and when its link expires (never the
+    link itself)."""
+
+    at: dt.datetime
+    reason: Reason
+    outcome: Outcome
+    error: str | None = None
+    link_expires_at: dt.datetime | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"at": _iso(self.at), "reason": self.reason, "outcome": self.outcome, "error": self.error,
+                "link_expires_at": _iso(self.link_expires_at)}  # fmt: skip
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Attempt | None:
+        """The attempt the state file holds, or None when it is missing or damaged."""
+        try:
+            reason, outcome, at = data["reason"], data["outcome"], _when(data["at"])
+            if reason not in REASONS or outcome not in ("sent", "skipped", "failed") or at is None:
+                return None
+            error = data.get("error")
+            return cls(
+                at, reason, outcome, error if isinstance(error, str) else None, _when(data.get("link_expires_at"))
+            )
+        except (KeyError, TypeError, AttributeError):
+            return None
+
+
+@dataclass(frozen=True)
+class LinkState:
+    """What the state file holds."""
+
+    last: Attempt | None = None
+    token_rejected_link_at: dt.datetime | None = None  # the last token_rejected attempt: the two hours start there
+    last_scheduled_for: dt.datetime | None = None  # the last slot handled (sent, skipped or failed)
+
+
+def read_state(path: Path) -> LinkState:
+    """What the state file holds; a missing or damaged file reads as nothing, a damaged field as None."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return LinkState()
+    if not isinstance(data, dict):
+        return LinkState()
+    return LinkState(
+        Attempt.from_dict(data.get("last")),
+        _when(data.get("token_rejected_link_at")),
+        _when(data.get("last_scheduled_for")),
+    )
+
+
+def write_state(path: Path, state: LinkState) -> None:
+    """Replace the state file (mode 600, atomically). Never a link: an Attempt holds none."""
+    data = {
+        "last": state.last.as_dict() if state.last else None,
+        "token_rejected_link_at": _iso(state.token_rejected_link_at),
+        "last_scheduled_for": _iso(state.last_scheduled_for),
+    }
+    write_private_file(path, json.dumps(data, indent=1) + "\n")
+
+
+def describe_links(settings: Settings, now: dt.datetime, skip: SkipDates | None = None) -> dict[str, Any]:
+    """The `login_links` status: the times, the days, the next time, the last slot handled and the last attempt.
+    Never a link."""
+    upcoming = next_scheduled(settings, now, skip or SkipDates(settings.login_reminder_skip_dates_file))
+    state = read_state(settings.state_dir / STATE_FILE)
+    return {
+        "times": [t.strftime("%H:%M") for t in settings.login_reminder_times],
+        "days": sorted(settings.login_reminder_days),
+        "next_at": to_ist(upcoming).isoformat(timespec="minutes") if upcoming else None,
+        "last_scheduled_for": (
+            to_ist(state.last_scheduled_for).isoformat(timespec="minutes") if state.last_scheduled_for else None
+        ),
+        "last": state.last.as_dict() if state.last else None,
+    }
+
+
+class LoginLinks:
+    """The scheduled links and the links after a rejected token, sent through the link command. See the module
+    docstring. Built for every process with a link command (cheap: nothing is read until used), so any process can
+    show its status; its loop runs only in the HTTP server."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        login: LoginManager,
+        *,
+        clock: Callable[[], dt.datetime] = now_ist,
+        environ: Mapping[str, str] | None = None,
+        spawn: Spawn | None = None,
+    ):
+        if settings.login_link_command is None:
+            raise ConfigError("the login links need KITE_MCP_LOGIN_LINK_COMMAND")
+        self.settings = settings
+        self.login = login
+        self.clock = clock
+        self.command: Path = settings.login_link_command
+        self.skip = SkipDates(settings.login_reminder_skip_dates_file)
+        self._environ = dict(os.environ if environ is None else environ)
+        self._spawn = spawn
+        self._state_path = settings.state_dir / STATE_FILE
+        self._lock = asyncio.Lock()
+        self._last_slot: dt.datetime | None = None  # the last slot handled by this process, should the file fail
+
+    def valid_token(self) -> bool:
+        return self.login.tokens.current() is not None
+
+    def status(self) -> dict[str, Any]:
+        return describe_links(self.settings, self.clock(), self.skip)
+
+    def handled_slot(self) -> dt.datetime | None:
+        """The latest slot that had an attempt: the later of the state file's and this process's own memory (which
+        holds it when the file cannot be written), so no slot runs twice."""
+        return _later(read_state(self._state_path).last_scheduled_for, self._last_slot)
+
+    async def send(self, reason: Reason, *, slot: dt.datetime | None = None) -> Attempt:
+        """Issue a link and give it to the link command, once, and record the attempt (a scheduled one with its slot).
+        ConfigError when no link may be issued now (LoginManager.issue_link: forcing off with a valid token): nothing
+        is recorded, the caller decides. Any other problem is a failed Attempt. ValueError for a slot on another
+        reason."""
+        if slot is not None and reason != "scheduled":
+            raise ValueError("only a scheduled attempt has a slot")
+        async with self._lock:
+            now = self.clock()
+            problem = await asyncio.to_thread(program_problem, self.command)
+            if problem is not None:
+                log.warning("login links: the link command is not run: %s", problem)
+                return self._record(Attempt(now, reason, "failed", _clip(problem)), slot)
+            try:
+                url, expires_at = await self.login.issue_link(source=SOURCES[reason])
+            except ConfigError:
+                raise
+            except KiteMCPError as exc:
+                return self._record(Attempt(now, reason, "failed", _clip(str(exc))), slot)
+            body = {"url": url, "expires_at": to_ist(expires_at).isoformat(timespec="seconds"), "reason": reason}
+            error = await run_link_command(
+                self.command,
+                (json.dumps(body) + "\n").encode(),
+                env=link_env(self.settings.login_link_env_pass, self._environ),
+                timeout_s=self.settings.login_link_timeout_s,
+                spawn=self._spawn,
+            )
+            if error is None:
+                log.info("login links: a %s link was sent through the link command", reason)
+            else:
+                log.warning("login links: the link command failed for a %s link (%s)", reason, error)
+            return self._record(Attempt(now, reason, "sent" if error is None else "failed", error, expires_at), slot)
+
+    def _record(self, attempt: Attempt, slot: dt.datetime | None = None) -> Attempt:
+        """Keep `attempt` as the last one in the state file (never a link). A scheduled attempt also keeps its slot, so
+        neither the loop nor a restart runs that slot again; a token_rejected attempt starts the two hours. A file
+        that cannot be written is logged, and the slot is still held in memory (handled_slot)."""
+        if slot is not None:
+            self._last_slot = _later(self._last_slot, slot)
+        before = read_state(self._state_path)
+        rejected_at = attempt.at if attempt.reason == "token_rejected" else before.token_rejected_link_at
+        state = LinkState(attempt, rejected_at, _later(before.last_scheduled_for, slot))
+        try:
+            write_state(self._state_path, state)
+        except OSError as exc:
+            log.warning("login links: could not write %s (%s)", self._state_path, exc.strerror or type(exc).__name__)
+        return attempt
