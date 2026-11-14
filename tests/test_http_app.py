@@ -35,7 +35,7 @@ async def test_health_is_public(runtime_factory):
     async with http_client(runtime_factory) as client:
         response = await client.get("/health")
     assert response.status_code == 200
-    assert response.json()["status"] == "ok"
+    assert response.json() == {"status": "ok"}  # no version: nothing to fingerprint (the docs say so too)
     assert response.headers["cache-control"] == "no-store"
 
 

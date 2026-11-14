@@ -37,9 +37,12 @@ The whole contract, with the retry schedule and the timeouts, is in [docs/EVENTS
    `command` is a list of arguments, not a shell line, and its first item is an absolute path. Other users can see a
    command's arguments, so never put a secret there: put it in the server's environment (its settings file works) and
    name it in `env_pass`.
-3. Make the consumers file private (`chmod 600`) and point `KITE_MCP_EVENTS_CONSUMERS_FILE` at it.
+3. Make the consumers file private to the server's user (owned by it, `chmod 600`) and point
+   `KITE_MCP_EVENTS_CONSUMERS_FILE` at it.
 4. Restart the server: it reads the consumers file when it starts. Then send a selftest with
-   `kite-connect-mcp events selftest` and check `kite-connect-mcp events status`.
+   `kite-connect-mcp events selftest` and check `kite-connect-mcp events status`. On a systemd server set up as in
+   [SELF_HOSTING.md](../docs/SELF_HOSTING.md#order-events-on-a-server):
+   `kite-mcp-ctl events selftest --url https://kite.example.com/postback`, then `kite-mcp-ctl events status`.
 
 A script given as an argument, as in `["/usr/bin/python3", "/path/to/telegram_notify.py"]`, is not checked by the
 server: keep it owned by you or root and writable by no one else. In the Docker image, Python is

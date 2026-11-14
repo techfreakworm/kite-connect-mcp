@@ -70,7 +70,7 @@ kite.example.com {
 		reverse_proxy 127.0.0.1:8765
 	}
 
-	# --- optional: health check (the answer includes the version number). Delete this block unless something
+	# --- optional: health check (it answers {"status":"ok"} and nothing more). Delete this block unless something
 	# outside the server polls it. ---
 	@health {
 		method GET

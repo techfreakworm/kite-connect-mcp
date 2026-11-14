@@ -108,7 +108,8 @@ def test_telegram_reads_the_event_as_utf8_whatever_the_locale(telegram):
     assert fake.received[0]["body"]["text"] == RUPEE_TEXT
 
 
-@pytest.mark.parametrize(("status", "code"), [(429, 75), (502, 75), (400, 1)])
+# a 408 (timed out) or a 429 (rate limited) is worth retrying, as in webhook.sh; another 4xx is not
+@pytest.mark.parametrize(("status", "code"), [(429, 75), (408, 75), (502, 75), (400, 1), (404, 1)])
 def test_telegram_exit_codes(telegram, status, code):
     base, fake = telegram
     fake.status = status

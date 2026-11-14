@@ -103,7 +103,7 @@ What the defaults give you (the kill-switch file has its own setting, under [Saf
 | `KITE_MCP_POSTBACK_PATH` | unset | Turns on the order-postback endpoint at this path (`POST`), for example `/postback`. | Same rules as the callback path. The postback URL in the developer console must match. Without it the endpoint does not exist. With `KITE_MCP_EVENTS=true` postbacks feed the [order events](EVENTS.md). |
 
 Fixed paths: `/mcp` (the MCP endpoint, bearer-protected, as is anything below `/mcp`) and `/health` (public; answers
-`{"status":"ok","version":...}`).
+`{"status":"ok"}` and nothing more, so it gives away no version).
 
 ## Safety
 

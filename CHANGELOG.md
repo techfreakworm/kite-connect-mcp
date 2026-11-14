@@ -35,6 +35,11 @@ is 0.x, minor releases may change tool arguments.
 - The Caddy and nginx samples cap request bodies per path: 1 MB for `/mcp`, 4 KB for `/callback` and `/health`,
   64 KiB for `/postback` (the server's own cap).
 
+### Fixed
+
+- The docs and the Caddy and nginx samples said that `/health` answers with the version. It answers only
+  `{"status":"ok"}`, which gives nothing away.
+
 ## 0.1.1 (2026-11-04)
 
 Checked against the live Kite API (read-only): every read tool, the calculators, and the WebSocket ticker across

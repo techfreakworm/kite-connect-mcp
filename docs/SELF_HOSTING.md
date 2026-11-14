@@ -397,7 +397,7 @@ nginx's error log can quote the request line when the server is down, so keep `/
 **Test it from another machine:**
 
 ```bash
-curl -i https://kite.example.com/health                 # 200 and {"status":"ok",...}
+curl -i https://kite.example.com/health                 # 200 and {"status":"ok"}
 curl -i -X POST https://kite.example.com/mcp            # 401: the bearer token is required
 curl -i https://kite.example.com/admin                  # 404 from the proxy
 ```
@@ -542,17 +542,35 @@ TELEGRAM_BOT_TOKEN=123456:ABC-placeholder
 TELEGRAM_CHAT_ID=123456789
 ```
 
-The log example writes to `~/kite-events.jsonl`, which for the service user is in its state folder. A consumer that
-writes anywhere else needs that folder in the unit's `ReadWritePaths=` (the drop-in has a commented line for it), and
-one that calls out (the Telegram example calls `api.telegram.org`) needs that allowed by your outbound firewall, if you
-filter outbound traffic.
+The consumers run inside the unit's sandbox. `ProtectHome=true` hides `/home`, so keep the programs and their scripts
+out of it: a program there stops the service from starting, and a script there fails every delivery.
+`ProtectSystem=strict` leaves only the state and cache folders writable. The log example writes to
+`~/kite-events.jsonl`, which for the service user is in its state folder; a consumer that writes anywhere else needs a
+folder of its own. The drop-in has commented `LogsDirectory=` lines for that: with them systemd creates
+`/var/log/kite-events`, owned by `kite-mcp` and writable by the service, and the log example writes there with
+`EVENT_LOG_FILE=/var/log/kite-events/events.jsonl` in the settings file. A consumer that calls out (the Telegram example
+calls `api.telegram.org`) needs that allowed by your outbound firewall, if you filter outbound traffic.
 
-**3. The drop-in.**
+**3. The settings file.** Name the store and the consumers file in the settings file
+(`sudoedit /etc/kite-connect-mcp/kite-connect-mcp.env`):
+
+```bash
+KITE_MCP_EVENTS_DB=/var/lib/kite-connect-mcp/events.sqlite3
+KITE_MCP_EVENTS_CONSUMERS_FILE=/etc/kite-connect-mcp/consumers.json
+```
+
+The service and `kite-mcp-ctl` both read this file, so the `events` commands find the service's store and the
+consumers' names. Put any other events setting here too, such as the poll's (`KITE_MCP_ORDER_POLL_INTERVAL_S` and the
+others): `events status` shows the poll settings of the process that runs it.
+
+**4. The drop-in.**
 [`deploy/systemd/kite-connect-mcp.service.d/events.conf`](../deploy/systemd/kite-connect-mcp.service.d/events.conf)
-turns the events on for the service: `KITE_MCP_EVENTS=true`, `KITE_MCP_POSTBACK_PATH=/postback`,
-`KITE_MCP_EVENTS_CONSUMERS_FILE=/etc/kite-connect-mcp/consumers.json`, and `Restart=always`, since the poll and the
-consumers should run all day. The settings are in the drop-in, not in the settings file, because `kite-mcp-ctl` reads
-the settings file without the service's `--transport http`, and `KITE_MCP_EVENTS=true` needs the HTTP transport.
+turns the events on for the service: `KITE_MCP_EVENTS=true`, `KITE_MCP_POSTBACK_PATH=/postback`, and `Restart=always`,
+since the poll and the consumers should run all day. `KITE_MCP_EVENTS=true` is in the drop-in, not the settings file,
+because it needs the HTTP transport: the service gets that from its command line (`--transport http`), and
+`kite-mcp-ctl` does not, so in the settings file it would stop every `kite-mcp-ctl` command. A line for the same
+setting in the settings file wins over the drop-in's (systemd reads `EnvironmentFile=` last), so keep each setting in
+one place.
 
 ```bash
 sudo mkdir -p /etc/systemd/system/kite-connect-mcp.service.d
@@ -562,38 +580,20 @@ sudo systemctl daemon-reload && sudo systemctl restart kite-connect-mcp
 journalctl -u kite-connect-mcp -n 20 --no-pager      # look for "order events: started, 2 consumer(s)"
 ```
 
-If the service does not come back, the log says why: most often the consumers file, or a program, that someone other
-than `kite-mcp` or root could change.
+If the service does not come back, the log says why: most often the consumers file or a program is missing, out of
+`kite-mcp`'s reach, or could be changed by someone other than `kite-mcp` or root.
 
-**4. Kite and the proxy.** Set your app's postback URL to `https://kite.example.com/postback` in the developer console
+**5. Kite and the proxy.** Set your app's postback URL to `https://kite.example.com/postback` in the developer console
 (see [KITE_SETUP.md](KITE_SETUP.md#5-postback-url-optional)). The Caddy and nginx examples of step 5 forward
 `POST /postback`, with a cap on the body of 64 KiB. Set `KITE_MCP_ALLOWED_USER_ID` in the settings file, so that a
 postback for any other account is refused.
 
-**5. The `events` commands.** The drop-in's settings reach only the service, so a command needs the store and the
-consumers file named. Add them to the settings file (the service reads them too, with the same values):
+**6. Check it.** The `events` commands run as the service user, who owns the store, through `kite-mcp-ctl`. The
+selftest signs a made-up postback with your API secret, without showing it, and posts it to the public URL, so a 200
+proves the whole way: DNS, TLS, the proxy, the route, the checksum and the store.
 
 ```bash
-KITE_MCP_EVENTS_DB=/var/lib/kite-connect-mcp/events.sqlite3
-KITE_MCP_EVENTS_CONSUMERS_FILE=/etc/kite-connect-mcp/consumers.json
-```
-
-Then `kite-mcp-ctl events status` and the other `events` commands work, as the service user, who owns the store. Or
-name the two for one command:
-
-```bash
-sudo -u kite-mcp env KITE_MCP_EVENTS_DB=/var/lib/kite-connect-mcp/events.sqlite3 \
-    KITE_MCP_EVENTS_CONSUMERS_FILE=/etc/kite-connect-mcp/consumers.json \
-    /opt/kite-connect-mcp/venv/bin/kite-connect-mcp --env-file /etc/kite-connect-mcp/kite-connect-mcp.env events status
-```
-
-If you change the poll's settings, put them in the settings file as well: `events status` shows the poll settings of the
-process that runs it.
-
-**6. The selftest, through the proxy.** It signs a made-up postback with your API secret, without showing it, and posts
-it to the public URL, so a 200 proves the whole way: DNS, TLS, the proxy, the route, the checksum and the store.
-
-```bash
+kite-mcp-ctl events status              # the postbacks, the poll and each consumer
 kite-mcp-ctl events selftest --url https://kite.example.com/postback
 # selftest: POST https://kite.example.com/postback -> HTTP 200
 kite-mcp-ctl events tail --limit 1      # the selftest event

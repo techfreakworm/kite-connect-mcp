@@ -11,6 +11,7 @@ from kite_connect_mcp.config import _FILE_VARIANTS, KNOWN_VARIABLES
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DOCS = sorted([ROOT / "README.md", *(ROOT / "docs").glob("*.md"), ROOT / ".env.example", ROOT / "SECURITY.md"])
+PROXY_SAMPLES = [ROOT / "deploy/caddy/Caddyfile.example", ROOT / "deploy/nginx/kite-connect-mcp.conf.example"]
 TOOL_WORD = re.compile(
     r"`((?:get|place|modify|cancel|delete|create|search|refresh|convert|authorise|engage|complete|ticker|session)"
     r"_[a-z_]+|login|logout)`"
@@ -53,6 +54,14 @@ def mcp_factory_module(tmp_path_factory):
 def test_tool_names_in_docs_exist(doc, tool_names):
     mentioned = set(TOOL_WORD.findall(doc.read_text(encoding="utf-8"))) - NOT_TOOLS
     assert not sorted(mentioned - tool_names), f"{doc.name} names tools that do not exist"
+
+
+@pytest.mark.parametrize("doc", [*DOCS, *PROXY_SAMPLES], ids=lambda p: p.name)
+def test_the_health_answer_is_shown_as_it_is(doc):
+    """/health answers {"status":"ok"} and nothing more: no version, nothing to fingerprint (test_http_app.py)."""
+    text = doc.read_text(encoding="utf-8")
+    assert set(re.findall(r'\{"status":\s*"ok"[^}]*\}', text)) <= {'{"status":"ok"}'}
+    assert not re.search(r"health[^.\n]*\bversion\b", text, flags=re.I), f"{doc.name} says /health shows the version"
 
 
 @pytest.mark.parametrize("doc", DOCS, ids=lambda p: p.name)

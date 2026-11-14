@@ -102,7 +102,7 @@ server {
         proxy_pass http://kite_connect_mcp;
     }
 
-    # --- optional: health check (the answer includes the version number). Delete this block unless something
+    # --- optional: health check (it answers {"status":"ok"} and nothing more). Delete this block unless something
     # outside the server polls it. ---
     location = /health {
         limit_except GET {

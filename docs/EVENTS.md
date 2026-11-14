@@ -55,8 +55,11 @@ To turn it on:
 1. **The settings.** Set `KITE_MCP_EVENTS=true`, `KITE_MCP_POSTBACK_PATH=/postback` and, once you have one,
    `KITE_MCP_EVENTS_CONSUMERS_FILE`. On a systemd server the drop-in
    [`deploy/systemd/kite-connect-mcp.service.d/events.conf`](../deploy/systemd/kite-connect-mcp.service.d/events.conf)
-   sets them for the service only; [SELF_HOSTING.md](SELF_HOSTING.md#order-events-on-a-server) walks through it. The
-   Docker image runs HTTP already, so there the lines go in the settings file.
+   sets the first two for the service only: `KITE_MCP_EVENTS=true` needs the HTTP transport, which the commands run
+   with the settings file do not have. The store (`KITE_MCP_EVENTS_DB`), the consumers file and any other events
+   setting go in the settings file, which the service and the `events` commands both read;
+   [SELF_HOSTING.md](SELF_HOSTING.md#order-events-on-a-server) walks through it. The Docker image runs HTTP already, so
+   there every line goes in the settings file.
 2. **The API secret.** The postback checksum is made with your app's API secret, so the server needs
    `KITE_API_SECRET` (or `KITE_API_SECRET_FILE`). Without it every postback is refused.
 3. **The postback URL.** In the [developer console](https://developers.kite.trade), set your app's postback URL to the
@@ -512,15 +515,13 @@ These commands open the store by its path, so they work while the server runs, a
 - A name that is neither in the consumers file nor in the store (a typo) is refused, and so is `retry` for a consumer
   that is no longer in the file, unless it is paused.
 
-For example, as the server's user on a systemd server that sets the events in a drop-in:
+On a systemd server set up as in [SELF_HOSTING.md](SELF_HOSTING.md#order-events-on-a-server), the settings file
+names the store and the consumers file, and the `kite-mcp-ctl` wrapper runs a command as the server's user with that
+file:
 
 ```bash
-KITE_MCP_EVENTS_DB=/var/lib/kite-connect-mcp/events.sqlite3 \
-KITE_MCP_EVENTS_CONSUMERS_FILE=/etc/kite-connect-mcp/consumers.json \
-  kite-connect-mcp events status
+kite-mcp-ctl events status
 ```
-
-[SELF_HOSTING.md](SELF_HOSTING.md#order-events-on-a-server) shows the same with `sudo`.
 
 **The selftest** signs a postback for a made-up order id (`selftest-` and 12 random hexadecimal digits) with the
 configured API secret, which it reads from the configuration itself and never prints, and posts it.

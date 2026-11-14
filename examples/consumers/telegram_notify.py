@@ -51,9 +51,9 @@ def main() -> int:
         with urllib.request.urlopen(request, timeout=15):  # noqa: S310 (as above)
             return 0
     except urllib.error.HTTPError as exc:
-        # 429 (rate limited) and 5xx are worth retrying; any other refusal will not change by itself
+        # 408 (timed out), 429 (rate limited) and 5xx are worth retrying; any other refusal will not change by itself
         print(f"telegram_notify: Telegram answered HTTP {exc.code}", file=sys.stderr)
-        return RETRY if exc.code == 429 or exc.code >= 500 else 1
+        return RETRY if exc.code in (408, 429) or exc.code >= 500 else 1
     except (http.client.InvalidURL, ValueError) as exc:
         # no request can be made of these settings (a space in the token, say): it will not change by itself
         name = type(exc).__name__
