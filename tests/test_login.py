@@ -5,6 +5,7 @@ temporary server on loopback)."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import fcntl
 import json
@@ -271,24 +272,29 @@ def test_separate_processes_cannot_both_reserve_a_state(tmp_path):
     now = dt.datetime.now(dt.UTC)
     StateStore(path).issue(STATE, now, now + HOUR)
     env = {**os.environ, "PYTHONPATH": str(Path(kite_connect_mcp.__file__).resolve().parents[1])}
-    procs = [
-        subprocess.Popen(
-            [sys.executable, "-c", RACE, str(path), STATE],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True,
-            env=env,
-        )
-        for _ in range(6)
-    ]
-    for proc in procs:  # everyone has finished starting up...
-        assert proc.stdout.readline().strip() == "ready"
-    for proc in procs:  # ...and now they all go at once
-        proc.stdin.write("go\n")
-        proc.stdin.flush()
-    answers = sorted(proc.stdout.readline().strip() for proc in procs)
-    for proc in procs:
-        proc.wait(timeout=30)
+    # each Popen closes its pipes and is waited for on the way out, also when an assert fails: a pipe left to the
+    # garbage collector is a ResourceWarning (an error with -W error), and its child a zombie
+    with contextlib.ExitStack() as stack:
+        procs = [
+            stack.enter_context(
+                subprocess.Popen(
+                    [sys.executable, "-c", RACE, str(path), STATE],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                )
+            )
+            for _ in range(6)
+        ]
+        for proc in procs:  # everyone has finished starting up...
+            assert proc.stdout.readline().strip() == "ready"
+        for proc in procs:  # ...and now they all go at once
+            proc.stdin.write("go\n")
+            proc.stdin.flush()
+        answers = sorted(proc.stdout.readline().strip() for proc in procs)
+        for proc in procs:
+            proc.wait(timeout=30)
     assert answers == ["lost"] * 5 + ["won"]
 
 
