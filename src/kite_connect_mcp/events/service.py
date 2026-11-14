@@ -2,7 +2,8 @@
 
 It owns the store and the consumers config, and is the only place events are created:
     ingest_order          a row read from Kite (the doorbell's re-read, or the poll) -> an order event, or nothing
-    note_token_rejected   Kite refused the stored token -> one session event per token
+    note_token_rejected   Kite refused the stored token -> one session event per token, whichever call met it first (a
+                          tool call, through TokenProvider.on_rejected; the poll; a doorbell)
     note_login            a new token was stored -> one `login` session event per token
     note_login_refused    another account's login was refused (the account pin) -> one `login_refused` per session
     note_login_failed     a real login on a link of ours did not complete -> one `login_failed` per link
@@ -87,10 +88,10 @@ _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
 class EventService:
-    """See the module docstring. Listeners (on_event, on_doorbell) are called synchronously, on the thread that
-    wrote, right after the commit; one that raises is logged and the others still run. A listener tied to an event
-    loop must therefore be safe to call from that thread: asyncio.Event.set is safe only on the loop's own thread, so a
-    service written to from another thread needs `lambda: loop.call_soon_threadsafe(event.set)` instead."""
+    """See the module docstring. Listeners (on_event, on_doorbell, on_token_rejected) are called synchronously, on the
+    thread that wrote, right after the commit; one that raises is logged and the others still run. A listener tied to
+    an event loop must therefore be safe to call from that thread: asyncio.Event.set is safe only on the loop's own
+    thread, so a service written to from another thread needs `lambda: loop.call_soon_threadsafe(event.set)` instead."""
 
     def __init__(
         self,
@@ -114,6 +115,7 @@ class EventService:
         self.store = store if store is not None else EventStore(settings.events_db)
         self._event_listeners: list[Callable[[], None]] = []
         self._doorbell_listeners: list[Callable[[], None]] = []
+        self._rejected_listeners: list[Callable[[], None]] = []
         # The workers' wake-ups (on_doorbell, on_event) set asyncio.Event objects, which is safe only on the event
         # loop's thread. Every writer runs on the loop today (the postback route rings, the poller and the doorbell
         # worker ingest, the router records its events); one on another thread needs loop.call_soon_threadsafe.
@@ -145,6 +147,11 @@ class EventService:
     def on_doorbell(self, callback: Callable[[], None]) -> None:
         """Call `callback` after each doorbell is kept (the doorbell worker's wake-up), on the writer's thread."""
         self._doorbell_listeners.append(callback)
+
+    def on_token_rejected(self, callback: Callable[[], None]) -> None:
+        """Call `callback` after a new token_rejected event is committed (the login links' wake-up, auth/reminders.py),
+        on the writer's thread: the event loop's, for every writer today."""
+        self._rejected_listeners.append(callback)
 
     @staticmethod
     def _tell(listeners: list[Callable[[], None]]) -> None:
@@ -220,11 +227,15 @@ class EventService:
         return seq
 
     def note_token_rejected(self, access_token: str) -> int | None:
-        """Kite refused this token: one `token_rejected` event per token (the id comes from a fingerprint of it; the
-        token itself is never stored)."""
+        """Kite refused this token: one `token_rejected` event per token, whoever reports it (the client's listener for
+        any call, the poll, a doorbell). The id comes from a fingerprint of it; the token itself is never stored. The
+        on_token_rejected listeners are told of a new event only."""
         now = self.clock()
         body = session_event("token_rejected", seed=token_fingerprint(access_token), received_at=now)
-        return self._insert(body, order_id=None, consumers=self.config.matching(body), now=now)
+        seq = self._insert(body, order_id=None, consumers=self.config.matching(body), now=now)
+        if seq is not None:
+            self._tell(self._rejected_listeners)
+        return seq
 
     def note_login(self, access_token: str, *, logged_in_at: dt.datetime, expires_at: dt.datetime) -> int | None:
         """A new token was stored: one `login` event per token (seeded with its fingerprint), whoever reports it (the

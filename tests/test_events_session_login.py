@@ -1,6 +1,9 @@
 """The login's session events: `login` once a new token is stored, `login_refused` once another account's login is
 refused, `login_failed` once per link when a real login on it did not complete. The callback's noise never becomes an
-event, and no event holds a user id, a token, a state, a link or Kite's own text."""
+event, and no event holds a user id, a token, a state, a link or Kite's own text.
+
+What the service sees by itself: a token stored beside it (the poll raises `login`, in managed mode), and Kite's
+rejection of the token in use met first by any call (`token_rejected`, once per token; never for a logout)."""
 
 from __future__ import annotations
 
@@ -14,11 +17,12 @@ import threading
 import httpx2
 import pytest
 
-from conftest import ACCESS_TOKEN, BEARER, FIXED_NOW
+from conftest import ACCESS_TOKEN, BEARER, FIXED_NOW, write_token_file
 from events_helpers import PY, Clock, write_consumers
 from kite_connect_mcp.auth.callback import CALLBACK_RATE_LIMIT
 from kite_connect_mcp.auth.loginstate import StateStore, digest_of
 from kite_connect_mcp.auth.tokenstore import TokenFile, TokenRecord
+from kite_connect_mcp.errors import TokenError
 from kite_connect_mcp.events.model import (
     LOGIN_FAILURES,
     SESSION_TEXT,
@@ -29,8 +33,9 @@ from kite_connect_mcp.events.model import (
     login_refused_event,
     session_event,
 )
+from kite_connect_mcp.events.store import StoreError
 from kite_connect_mcp.server import build_http_app, build_runtime
-from kite_connect_mcp.timeutil import IST
+from kite_connect_mcp.timeutil import IST, next_token_reset
 from kite_login import NEW_TOKEN, REQUEST_TOKEN, USER_ID, KiteSession, callback_params, state_of
 
 EVENTS = {"KITE_MCP_EVENTS": "true", "KITE_MCP_TRANSPORT": "http", "KITE_MCP_BEARER_TOKEN": BEARER}
@@ -371,3 +376,201 @@ def test_every_session_event_name_is_listed_in_sessions():
     assert built == set(SESSIONS) and set(SESSION_TEXT) <= set(SESSIONS)
     with pytest.raises(ValueError, match="unknown session event"):
         _session("logged_out", "s", FIXED_NOW, "a name that is not in SESSIONS")
+
+
+# --- what the service sees by itself: a token stored beside it, a rejection any call meets first ---------------------
+
+
+def at(day: int, hour: int, minute: int = 0) -> dt.datetime:
+    """A moment of November 2026 in IST: the 4th is a Wednesday, the 7th a Saturday."""
+    return dt.datetime(2026, 11, day, hour, minute, tzinfo=IST)
+
+
+@pytest.mark.parametrize("moment", [at(4, 6, 30), at(7, 11, 0)], ids=["weekday-before-the-poll-window", "saturday"])
+async def test_a_token_stored_beside_the_service_raises_login_at_the_next_tick(service_factory, fake_kite, moment):
+    fake_kite.on("GET", "/orders", [])
+    svc, rt = service_factory(consumers=[SESSION_CONSUMER], clock=Clock(moment))
+    svc.poller.prime()  # the token in use when the service started is not a login
+    await svc.poller.tick()
+    assert svc.store.events() == []
+    write_token_file(rt.settings.token_file, token=NEW_TOKEN, logged_in_at=moment)  # `kite-connect-mcp login` beside it
+    await svc.poller.tick()  # the next tick: at most Poller.TICK_S (5 s) after the write
+    (event,) = svc.store.events()
+    assert (event["session"], event["logged_in_at"]) == ("login", moment.isoformat(timespec="seconds"))
+    assert event["expires_at"] == next_token_reset(moment).isoformat(timespec="seconds")
+    no_secret_in(event)
+    await svc.poller.tick()
+    assert len(svc.store.events()) == 1
+
+
+async def test_in_external_mode_a_new_token_raises_nothing(service_factory, fake_kite):
+    fake_kite.on("GET", "/orders", [])
+    svc, rt = service_factory(consumers=[SESSION_CONSUMER], clock=Clock(at(4, 6, 30)), KITE_MCP_AUTH_MODE="external")
+    svc.poller.prime()
+    write_token_file(rt.settings.token_file, token=NEW_TOKEN, logged_in_at=at(4, 6, 30))  # another program's login
+    await svc.poller.tick()
+    assert svc.store.events() == []  # as in 0.2.0
+
+
+async def test_the_callback_and_the_poll_raise_one_login_for_one_token(events_rt, fake_kite):
+    KiteSession(fake_kite)
+    fake_kite.on("GET", "/orders", [])
+    rt = events_rt()
+    rt.events.poller.prime()
+    url, _ = await rt.login.issue_link()
+    assert (await rt.login.handle_callback(callback_params(state_of(url)))).ok
+    await rt.events.poller.tick()  # the poll sees the new token too
+    assert [e["session"] for e in rt.events.store.events()] == ["login"]
+
+
+async def test_when_the_poll_sees_the_token_first_the_logins_own_report_is_the_same_event(events_rt, fake_kite):
+    fake_kite.on("GET", "/orders", [])
+    rt = events_rt()
+    rt.events.poller.prime()
+    # the manager's write, in a thread
+    write_token_file(rt.settings.token_file, token=NEW_TOKEN, logged_in_at=FIXED_NOW)
+    await rt.events.poller.tick()
+    reset = next_token_reset(FIXED_NOW)
+    assert rt.events.note_login(NEW_TOKEN, logged_in_at=FIXED_NOW, expires_at=reset) is None  # already stored
+    assert [e["session"] for e in rt.events.store.events()] == ["login"]
+
+
+async def test_a_store_that_cannot_write_the_polls_login_does_not_stop_the_poll(
+    service_factory, fake_kite, caplog, monkeypatch
+):
+    fake_kite.on("GET", "/orders", [])
+    svc, rt = service_factory(consumers=[SESSION_CONSUMER])
+    svc.poller.prime()
+    write_token_file(rt.settings.token_file, token=NEW_TOKEN, logged_in_at=FIXED_NOW)
+
+    def cannot_write(*args, **kwargs):
+        raise StoreError("cannot write the event store: disk I/O error")
+
+    monkeypatch.setattr(svc.store, "insert_event", cannot_write)
+    with caplog.at_level(logging.WARNING):
+        await svc.poller.tick()
+    assert "could not record the login session event (StoreError)" in caplog.text
+    assert NEW_TOKEN not in caplog.text
+    assert len(fake_kite.calls("GET", "/orders")) == 1  # the poll ran all the same
+    assert svc.store.counters()["poll_ok"]["note"] == "login"
+
+
+async def test_a_tool_call_that_kite_refuses_raises_token_rejected_once(events_rt, fake_kite):
+    fake_kite.on("GET", "/user/profile", status=403, error_type="TokenException", message="Incorrect token")
+    rt = events_rt()
+    heard = []
+    rt.events.on_token_rejected(lambda: heard.append(1))
+    with pytest.raises(TokenError):
+        await rt.client.get("/user/profile")  # what session_status(verify=true) does on the service's /mcp
+    (event,) = rt.events.store.events()
+    assert event["session"] == "token_rejected" and heard == [1]
+    assert rt.tokens.current() is None  # marked, as before
+    assert rt.events.note_token_rejected(ACCESS_TOKEN) is None  # the poll's or a doorbell's own report: the same event
+    assert len(rt.events.store.events()) == 1 and heard == [1]
+
+
+async def test_the_polls_rejection_is_one_event_with_the_clients_report(events_rt, fake_kite):
+    fake_kite.on("GET", "/orders", status=403, error_type="TokenException", message="Invalid session")
+    rt = events_rt()
+    heard = []
+    rt.events.on_token_rejected(lambda: heard.append(1))
+    assert await rt.events.poller.poll("window") is False  # the client reports it, then the poll does
+    assert [e["session"] for e in rt.events.store.events()] == ["token_rejected"] and heard == [1]
+
+
+async def test_a_listener_that_fails_is_logged_and_the_call_still_raises(events_rt, fake_kite, caplog):
+    fake_kite.on("GET", "/user/profile", status=403, error_type="TokenException", message="Incorrect token")
+    rt = events_rt()
+    rt.events.store.close()  # the event service cannot write: note_token_rejected raises StoreError
+    with caplog.at_level(logging.WARNING), pytest.raises(TokenError):
+        await rt.client.get("/user/profile")
+    assert "could not report a rejected token to the order events (StoreError)" in caplog.text
+    assert ACCESS_TOKEN not in caplog.text
+    assert rt.tokens.current() is None  # marked all the same (in memory)
+
+
+@pytest.mark.parametrize("env_token", [None, "testenvaccesstoken0000000000000003"], ids=["file", "environment"])
+def test_only_a_rejection_of_the_token_in_use_is_reported(events_rt, env_token):
+    rt = events_rt(KITE_ACCESS_TOKEN=env_token)
+    in_use = env_token or ACCESS_TOKEN
+    other = ACCESS_TOKEN if env_token else NEW_TOKEN
+    heard: list[str] = []
+    rt.tokens.on_rejected = heard.append
+    rt.tokens.reject(other, report=True)  # a token no longer in use (the file was replaced since it was sent)
+    assert heard == [] and rt.tokens.current().access_token == in_use
+    rt.tokens.reject(in_use)  # a logout's or a refused account's session call: never reported
+    assert heard == [] and rt.tokens.current() is None
+    rt.tokens.reject(in_use, report=True)
+    assert heard == [in_use]
+    assert rt.events.store.events() == []  # the listener was replaced: nothing reached the store
+
+
+async def test_without_the_events_a_refused_call_works_as_before(runtime_factory, fake_kite):
+    fake_kite.on("GET", "/user/profile", status=403, error_type="TokenException", message="Incorrect token")
+    rt = runtime_factory()
+    assert rt.events is None and rt.tokens.on_rejected is None
+    with pytest.raises(TokenError):
+        await rt.client.get("/user/profile")
+    assert rt.tokens.current() is None  # marked, as in 0.2.0
+    assert len(fake_kite.calls("GET", "/user/profile")) == 1
+
+
+async def test_a_logout_raises_no_token_rejected(events_rt, fake_kite):
+    kite = KiteSession(fake_kite)
+    kite.logout_error = (403, "TokenException")  # Kite no longer knows the stored token
+    rt = events_rt()
+    assert (await rt.login.logout()).kite == "already_invalid"
+    assert rt.events.store.events() == []
+
+
+async def test_ending_a_refused_accounts_session_raises_no_token_rejected(events_rt, fake_kite):
+    kite = KiteSession(fake_kite, user_id="ZZ9999")
+    kite.logout_error = (403, "TokenException")
+    rt = events_rt(KITE_MCP_ALLOWED_USER_ID=USER_ID)
+    assert (await rt.login.complete(REQUEST_TOKEN)).reason == "account_mismatch"
+    assert [e["session"] for e in rt.events.store.events()] == ["login_refused"]
+
+
+def test_token_rejected_tells_its_listeners_once_per_token(service_factory):
+    svc, _ = service_factory()
+    heard = []
+    svc.on_token_rejected(lambda: heard.append(1))
+    assert svc.note_token_rejected(ACCESS_TOKEN) is not None
+    assert svc.note_token_rejected(ACCESS_TOKEN) is None  # the same token: stored once, told once
+    assert heard == [1]
+
+
+@pytest.mark.parametrize(
+    ("mode", "logged_in_at", "cleared"),
+    [
+        ("managed", FIXED_NOW, True),  # a new login, later than the record the service saw
+        ("managed", FIXED_NOW - dt.timedelta(hours=3), False),  # the same record written again: not a login
+        ("external", FIXED_NOW, False),  # another program's file: its marks stay, as in 0.2.0
+    ],
+    ids=["managed-new-login", "managed-same-record", "external"],
+)
+async def test_a_login_beside_the_service_that_kite_answers_with_the_rejected_token_clears_its_mark(
+    events_rt, fake_kite, mode, logged_in_at, cleared
+):
+    fake_kite.on("GET", "/user/profile", status=403, error_type="TokenException", message="Incorrect token")
+    fake_kite.on("GET", "/orders", [])
+    rt = events_rt(KITE_MCP_AUTH_MODE=mode)
+    poller = rt.events.poller
+    poller.prime()
+    with pytest.raises(TokenError):
+        await rt.client.get("/user/profile")
+    await poller.tick()
+    assert rt.tokens.current() is None and fake_kite.calls("GET", "/orders") == []  # refused: the poll skips quietly
+    # `kite-connect-mcp login` beside the service, and Kite gave the same token string again: the command clears the
+    # mark only in its own memory, and writes the file as the login does (a new file in its place)
+    TokenFile(rt.settings.token_file, writable=True).write(TokenRecord.new(ACCESS_TOKEN, logged_in_at))
+    await poller.tick()
+    marks = json.loads(rt.events.store.meta("rejected_tokens"))
+    if cleared:
+        assert rt.tokens.current().access_token == ACCESS_TOKEN and marks == []
+        assert [e["session"] for e in rt.events.store.events()] == ["token_rejected", "login"]
+        assert len(fake_kite.calls("GET", "/orders")) == 1  # the login's poll, with the token
+    else:
+        assert rt.tokens.current() is None and len(marks) == 1
+        assert [e["session"] for e in rt.events.store.events()] == ["token_rejected"]
+        assert fake_kite.calls("GET", "/orders") == []

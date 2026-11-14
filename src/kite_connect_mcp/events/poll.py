@@ -16,6 +16,12 @@ is not a list of orders is a failed poll (poll_failed), so it never stands in fo
 Every failed poll is counted in poll_failed (one that raises, under the kind of error, when the store can still count
 it), but logged only when the polls start failing and when one works again, so an outage logs two lines, not one a
 minute. Nothing that fails stops run(): it logs, and the next tick tries again.
+
+In managed mode, a new token that another process stored beside this one (a login by hand) also raises the session
+event `login`; the login manager reports its own logins, and the two are one event (seeded with the token). The token
+in use when the service starts is not a login (prime()). Kite may answer such a login with the very token string it
+rejected before; the login command clears that mark only in its own memory, so a newer login record of a token marked
+rejected clears the mark here, and counts as a login.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from .model import token_fingerprint
 from .store import iso
 
 if TYPE_CHECKING:
+    from ..auth.tokenstore import TokenRecord
     from ..config import Settings
     from .service import EventService
 
@@ -80,6 +87,7 @@ class Poller:
         self.settings = service.settings
         self.interval = dt.timedelta(seconds=service.settings.order_poll_interval_s)
         self._token_seen: str | None = None  # the fingerprint of the last token due() saw
+        self._file_seen: TokenRecord | None = None  # managed mode: the token file's record due() saw last
         self._next_at: dt.datetime | None = None
         self._failing = False  # the polls are failing, and that has been logged
         self._check_logged_at: dt.datetime | None = None  # due() is failing: when that was last logged
@@ -100,15 +108,47 @@ class Poller:
         return token_fingerprint(record.access_token) if record is not None else None
 
     def prime(self) -> None:
-        """Remember the token in use now, so that only a new one counts as a login."""
+        """Remember the token in use now, so that only a new one counts as a login (and, in managed mode, the token
+        file's record: see _relogin_of_a_rejected_token)."""
         self._token_seen = self._current_token()
+        self._file_seen = self._file_record()
+
+    def _file_record(self) -> TokenRecord | None:
+        """The token file's record, rejected or not, when this server owns the file and uses it (managed mode, no
+        KITE_ACCESS_TOKEN); else None."""
+        if self.settings.auth_mode != "managed" or self.settings.access_token:
+            return None
+        return self.service.tokens.file.read()
+
+    def _relogin_of_a_rejected_token(self) -> bool:
+        """Kite may answer a new login with the very token string it rejected before. A login in this process clears
+        that mark itself, but the login command beside it (`kite-connect-mcp login`) clears it only in its own memory,
+        and this process would go on refusing a token Kite accepts. So in managed mode a record of the same token with
+        a later login time than the record seen last, while that token is marked rejected, is such a login: its mark
+        is cleared. True when a mark was cleared (the caller counts it as a login). A login made while the service was
+        down is not seen: prime() takes the record of that time as the one seen."""
+        record = self._file_record()
+        seen, self._file_seen = self._file_seen, record
+        if record is None or seen is None or record.access_token != seen.access_token:
+            return False
+        if record.logged_in_at is None or seen.logged_in_at is None or record.logged_in_at <= seen.logged_in_at:
+            return False
+        tokens = self.service.tokens
+        if token_fingerprint(record.access_token) not in tokens.rejections:
+            return False
+        tokens.accept(record.access_token)
+        log.info("order events: a new login stored the token Kite rejected before; it is used again")
+        return True
 
     def mark_polled(self, now: dt.datetime) -> None:
         self._next_at = now + self.interval
 
     def due(self, now: dt.datetime) -> Reason | None:
         """Why a poll is due now ("login", "window" or "after_close"), or None. Not a pure question: it remembers the
-        token it saw, so a new token is "login" only once, and a caller that gets "login" must poll."""
+        token it saw, so a new token is "login" only once, and a caller that gets "login" must poll. A new login of a
+        token Kite rejected before clears its mark, and is "login" too (_relogin_of_a_rejected_token)."""
+        if self._relogin_of_a_rejected_token():
+            self._token_seen = None  # the same token string as before, but a new login all the same
         token = self._current_token()
         if token is None:
             return None
@@ -208,8 +248,29 @@ class Poller:
         if self._check_logged_at is not None:
             self._check_logged_at = None
             log.info("order events: telling whether a poll is due works again")
+        if reason == "login":
+            self._report_login()
         if reason is not None:
             await self._safe_poll(reason)
+
+    def _report_login(self) -> None:
+        """due() said "login": a new token is in use. In managed mode this server owns the login, so a token it did not
+        store itself was stored by another process beside it (`kite-connect-mcp login`, which runs without the
+        events): raise the session event `login` for it. The login manager reports its own logins too; both reports
+        are seeded with the token's fingerprint, and the store keeps an event id once, so one token gives one event
+        whichever report comes first. In external mode the token is another program's: nothing is raised, as in
+        0.2.0. Never raises: the poll goes ahead."""
+        if self.settings.auth_mode != "managed":
+            return
+        svc = self.service
+        try:
+            record = svc.tokens.current()
+            if record is None or record.source != "file" or record.expires_at is None:
+                return
+            logged_in_at = record.logged_in_at or svc.clock()
+            svc.note_login(record.access_token, logged_in_at=logged_in_at, expires_at=record.expires_at)
+        except Exception as exc:  # a store that cannot write: logged, and the poll still runs
+            log.warning("order events: could not record the login session event (%s)", type(exc).__name__)
 
     async def _safe_poll(self, reason: Reason) -> bool:
         """poll(), with an error logged instead of raised: its traceback when the polls start failing. It is counted in

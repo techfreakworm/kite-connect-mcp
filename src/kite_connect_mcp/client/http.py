@@ -313,7 +313,8 @@ class KiteClient:
                         raise
                 except TokenError:
                     if token_used:
-                        self.tokens.reject(token_used)
+                        # a session call (a logout, or ending a refused account's session) is not reported
+                        self.tokens.reject(token_used, report=not allow_session_call)
                     raise
             if attempt + 1 < attempts:
                 await self._sleep(min(8.0, 0.5 * (2**attempt)))

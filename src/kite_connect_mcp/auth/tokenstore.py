@@ -261,7 +261,8 @@ class MemoryRejections:
 
 class TokenProvider:
     """The token to use right now, with the knowledge of whether Kite has already rejected it. Kite's rejections are
-    kept by fingerprint (Rejections): in memory, or in the event store."""
+    kept by fingerprint (Rejections): in memory, or in the event store. With the order events on, the event service
+    listens (on_rejected) for Kite's rejections of the token in use."""
 
     def __init__(
         self,
@@ -275,6 +276,7 @@ class TokenProvider:
         self._env = TokenRecord(env_token, None, None, None, "env") if env_token else None
         self._clock = clock
         self.rejections: Rejections = rejections if rejections is not None else MemoryRejections()
+        self.on_rejected: Callable[[str], object] | None = None  # told when Kite rejects the token in use (reject())
 
     def keep_rejections_in(self, rejections: Rejections) -> None:
         """Keep the marks in `rejections` from now on (the event store's, so a restart remembers them); the marks held
@@ -298,9 +300,22 @@ class TokenProvider:
             return None
         return record
 
-    def reject(self, access_token: str) -> None:
-        """Kite said TokenException for this token: stop using it until a different token appears."""
+    def reject(self, access_token: str, *, report: bool = False) -> None:
+        """Kite said TokenException for this token: stop using it until a different token appears. With `report`
+        (KiteClient.request, for a call that is not a session call) the listener `on_rejected` hears of it too, when the
+        token is the one in use (the environment's or the file's): the event service then raises token_rejected
+        whichever call met the rejection first. A logout and the end of another account's refused session never
+        report. A listener that fails is logged, never raised."""
         self.rejections.add(token_fingerprint(access_token))
+        if not report or self.on_rejected is None:
+            return
+        record = self._env or self.file.read()
+        if record is None or record.access_token != access_token:
+            return
+        try:
+            self.on_rejected(access_token)
+        except Exception as exc:
+            log.warning("could not report a rejected token to the order events (%s)", type(exc).__name__)
 
     def accept(self, access_token: str) -> None:
         self.rejections.discard(token_fingerprint(access_token))
