@@ -14,9 +14,10 @@ The order events follow the orders of one Kite account: the account whose token 
 
 - **Postbacks are a doorbell.** When Kite posts an order update to the server, the server checks it, then reads that
   order back from Kite and records what Kite answered. The postback itself is never stored.
-- **The order-book poll is the backup.** Every minute during market hours the server reads the day's order book. That
-  catches a postback that never arrived, and it is the only source for orders placed outside this API key: on Kite's
-  web site or app, by another program, or by a GTT.
+- **The order-book poll is the backup.** Every minute from 09:00 to 16:00 IST on weekdays, by default, the server
+  reads the day's order book. That catches a postback that never arrived, and it is the only source for orders placed
+  outside this API key: on Kite's web site or app, or by another program. That includes an order a GTT placed, if Kite
+  sent no postback for it.
 - **One durable store.** Every event is written to a SQLite file before anything else happens, so a restart loses
   nothing.
 - **A router hands each event to the commands you configure** (the consumers). A command reads the event as JSON on
@@ -104,7 +105,8 @@ the route logs nothing from any request (no order id, no checksum, no user).
 A postback that passes every check is answered:
 
 - **200** once its doorbell is on disk: the order id is kept in the store and counted in `postback_accepted`;
-- **503** when the store cannot write: nothing is kept, the log says so, and the poll catches the change later;
+- **503** when the store cannot write: nothing is written to the store, the log says so, and the poll catches the
+  change later;
 - **200 without a write** when it repeats, byte for byte, a postback accepted in the last 10 seconds (Kite sending it
   twice, or a replay): its doorbell has rung already.
 
@@ -112,7 +114,8 @@ A worker then reads each waiting doorbell's order from Kite (`GET /orders/{order
 history, and records Kite's answer, with `postback` as its source, if it reports a change (see [Events](#events)).
 
 - **No token.** Without a valid token nothing is read, and the doorbells wait. The poll that a login starts reads them
-  first, so a fill that happened before your morning login (a GTT, say) is reported right after it.
+  first, so a fill that happened before your morning login (of an AMO placed through this API key, say) is reported
+  right after it.
 - **An order Kite does not know.** Kite answers 404 `GeneralException` "Couldn't find that `order_id`." (or an empty
   history), for instance to a replay of an old postback. The doorbell is dropped and counted in
   `doorbell_unknown_order`.
@@ -146,8 +149,8 @@ It runs:
 - after the window closes on a poll day, every interval until one poll succeeds. Kite's order book holds only today's
   orders, so this is the last chance to see the day's final statuses.
 
-It catches a postback that was lost, refused or never sent, a stretch when the service was down (on the same day),
-orders placed on Kite's web site or app or by another program, and orders that a GTT placed.
+It catches a postback that was lost, refused or never sent (an order a GTT placed may get none), a stretch when the
+service was down (on the same day), and orders placed on Kite's web site or app or by another program.
 
 - **The first poll ever is a silent baseline.** It records the state of every order in the book and tells nobody, so
   turning the events on in the middle of a day does not replay the day. Every change after it is an event.
@@ -160,8 +163,14 @@ orders placed on Kite's web site or app or by another program, and orders that a
   `after_close`.
 
 The poll does not run after the window, so a change later in the evening reaches the events only by its postback,
-which only orders placed with this API key have. If you trade on MCX in the evening, widen the window, for example
-`KITE_MCP_ORDER_POLL_WINDOW=09:00-23:45`.
+which only orders placed with this API key have. And a window that ends before a market closes runs its after-close
+poll before that close: the poll succeeds, so `events status` shows no warning, yet the final statuses after it are
+never seen. End the window after the last close you trade in:
+
+- currency derivatives trade until 17:00: for example `KITE_MCP_ORDER_POLL_WINDOW=09:00-17:15`;
+- MCX trades until 23:30, or 23:55 while the US is on standard time (roughly November to March): use
+  `KITE_MCP_ORDER_POLL_WINDOW=09:00-23:59`, the latest end the setting takes. The after-close poll then has the day's
+  last minute; if it fails, `events status` warns.
 
 ## Events
 
@@ -320,8 +329,9 @@ A delivery that failed:
 
 - `router` is `delivery_delayed` (still retrying past the consumer's alert point; its text reads "Delivery to webhook
   is delayed and still retrying: ...") or `delivery_failed` (given up, or a permanent failure).
-- `about_seq` and `about_event_id` name the event whose delivery is late or failed; `error` is the last error, made
-  from the end of the command's stderr (see [What a command gets](#what-a-command-gets)), at most 200 characters.
+- `about_seq` and `about_event_id` name the event whose delivery is late or failed; `error` is the last error, at
+  most 200 characters: the router's reason (a timeout, a command that cannot start or fails the ownership check), or
+  the exit status and the end of the command's stderr (see [What a command gets](#what-a-command-gets)).
 - A router event never goes to the consumer it is about, and nothing is raised about a router event itself, so two
   failing consumers cannot report each other's failures for ever.
 
@@ -360,9 +370,10 @@ The file named by `KITE_MCP_EVENTS_CONSUMERS_FILE` is JSON, in UTF-8. A full exa
       "env_pass": ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
     },
     {
-      "name": "journal",
-      "command": ["/usr/local/bin/order-journal", "--quiet"],
-      "match": {"kinds": ["order"], "statuses": ["COMPLETE"], "tags": ["mytag"], "sources": ["postback", "poll"]}
+      "name": "webhook",
+      "command": ["/opt/kite-connect-mcp/examples/consumers/webhook.sh"],
+      "match": {"kinds": ["order"], "statuses": ["COMPLETE"], "tags": ["mytag"], "sources": ["postback", "poll"]},
+      "env_pass": ["WEBHOOK_URL"]
     }
   ]
 }
@@ -531,9 +542,12 @@ configured API secret, which it reads from the configuration itself and never pr
   without it answers a selftest 404, so there would be nothing to test.
 - With `--url https://kite.example.com/postback` it tests the whole way a postback travels: DNS, TLS, the proxy, the
   route, the checksum and the store's write. Use the URL registered in the developer console.
-- It prints `selftest: POST <url> -> HTTP 200` and exits 0 on a 200, else 1 with a hint: 403, the server has another
-  API secret; 404, no postback route there, or the event service is off there; 503, the server's store cannot write; a
-  redirect, give the final URL.
+- Every run needs the API secret, and without `--url` it also needs `KITE_MCP_POSTBACK_PATH`; it refuses to run
+  without them.
+- It prints `selftest: POST <url> -> HTTP 200` and exits 0 on a 200; 1 on another answer or when the URL cannot be
+  reached; 2 when it refuses to run. Another answer comes with a hint: 403, the server has another API secret; 404, no
+  postback route there, or the event service is off there; 503, the server's store cannot write; a redirect, give the
+  final URL.
 - A 200 means the selftest was stored, as a `selftest` event (counted in `selftest_received`), and the consumers that
   list `selftest` get it. Whether they did is for you to see: `events tail`, `events status`, or the consumer's own
   output (the Telegram example marks it `[test]`).
@@ -547,12 +561,13 @@ The `events` toolset has two read-only tools. They read a local file: they never
 | Tool | What it returns |
 |---|---|
 | `get_order_events` | Events, oldest first, and `last_seq`, the seq of the newest event stored. `order_id` keeps one order's events; `limit` is from 1 to 200 (20 by default). With `after_seq` 0 it returns the newest; to page forward, pass the last event's seq as `after_seq` until a page ends at `last_seq` or comes back empty. |
-| `get_event_status` | The same as `events status`. |
+| `get_event_status` | The same as `events status` (in a reader process, without the poll section, the warning and `configured_consumers`; see below). |
 
 In the serving process they read its store. Any other MCP process (a stdio client on the same machine, say) can read
 the same store read-only by naming it in `KITE_MCP_EVENTS_DB`; it must run as a user that can read the file. Such a
-reader leaves out the poll's settings and the warning (`"poll": "see the serving process's status"`), because those
-come from the serving process. Without a store both tools are hidden, and `kite-connect-mcp tools` says why.
+reader leaves out the poll's settings and the warning (`"poll": "see the serving process's status"`), and
+`configured_consumers`, because those come from the serving process. Without a store both tools are hidden, and
+`kite-connect-mcp tools` says why.
 
 ### What `events status` shows
 

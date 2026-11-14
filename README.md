@@ -118,8 +118,9 @@ notification on your phone, a trading journal, an automation.
 
 - **Postbacks are a doorbell.** A verified postback makes the server read the order back from Kite, and it records
   Kite's answer, never the postback.
-- **A poll of the order book**, every minute in market hours, catches a lost postback and the orders placed outside
-  your API key (on Kite's web site or app, or by a GTT).
+- **A poll of the order book**, every minute from 09:00 to 16:00 IST on weekdays by default, catches a lost postback
+  and the orders placed outside your API key (on Kite's web site or app, or by another program; a GTT's order too, if
+  Kite sends no postback for it).
 - **Each event is stored** in SQLite, then delivered to your commands as JSON on standard input, with retries.
   `get_order_events` and `get_event_status` read the store; `kite-connect-mcp events status` shows its health.
 - **It only reads.** Nothing in it can place, modify or cancel an order.

@@ -647,11 +647,13 @@ KITE_TOKEN_FILE=/var/lib/other-program/kite_token.json
 | `/var/lib/kite-connect-mcp/audit/` (Docker: `state/audit/` in the volume) | **Yes.** It is your record of every order attempt, and the daily caps are computed from today's file. |
 | `/var/lib/kite-connect-mcp/access_token.json` | No. It expires daily. If you must, encrypt the backup: it is a live credential until 06:00 IST. |
 | `/var/lib/kite-connect-mcp/KILL_SWITCH` | No. It is a flag; recreate it if you need it. |
+| `/var/lib/kite-connect-mcp/events.sqlite3` (Docker: `state/events.sqlite3` in the volume), with the order events on | Optional: it holds the recorded events and the pending deliveries. Not with `tar` or `cp` while the service runs: the file and its `-wal` and `-shm` files are copied at different moments, so the copy can come back corrupt, and a store that cannot be opened stops the server. Copy it with `sqlite3 /var/lib/kite-connect-mcp/events.sqlite3 ".backup /path/to/copy.sqlite3"` (as the service user), or with the service stopped, or leave it out: the next start creates an empty one. |
 | `/var/cache/kite-connect-mcp/` | No. It is rebuilt. |
 | `/etc/kite-connect-mcp/` | Keep a copy of the settings file somewhere private (a password manager is fine). Never put the secrets in a repository, a ticket or a chat. You can generate a new bearer token at any time. |
 
 ```bash
-sudo tar --exclude=access_token.json -czf kite-connect-mcp-state.tgz -C /var/lib kite-connect-mcp
+sudo tar --exclude=access_token.json --exclude='events.sqlite3*' \
+    -czf kite-connect-mcp-state.tgz -C /var/lib kite-connect-mcp
 ```
 
 The server never deletes audit files. Archive old days yourself, but leave today's file in place: deleting it resets
