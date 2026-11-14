@@ -31,7 +31,7 @@ def main() -> int:
             "telegram_notify: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID (and list them in env_pass)", file=sys.stderr
         )
         return 1
-    event = json.load(sys.stdin)
+    event = json.load(sys.stdin.buffer)  # the event is UTF-8 whatever the locale (LANG) says
     text = str(event.get("text") or "")
     if not text:
         return 0  # nothing to say

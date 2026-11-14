@@ -12,7 +12,8 @@ says by its exit code whether it is done. These examples are starting points; co
 | [events.consumers.json](events.consumers.json) | A sample consumers file: the Telegram and log consumers, and a label for the tag `mytag` | |
 
 The Telegram example sends only the event's `text`, which never holds an order id, an account or a link. The other two
-pass on the whole event, order id included.
+pass on the whole event, order id included. The log example reads its whole file at every delivery to skip the events
+it has written, so each delivery takes longer as the file grows: move the file aside now and then.
 
 ## The contract in short
 
