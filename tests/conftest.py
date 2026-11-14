@@ -228,14 +228,27 @@ def runtime_factory(fake_kite: FakeKite, settings_factory: Callable[..., Setting
         return rt
 
     yield make
-    # the store and lock of an event service (KITE_MCP_EVENTS=true), also when a test failed before stop(), and what
-    # the tool modules opened (the events tools' read-only store), which only aclose() closes otherwise
-    for rt in created:
+    close_runtimes(created)
+
+
+def close_runtimes(runtimes: list[Any]) -> None:
+    """runtime_factory's teardown: the store and lock of an event service (KITE_MCP_EVENTS=true), also when a test
+    failed before stop(), and what the tool modules opened (the events tools' read-only store), which only aclose()
+    closes otherwise. Like aclose(): the closers newest first, each on its own, so one that fails skips nothing; then
+    the first error is raised, so a teardown that failed is not silent."""
+    errors: list[Exception] = []
+    for rt in runtimes:
+        steps: list[Callable[[], None]] = []
         if rt.events is not None:
-            rt.events.store.close()
-            rt.events._release_lock()
-        for close in rt.closers:
-            close()
+            steps += [rt.events.store.close, rt.events._release_lock]
+        steps += reversed(rt.closers)
+        for step in steps:
+            try:
+                step()
+            except Exception as exc:
+                errors.append(exc)
+    if errors:
+        raise errors[0]
 
 
 @pytest.fixture

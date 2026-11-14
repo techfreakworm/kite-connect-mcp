@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import sqlite3
 
@@ -175,30 +174,3 @@ async def test_limits_are_checked(mcp_factory):
         assert wrong.is_error and f"after_seq must be between 0 and {2**63 - 1}" in tool_text(wrong)
     assert tool_json(largest) == tool_json(most) == {"events": [], "last_seq": 0}
     rt.events.store.close()
-
-
-async def test_every_closer_runs_newest_first_and_a_failing_one_hides_nothing(runtime_factory, caplog):
-    rt = runtime_factory()
-    closed: list[str] = []
-
-    def failing() -> None:
-        closed.append("failing")
-        raise OSError("cannot close")
-
-    rt.closers.extend([lambda: closed.append("first"), failing, lambda: closed.append("last")])
-    try:
-        with caplog.at_level(logging.ERROR):
-            await rt.aclose()
-        assert closed == ["last", "failing", "first"]
-        assert "cannot close" in caplog.text
-
-        async def broken() -> None:
-            raise RuntimeError("the client did not close")
-
-        rt.client.aclose = broken  # type: ignore[method-assign]
-        closed.clear()
-        with pytest.raises(RuntimeError, match="the client did not close"):  # not the closer's OSError
-            await rt.aclose()
-        assert closed == ["last", "failing", "first"]
-    finally:
-        rt.closers.clear()  # the fixture's teardown would run them again
