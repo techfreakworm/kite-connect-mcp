@@ -22,7 +22,8 @@ pass on the whole event, order id included.
 - Exit 0 when the event is handled, 75 when it should be retried later; any other exit is a permanent failure.
 - Deliveries are at least once, so the same event can arrive twice: be idempotent on `event_id`.
 - Whatever the program prints to stderr ends up, cleaned and clipped, in the server's log, in `events status` and in
-  the other consumers' `delivery_failed` events: never print a secret there.
+  the other consumers' `delivery_failed` events: never print a secret there. An HTTP client's error can quote the
+  URL, token and all, so catch its errors and print a message of your own, as the examples do.
 
 The whole contract, with the retry schedule and the timeouts, is in [docs/EVENTS.md](../docs/EVENTS.md).
 

@@ -109,6 +109,23 @@ def test_telegram_unreachable_is_temporary():
     assert run(TG, EVENT, {**TG_ENV, "TELEGRAM_API_BASE": "http://127.0.0.1:9"}).returncode == 75
 
 
+@pytest.mark.parametrize(
+    ("base", "bot"),
+    [
+        ("127.0.0.1", BOT),  # no scheme: urllib's error would quote the whole URL, token and all
+        (None, "123456:ABC placeholder"),  # a space: http.client's error would quote the path, token and all
+    ],
+)
+def test_telegram_never_prints_the_token(telegram, base, bot):
+    url, fake = telegram
+    result = run(TG, EVENT, {**TG_ENV, "TELEGRAM_BOT_TOKEN": bot, "TELEGRAM_API_BASE": base or url})
+    assert result.returncode == 1  # a setting that cannot work: no retry
+    printed = result.stdout + result.stderr
+    assert bot.encode() not in printed and b"ABC" not in printed and b"Traceback" not in printed
+    assert result.stderr.startswith(b"telegram_notify: ") and result.stderr.count(b"\n") == 1
+    assert fake.received == []
+
+
 def test_log_to_file_appends_once_per_event(tmp_path):
     log = tmp_path / "events.jsonl"
     program = [sys.executable, str(EXAMPLES / "consumers" / "log_to_file.py")]
@@ -119,6 +136,19 @@ def test_log_to_file_appends_once_per_event(tmp_path):
     assert stat.S_IMODE(log.stat().st_mode) == 0o600  # the events are private, as the store is
 
 
+def test_log_to_file_skips_a_corrupt_line(tmp_path):
+    log = tmp_path / "events.jsonl"
+    # a line edited by hand, then one cut short by a crash: mid-character and without its newline
+    log.write_bytes(b'not json\n{"event_id": "cut-short", "text": "\xe2\x82')
+    program = [sys.executable, str(EXAMPLES / "consumers" / "log_to_file.py")]
+    for _ in range(2):  # neither line fails the delivery, and the event is still written once
+        result = run(program, EVENT, {"EVENT_LOG_FILE": str(log)})
+        assert result.returncode == 0, result.stderr
+    lines = log.read_bytes().split(b"\n")
+    assert lines[:2] == [b"not json", b'{"event_id": "cut-short", "text": "\xe2\x82']  # left as they were
+    assert [json.loads(line)["event_id"] for line in lines[2:] if line] == [EVENT["event_id"]]  # on a line of its own
+
+
 @pytest.mark.skipif(shutil.which("curl") is None, reason="curl is not installed")
 def test_webhook_posts_the_event(telegram):
     base, fake = telegram
@@ -127,6 +157,17 @@ def test_webhook_posts_the_event(telegram):
     assert fake.received[0]["path"] == "/hook" and fake.received[0]["body"]["event_id"] == EVENT["event_id"]
     fake.status = 503
     assert run(WEBHOOK, EVENT, {"WEBHOOK_URL": f"{base}/hook"}).returncode == 75
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="curl is not installed")
+def test_webhook_never_prints_the_url_or_the_event():
+    # a webhook URL often is the secret, and curl's own messages name parts of it (its host), so none are printed
+    result = run(WEBHOOK, EVENT, {"WEBHOOK_URL": "http://127.0.0.1:9/hook/ABCD-placeholder"})
+    assert result.returncode == 75  # no answer: retry
+    printed = result.stdout + result.stderr
+    for part in (b"127.0.0.1", b"/hook", b"ABCD-placeholder", EVENT["event_id"].encode()):
+        assert part not in printed
+    assert result.stderr.startswith(b"webhook.sh: ") and result.stderr.count(b"\n") == 1
 
 
 def test_the_sample_consumers_file_is_valid(tmp_path):
