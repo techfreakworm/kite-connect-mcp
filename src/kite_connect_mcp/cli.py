@@ -299,8 +299,9 @@ def cmd_events(args: argparse.Namespace) -> int:
         store = _open_store(settings, readonly=True)
         try:
             if action == "status":
-                links = describe_links(settings, now_ist()) if settings.login_link_command is not None else None
-                health = describe_status(store, settings, now_ist(), names, links=links)
+                now = now_ist()  # one moment for the whole status
+                links = describe_links(settings, now) if settings.login_link_command is not None else None
+                health = describe_status(store, settings, now, names, links=links)
                 print(json.dumps(health, indent=2, default=str))
             else:
                 for event in store.events(order_id=args.order, limit=args.limit):

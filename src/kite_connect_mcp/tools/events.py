@@ -74,8 +74,8 @@ def register(reg: Registrar) -> None:
     async def get_event_status() -> Any:
         """The health of the order events: the last postback and how many were refused, the last poll and its error,
         doorbells waiting, each consumer's pending, delayed and failed deliveries, and paused consumers. Only the
-        serving process shows its poll settings, the after-close warning and the login links, when the server has a
-        link command."""
+        serving process shows its poll settings and the after-close warning, and (with a link command) the login
+        links."""
         if rt.events is None:  # a reader: the poll settings and the links that matter are the serving process's
             return describe_status(store, rt.settings, rt.clock(), with_poll=False)
         return describe_status(

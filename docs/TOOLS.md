@@ -50,7 +50,8 @@ token).
 Start the daily Kite login (managed auth mode): returns a one-time login link for the person to open.
 Show them the `warning` and the link. They log in at Kite themselves (user id, password, 2FA); never ask for
 their credentials and never try to log in for them. With deliver=true the link goes straight to the person
-through the server's link command (KITE_MCP_LOGIN_LINK_COMMAND) and you never see it.
+through the server's link command (KITE_MCP_LOGIN_LINK_COMMAND) and you never see it; show them the `warning`
+all the same.
 
 Kite then redirects to the app's registered redirect URL (`redirect_url`). This server completes the login
 when that redirect reaches it; if the redirect page cannot be reached, the person can copy the request_token
@@ -63,7 +64,7 @@ only explains and shows the status.
 | Argument | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `force` | boolean |  | `false` | issue a new link even though a valid token exists (the new login ends the old token); refused when the server turns forcing off (KITE_MCP_LOGIN_ALLOW_FORCE=false) |
-| `deliver` | boolean |  | `false` | send the link to the person through the server's login link command (KITE_MCP_LOGIN_LINK_COMMAND) instead of returning it: the answer then says only whether it was sent and when the link expires, never the link |
+| `deliver` | boolean |  | `false` | send the link to the person through the server's login link command (KITE_MCP_LOGIN_LINK_COMMAND) instead of returning it: the answer then holds the warning, whether it was sent and when the link expires, never the link |
 
 ### `complete_login`: Complete the Kite login by hand
 
@@ -1060,8 +1061,8 @@ order_id, the order's last event is seldom the store's last).
 
 The health of the order events: the last postback and how many were refused, the last poll and its error,
 doorbells waiting, each consumer's pending, delayed and failed deliveries, and paused consumers. Only the
-serving process shows its poll settings, the after-close warning and the login links, when the server has a
-link command.
+serving process shows its poll settings and the after-close warning, and (with a link command) the login
+links.
 
 ## safety
 

@@ -49,22 +49,42 @@ def safety_line(s: Settings) -> str:
     return f"trading_mode={s.trading_mode}, read_only={str(s.read_only).lower()}: {effect}"
 
 
-def _delivered(attempt: Attempt) -> dict[str, Any]:
-    """The answer of login(deliver=true): whether the link command took the link, and when the link expires. Never
-    the link: it went to the person, not to the model (an Attempt holds none)."""
-    expires = attempt.link_expires_at
+def _login_notes(settings: Settings, pin: AccountPin) -> list[str]:
+    """The notes of every login answer, a link returned or delivered: what would make the login change nothing, and
+    that any account would be accepted."""
+    notes = []
+    if settings.access_token:
+        notes.append("KITE_ACCESS_TOKEN is set and takes precedence over the token file; unset it for this login")
+    if not pin.pinned:
+        notes.append(
+            "no account pin is set (KITE_MCP_ALLOWED_USER_ID or KITE_MCP_ALLOWED_USER_ID_SHA256): any Kite "
+            "account that completes this login is accepted"
+        )
+    return notes
+
+
+def _delivery_answer(attempt: Attempt, notes: list[str]) -> dict[str, Any]:
+    """The answer of login(deliver=true): the AI-risk warning and the notes of every login, whether the link command
+    took the link, and when the link expires. Never the link: it went to the person, not to the model (an Attempt
+    holds none)."""
     out: dict[str, Any] = {
+        "warning": AI_RISK_WARNING,
         "delivered": attempt.outcome == "sent",
-        "expires_at": to_ist(expires).isoformat(timespec="seconds") if expires else None,
+        "expires_at": attempt.as_dict()["link_expires_at"],
     }
     if attempt.outcome == "sent":
         out["message"] = (
-            "The login link went to the person through the link command. They log in at Kite; this server completes "
-            "the login when Kite redirects to it. Then call session_status."
+            "Show the user the warning; the login link went to them through the link command. They log in at Kite; "
+            "this server completes the login when Kite redirects to it. Then call session_status."
         )
     else:
         out["error"] = attempt.error
-        out["message"] = "The link could not be sent. Call login with deliver=true again to retry."
+        out["message"] = (
+            "The link could not be sent (see error). Call login with deliver=true to retry, or call login without "
+            "deliver to get the link here."
+        )
+    if notes:
+        out["notes"] = notes
     return out
 
 
@@ -147,11 +167,18 @@ def _register_status_and_login(reg: Registrar) -> None:
         if check is not None:
             out["verify"] = check
         if not out.get("logged_in"):
-            out["next_step"] = (
-                "call login to get a Kite login link"
-                if managed
-                else "another program maintains the token file; wait for its next login (this server cannot log in)"
-            )
+            if not managed:
+                next_step = (
+                    "another program maintains the token file; wait for its next login (this server cannot log in)"
+                )
+            elif rt.links is not None:
+                next_step = (
+                    "call login to get a Kite login link, or login(deliver=true) to have the server's link command "
+                    "send it straight to the person"
+                )
+            else:
+                next_step = "call login to get a Kite login link"
+            out["next_step"] = next_step
         if managed and settings.access_token:
             out["note"] = "KITE_ACCESS_TOKEN is set and takes precedence over the token file; unset it to use logins"
         if rt.links is not None:
@@ -171,15 +198,16 @@ def _register_status_and_login(reg: Registrar) -> None:
             bool,
             Field(
                 description="send the link to the person through the server's login link command "
-                "(KITE_MCP_LOGIN_LINK_COMMAND) instead of returning it: the answer then says only whether it was sent "
-                "and when the link expires, never the link"
+                "(KITE_MCP_LOGIN_LINK_COMMAND) instead of returning it: the answer then holds the warning, whether it "
+                "was sent and when the link expires, never the link"
             ),
         ] = False,
     ) -> Any:
         """Start the daily Kite login (managed auth mode): returns a one-time login link for the person to open.
         Show them the `warning` and the link. They log in at Kite themselves (user id, password, 2FA); never ask for
         their credentials and never try to log in for them. With deliver=true the link goes straight to the person
-        through the server's link command (KITE_MCP_LOGIN_LINK_COMMAND) and you never see it.
+        through the server's link command (KITE_MCP_LOGIN_LINK_COMMAND) and you never see it; show them the `warning`
+        all the same.
 
         Kite then redirects to the app's registered redirect URL (`redirect_url`). This server completes the login
         when that redirect reaches it; if the redirect page cannot be reached, the person can copy the request_token
@@ -221,7 +249,7 @@ def _register_status_and_login(reg: Registrar) -> None:
             }
         if deliver:  # forcing off with a valid token: issue_link refuses (audited) and nothing is sent
             assert rt.links is not None  # checked above
-            return _delivered(await rt.links.send("requested"))
+            return _delivery_answer(await rt.links.send("requested"), _login_notes(settings, pin))
         manager = _manager(rt)
         url, expires_at = await manager.issue_link()  # refuses (audited) while forcing is off and the token is valid
         redirect = manager.redirect_url()
@@ -252,14 +280,7 @@ def _register_status_and_login(reg: Registrar) -> None:
                 "address bar (pasting the whole URL works too) and you call complete_login with it.",
             ],
         }
-        notes = []
-        if settings.access_token:
-            notes.append("KITE_ACCESS_TOKEN is set and takes precedence over the token file; unset it for this login")
-        if not pin.pinned:
-            notes.append(
-                "no account pin is set (KITE_MCP_ALLOWED_USER_ID or KITE_MCP_ALLOWED_USER_ID_SHA256): any Kite "
-                "account that completes this login is accepted"
-            )
+        notes = _login_notes(settings, pin)
         if notes:
             out["notes"] = notes
         return out
