@@ -18,6 +18,19 @@
 #
 # `--transport http` on the command line wins over KITE_MCP_TRANSPORT, so a settings file copied from .env.example
 # (which says "stdio") cannot switch the service into stdio mode.
+#
+# The daily login, in the settings file (all optional; docs/CONFIGURATION.md, docs/SELF_HOSTING.md
+# "The daily login on a server"):
+#   KITE_MCP_ALLOWED_USER_ID_SHA256=...
+#   KITE_MCP_ALLOW_LOGOUT=false
+#   KITE_MCP_LOGIN_ALLOW_FORCE=false
+#   KITE_MCP_LOGIN_REMINDER_TIMES=07:30,08:30
+#   KITE_MCP_LOGIN_LINK_COMMAND=/opt/kite-connect-mcp/bin/send-kite-link
+#   KITE_MCP_LOGIN_LINK_ENV_PASS=TELEGRAM_BOT_TOKEN,TELEGRAM_CHAT_ID
+# Put them in the settings file, not in Environment= lines here: the commands (kite-connect-mcp status, login and
+# logout, run by hand or by kite-connect-mcp-logout.service) read that file and not this unit, and the logout command
+# must see KITE_MCP_ALLOW_LOGOUT=false to refuse. Keep the link command under /opt, owned by root: ProtectHome=true
+# hides /home from the service.
 
 [Unit]
 Description=kite-connect-mcp (MCP server for the Zerodha Kite Connect API)

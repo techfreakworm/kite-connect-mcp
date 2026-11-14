@@ -199,10 +199,19 @@ result.
 4. Kite redirects the browser to your [redirect URL](#4-redirect-url) with a `request_token`.
 5. The server's `/callback` checks the `state`, then exchanges the `request_token` for an access token by calling
    `POST /session/token` with a checksum of `api_key + request_token + api_secret`.
-6. If you set `KITE_MCP_ALLOWED_USER_ID`, the server refuses a login from any other Kite account.
+6. If you set an account pin, the server refuses a login from any other Kite account (and ends the session it
+   opened). The pin is your user ID in `KITE_MCP_ALLOWED_USER_ID`, or its SHA-256 in
+   `KITE_MCP_ALLOWED_USER_ID_SHA256` (`printf %s AB1234 | sha256sum`), so the plain ID need not be in any file.
 7. The server stores the access token in its state directory with mode 600. Every client connected to the server now
    uses it, and the server picks it up again after a restart.
 8. The token stops working at about 06:00 IST the next morning, before the market opens. Repeat from step 1.
+
+**The link can come to you.** Step 1 can happen without you: give the server a link command
+(`KITE_MCP_LOGIN_LINK_COMMAND`, a program of yours that sends a message, say on Telegram) and reminder times
+(`KITE_MCP_LOGIN_REMINDER_TIMES=07:30,08:30`), and at those times (Monday to Friday by default, without the holidays
+you list), when no valid token is stored, it sends you a fresh link. With the order events on it also sends one when
+Kite rejects the stored token, and an assistant can ask for one with `login(deliver=true)`: the link then goes to
+you, never to the assistant. You still log in at Kite yourself. See [EVENTS.md](EVENTS.md#scheduled-login-links).
 
 **Facts that shape this**
 

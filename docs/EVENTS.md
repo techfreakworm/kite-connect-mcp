@@ -6,7 +6,8 @@ This page explains where the changes come from, what an event holds, how the eve
 and check it all. The feature is off by default.
 
 Contents: [What it does](#what-it-does) · [Turning it on](#turning-it-on) · [Sources](#sources) · [Events](#events) ·
-[Consumers](#consumers) · [Operating it](#operating-it) · [Security notes](#security-notes) · [Limits](#limits)
+[Consumers](#consumers) · [Operating it](#operating-it) · [Scheduled login links](#scheduled-login-links) ·
+[Security notes](#security-notes) · [Limits](#limits)
 
 ## What it does
 
@@ -69,8 +70,9 @@ To turn it on:
 4. **The reverse proxy.** Forward `POST /postback` to the server. The [Caddy](../deploy/caddy/Caddyfile.example) and
    [nginx](../deploy/nginx/kite-connect-mcp.conf.example) samples have that route, with a cap on the request body of
    64 KiB, the server's own cap.
-5. **The account pin.** Set `KITE_MCP_ALLOWED_USER_ID` to your user ID (for example `AB1234`): a postback for any other
-   account is then refused.
+5. **The account pin.** Set `KITE_MCP_ALLOWED_USER_ID` to your user ID (for example `AB1234`), or
+   `KITE_MCP_ALLOWED_USER_ID_SHA256` to its SHA-256 (see [CONFIGURATION.md](CONFIGURATION.md#session-and-token-store)):
+   a postback for any other account is then refused.
 6. **Check it.** Restart the server, send a selftest through the public URL and read the status (see
    [Operating it](#operating-it)): `kite-connect-mcp events selftest --url https://kite.example.com/postback`, then
    `kite-connect-mcp events status`.
@@ -95,7 +97,7 @@ order, and refuses it with a bare response (no body) at the first check that fai
 | The body is a JSON object | 400 | `body not a JSON object` |
 | The checksum matches (compared in constant time) | 403 | `bad checksum` |
 | The order id has an order id's form: 1 to 64 letters, digits, `_` or `-` | 400 | `bad order id` |
-| With `KITE_MCP_ALLOWED_USER_ID` set, the postback's `user_id` is that account (a signed selftest names no account, and is not held to it) | 403 | `another account` |
+| With an account pin set (`KITE_MCP_ALLOWED_USER_ID` or `KITE_MCP_ALLOWED_USER_ID_SHA256`), the postback's `user_id` is that account (a signed selftest names no account, and is not held to it) | 403 | `another account` |
 
 Refusals are counted in `postback_refused`, with the last one's reason as its note; a wrong API secret shows up there
 as `bad checksum`. They are written to the store at most once a second and logged at most once a minute per reason, so
@@ -168,7 +170,8 @@ service was down (on the same day), and orders placed on Kite's web site or app 
   turning the events on in the middle of a day does not replay the day. Every change after it is an event.
 - **No token:** the poll skips quietly, and runs at once when a token appears.
 - **A rejected token:** when Kite refuses the token, the server stops sending it, raises one `token_rejected` session
-  event for that token, and the poll waits for a new login.
+  event for that token (whichever call met the refusal first: the poll, a doorbell or a tool call), and the poll waits
+  for a new login.
 - **Failures** are counted in `poll_failed`, with the error as the note (or "an unexpected error: <type> (see the
   log)"). The log says when the polls start failing and when they work again, not once a minute.
 - Each poll that works is counted in `poll_ok`, with why it ran as the note: `startup`, `window`, `login` or
@@ -201,7 +204,7 @@ The store adds `seq`, a number that only goes up, when it reads an event back: c
 | `kind` | Raised when | `source` |
 |---|---|---|
 | `order` | an order changed | `postback` or `poll` |
-| `session` | Kite rejected the stored access token (`session` is `token_rejected`): once per token | `service` |
+| `session` | the day's login changed: a new token was stored (`session` is `login`), another account's login was refused (`login_refused`), a login on a link of this server's did not complete (`login_failed`), or Kite rejected the stored access token (`token_rejected`). See [Session events](#session-router-and-selftest-events) | `service` |
 | `router` | a delivery to a consumer is late (`delivery_delayed`) or has failed (`delivery_failed`) | `router` |
 | `selftest` | a signed selftest postback arrived (`kite-connect-mcp events selftest`) | `selftest` |
 
@@ -315,11 +318,56 @@ earlier state cannot be told from a real modification back to it, and is reporte
 
 ### Session, router and selftest events
 
+Session events follow the day's login. Their `session` field names what happened:
+
+| `session` | Raised when | Once per |
+|---|---|---|
+| `login` | A new token was stored: by this server's login callback or `complete_login`, or, in managed mode, by another process beside the serving one (such as `kite-connect-mcp login` run by hand), which the poll sees within seconds, on any day and at any hour. | token |
+| `login_refused` | A login by another Kite account was refused (the account pin), and the session it opened was ended, or ending it failed. | refused session |
+| `login_failed` | A real login on a link this server issued (its state was known, unexpired and unused) did not complete: Kite did not accept the exchange (`exchange_failed`), or the token could not be stored (`token_not_stored`). | link |
+| `token_rejected` | Kite rejected the stored access token, whichever call met the rejection first: the poll, a doorbell or a tool call. Never raised by a logout, nor for the session of another account that was refused. | token |
+
+A login, once per token, whoever stored it (the server's own report and the poll's are one event):
+
+```json
+{"kind": "session", "event_id": "5e33dd0116e6733635911bc9028d71e2", "source": "service", "received_at": "2026-11-16T07:35:03+05:30", "session": "login", "text": "Kite login completed: the session is valid until 06:00 IST tomorrow.", "logged_in_at": "2026-11-16T07:35:03+05:30", "expires_at": "2026-11-17T06:00:00+05:30", "seq": 38}
+```
+
+Another account's login, refused (the account pin), once per refused session:
+
+```json
+{"kind": "session", "event_id": "e04def03cee2752f711e2a6f4ecc0eaf", "source": "service", "received_at": "2026-11-16T07:34:41+05:30", "session": "login_refused", "text": "A Kite login by another account was refused, and the session it opened was ended.", "session_ended": true, "seq": 37}
+```
+
+When ending that session failed, the flag is false and the text reads "A Kite login by another account was refused;
+ending the session it opened failed, so it lapses at 06:00 IST."
+
+A login on a link of this server's that did not complete, once per link:
+
+```json
+{"kind": "session", "event_id": "7616bc64e2ce4f4a8b1729fbfe1aacc4", "source": "service", "received_at": "2026-11-16T07:33:12+05:30", "session": "login_failed", "text": "A Kite login did not complete: Kite did not accept the login. Tap the link again or ask for a new one.", "reason": "exchange_failed", "seq": 36}
+```
+
+`reason` is `exchange_failed` or `token_not_stored` (text: "A Kite login did not complete: the token could not be
+stored."), never Kite's own message. After a failed exchange the same link still works until it expires.
+
 A rejected token, once per token:
 
 ```json
 {"kind": "session", "event_id": "17559475683e3cbc60b4721bc8c413a7", "source": "service", "received_at": "2026-11-16T09:00:05+05:30", "session": "token_rejected", "text": "Kite rejected the stored access token: log in again to resume the order events.", "seq": 40}
 ```
+
+- **Once.** Each session event's id comes from what it is about (a fingerprint of the token, or a digest of the
+  link's state, never the thing itself), so a second report of the same login, refusal, failure or rejection stores
+  nothing new.
+- **The poll's `login`** is managed mode only. The token in use when the service starts is not a login, so a restart
+  raises none, and nor does a login made while the service was down.
+- **The callback's noise never becomes an event.** A malformed redirect, an unknown, expired, used or replayed state,
+  rate limiting, probes and an error in the route stay a throttled line in the audit log. A request token pasted
+  without a state (`complete_login` without one) that fails raises nothing either: whoever pasted it sees the answer.
+- **Never in a session event:** a user id, an access or request token, a state, a login link, or Kite's message text.
+- **A consumer that takes the `session` kind gets every session event.** `match` has no filter by session name: a
+  consumer that wants only some reads `session` and exits 0 for the names it does not want.
 
 A delivery that failed:
 
@@ -353,8 +401,9 @@ A selftest (its order id is `selftest-` and 12 random hexadecimal digits; it nev
 {"kind": "selftest", "event_id": "3b949ae9b610e992bfa59fb467eed46b", "source": "selftest", "received_at": "2026-11-16T08:30:00+05:30", "order_id": "selftest-0a1b2c3d4e5f", "text": "Self-test postback received and verified: the postback path works.", "seq": 39}
 ```
 
-The server never puts an access token, a request token, a login link, a user id or a checksum in an event. The one
-field that carries text from outside is a router event's `error`: the end of a consumer's standard error.
+The server never puts an access token, a request token, a login state, a login link, a user id or a checksum in an
+event. The one field that carries text from outside is a router event's `error`: the end of a consumer's standard
+error.
 
 ## Consumers
 
@@ -423,7 +472,9 @@ server starts: restart it after a change.
 
 - A consumer without `match` gets every order event, and only order events. Session, router and selftest events
   reach only the consumers that list those kinds.
-- The other keys filter order events only, so a consumer that gives one must list `order` among its kinds.
+- The other keys filter order events only, so a consumer that gives one must list `order` among its kinds. There is no
+  key for session names: a consumer that lists `session` gets `login`, `login_refused`, `login_failed` and
+  `token_rejected`, and ignores the names it does not want (exit 0).
 - An event matches when it matches every key given; within a key, any value listed matches. A list must not be empty:
   leave the key out to match anything. `statuses` and `transaction_types` are read in any case.
 - To hear about every final outcome, list `seen_final` with `filled`, `cancelled` and `rejected`: an order seen for the
@@ -575,7 +626,7 @@ The `events` toolset has two read-only tools. They read a local file: they never
 | Tool | What it returns |
 |---|---|
 | `get_order_events` | Events, oldest first, and `last_seq`, the seq of the newest event stored. `order_id` keeps one order's events; `limit` is from 1 to 200 (20 by default). With `after_seq` 0 it returns the newest; to page forward, pass the last event's seq as `after_seq` until a page ends at `last_seq` or comes back empty. |
-| `get_event_status` | The same as `events status` (in a reader process, without the poll section, the warning and `configured_consumers`; see below). |
+| `get_event_status` | The same as `events status` (in a reader process, without the poll section, the warning, `configured_consumers` and `login_links`; see below). |
 
 In the serving process they read its store. Any other MCP process (a stdio client on the same machine, say) can read
 the same store read-only by naming it in `KITE_MCP_EVENTS_DB`; it must run as a user that can read the file. Such a
@@ -620,8 +671,9 @@ reader leaves out the poll's settings and the warning (`"poll": "see the serving
 | `store`, `configured_consumers` | The store's path; the names in the consumers file. |
 | `poll` | The poll's interval, window and days (0 is Monday, 6 Sunday), and whether it is inside the window now. These come from the settings of the process that runs the command, so give it the server's poll settings. |
 | `warning` | Present while no poll has succeeded after the latest close of the poll window, and names that day: "no successful poll after the close on Fri 2026-11-13: fills after the last poll may be missing". A missed Friday stays visible over the weekend, until Monday's close is polled. |
+| `login_links` | Present with a link command (`KITE_MCP_LOGIN_LINK_COMMAND`): the [scheduled login links](#scheduled-login-links)' times and days, the next time, the last time handled (`last_scheduled_for`) and the last attempt. Like `poll`, it comes from the settings of the process that runs the command, and the state folder it names. |
 
-It holds no event and no order id.
+It holds no event, no order id and no login link.
 
 ### Retention
 
@@ -641,6 +693,127 @@ states not updated since, and doorbells older than two days.
   the same store fails to start: "another process is already serving order events from ...".
 - The service starts with the HTTP server. If it cannot start (a bad consumers file, the lock, a store it cannot
   open), the server stops instead of running without it.
+
+## Scheduled login links
+
+You log in to Kite yourself every day; these links bring the login to you. At the times you set, when no valid token
+is stored, the server issues a login link and hands it to one program of yours, the link command, which sends it to
+you: a Telegram message, an e-mail, a push notification. You tap it, log in at Kite, and Kite's redirect brings the
+new token back to the server. The links work with the order events on or off; only the link after a rejected token
+needs them. [examples/README.md](../examples/README.md#a-login-link-command) has a link command for Telegram.
+
+### Settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `KITE_MCP_LOGIN_REMINDER_TIMES` | unset | The times, in IST: `HH:MM`, comma-separated, such as `07:30,08:30`. Needs a link command. |
+| `KITE_MCP_LOGIN_REMINDER_DAYS` | `Mon-Fri` | The days, written as `KITE_MCP_ORDER_POLL_DAYS` is. |
+| `KITE_MCP_LOGIN_REMINDER_SKIP_DATES_FILE` | unset | A file of dates with no scheduled link, such as exchange holidays (below). |
+| `KITE_MCP_LOGIN_LINK_COMMAND` | unset | The link command: the absolute path of one executable, run with no arguments. |
+| `KITE_MCP_LOGIN_LINK_ENV_PASS` | empty | Names of the server's environment variables the command gets, such as `TELEGRAM_BOT_TOKEN,TELEGRAM_CHAT_ID`. Never a `KITE_*` name. |
+| `KITE_MCP_LOGIN_LINK_TIMEOUT_S` | `30` | Seconds the command may run, from 1 to 600. |
+
+Times or a command need `KITE_MCP_AUTH_MODE=managed` and `KITE_MCP_PUBLIC_URL`, since a link is of use only when
+Kite's redirect reaches this server's callback (checked with the other settings), and the HTTP transport (checked when
+`serve` starts: the server does not start without it). A command without times sends only the links after a rejected
+token and the ones asked for. Put these settings in the settings file that the commands read too, so that
+`kite-connect-mcp status` shows the links. The full rules: [CONFIGURATION.md](CONFIGURATION.md#scheduled-login-links).
+
+```bash
+KITE_MCP_LOGIN_REMINDER_TIMES=07:30,08:30
+KITE_MCP_LOGIN_REMINDER_SKIP_DATES_FILE=/etc/kite-connect-mcp/skip-dates.txt
+KITE_MCP_LOGIN_LINK_COMMAND=/usr/local/bin/send-kite-link
+KITE_MCP_LOGIN_LINK_ENV_PASS=TELEGRAM_BOT_TOKEN,TELEGRAM_CHAT_ID
+```
+
+**The skip-dates file** holds one `YYYY-MM-DD` per line; `#` starts a comment, on a line of its own or after a date,
+and blank lines are fine. It must be a regular file of at most 64 KiB, in UTF-8 (a byte-order mark is fine). It is
+read again each time it is needed, so a new list takes effect without a restart. A file that is missing, unreadable,
+not a regular file or too large is a warning in the log and skips nothing, and so is a line that is not a date (the
+other dates still apply): a link on a holiday is better than none on a trading day.
+
+```
+# exchange holidays: no scheduled link on these days
+2026-12-25
+2027-01-26  # a comment after a date
+```
+
+### When a link goes out
+
+| `reason` | When |
+|---|---|
+| `scheduled` | At a reminder time, on a reminder day that is not a skip date, when no valid token is stored. With a valid token (not expired, and not rejected by Kite) nothing is sent, and the time is recorded as skipped. |
+| `token_rejected` | Right after the event service raised `token_rejected` (so only with `KITE_MCP_EVENTS=true`), when still no valid token is stored; at most one every two hours, counted from the last such attempt whatever its outcome, across a restart too. A rejection inside those two hours gets no link, then or later: the next scheduled time is the one. The days and the skip dates do not apply: a token was in use that day. A scheduled time due in the same check as such a link that went out is recorded as skipped: you just got one. |
+| `requested` | An agent called `login(deliver=true)`. The link goes to you, not to the agent: its answer says whether the link was sent (delivered), when it expires, the AI-risk warning and any notes, and on a failure the short error, never the link. As with every `login`, a valid token means no link unless force=true. |
+
+With `KITE_MCP_LOGIN_ALLOW_FORCE=false`, `login(deliver=true)` issues no link while a valid token exists either, even
+with force=true (the refusal is audited as `login_link_refused`).
+
+**A missed time is caught up, once.** The server checks at each reminder time and at least every 30 seconds. A time
+it missed, because it was down or the machine slept, is sent when it comes back if that is within 3 hours of the
+time: only the latest such time, once; older ones are dropped. Every scheduled attempt (sent, skipped or failed)
+records its time in the state file (`last_scheduled_for`), so neither the next check nor a restart sends that time
+again, and a time recorded as skipped because a valid token existed is never caught up later. A first start counts
+too. With the times `07:30,08:30` on a weekday with no valid token:
+
+- the server is down from 07:00 and comes back at 09:10: it sends the 08:30 link at once, and the 07:30 one never;
+- it comes back at 11:45 instead: it sends nothing, as 08:30 is more than 3 hours past; the next link is the next
+  reminder time;
+- it is stopped while the command runs: a command still running 10 seconds later is killed and nothing is recorded,
+  so a restart within the 3 hours sends that time again.
+
+A late link is logged as caught up. A failed link is not retried: the next scheduled time is the retry.
+
+### The link command
+
+| | |
+|---|---|
+| Program | `KITE_MCP_LOGIN_LINK_COMMAND`: one absolute path, no arguments and no whitespace, run without a shell. It must be an executable regular file that only the server's user or root can change, reached through folders and links only they can change, as for consumer programs ([File permissions](#file-permissions)). The server checks it when it starts (and does not start otherwise) and again before each run (that run then fails). |
+| Standard input | One JSON object, then a newline (below). |
+| Environment | `PATH`, `HOME` (when set), `LANG` and the variables named in `KITE_MCP_LOGIN_LINK_ENV_PASS` that are set. Never a `KITE_*` variable. |
+| Standard output and error | Discarded: nothing the command prints is kept, logged or shown. Run it by hand to see its messages. |
+| Exit | 0: sent. Anything else is a failed attempt with a short error: `exit 3`, `killed by SIGTERM`, `timed out after 30 s`, `cannot start the command: ...`. |
+| Timeout | `KITE_MCP_LOGIN_LINK_TIMEOUT_S` (30 seconds). Past it, the command and everything it started (its process group: it runs in a session of its own) are killed. |
+| Retries | None: the next scheduled time is the retry. |
+
+```json
+{"url": "https://kite.zerodha.com/connect/login?v=3&api_key=...", "expires_at": "2026-11-16T08:30:00+05:30", "reason": "scheduled"}
+```
+
+`url` is the login link; `expires_at` when it stops working (`KITE_MCP_LOGIN_LINK_TTL_S` after it was issued, and
+never past 05:59 IST); `reason` is `scheduled`, `token_rejected` or `requested`. Whoever holds the link can complete
+one login to your account with it until it expires: send it only to yourself, and never print or log it.
+
+### What is never stored or logged
+
+The link: it is never stored (the server keeps only a digest of its one-time state, as for every login link), never
+logged, and never put in an event, a status, an audit line, an error or the answer of `login(deliver=true)`. The
+command's output is discarded for the same reason. The audit log records each link issued (`login_link_issued`, with
+its source, `scheduled`, `token_rejected` or `tool`, and its expiry) and each refused (`login_link_refused`); the
+server's log has one line per attempt (sent, skipped or failed, with the short error).
+
+### The status and the state file
+
+With a link command, `session_status`, `kite-connect-mcp status`, `kite-connect-mcp events status` and, in the
+serving process, `get_event_status` show `login_links`:
+
+```json
+{"times": ["07:30", "08:30"], "days": [0, 1, 2, 3, 4], "next_at": "2026-11-16T07:30+05:30", "last_scheduled_for": "2026-11-13T08:30+05:30", "last": {"at": "2026-11-13T08:30:00+05:30", "reason": "scheduled", "outcome": "skipped", "error": null, "link_expires_at": null}}
+```
+
+| Field | Meaning |
+|---|---|
+| `times`, `days` | The reminder times (IST) and days (0 is Monday, 6 Sunday). |
+| `next_at` | The next reminder time on a reminder day that is not a skip date, within 31 days; null when there is none. |
+| `last_scheduled_for` | The last reminder time handled: sent, skipped or failed. |
+| `last` | The last attempt, whatever its reason: when (`at`), the `reason`, the `outcome` (`sent`; `skipped`, because a valid token existed or a link for a rejected token had just gone out; or `failed`), the short `error` of a failed one, and when its link expires (`link_expires_at`, for a link that was issued). |
+
+The state behind it is `<state dir>/login_links.json`, mode 600: the last attempt, the last time handled and when the
+last link after a rejected token was tried (where the two hours start). It never holds a link. A missing or damaged
+file reads as empty, and a time in it later than now is ignored. Beside it, `login_links.json.lock` is held while the
+server sends links: one serving process per state folder, as two would both send each time. A second server on the
+same `KITE_MCP_STATE_DIR` does not start ("another process is already sending login links from the state folder
+...").
 
 ## Security notes
 

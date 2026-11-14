@@ -251,6 +251,12 @@ nothing); `notional_inr` is the full value of its legs, kept for the record.
 The `call_id` ties a `live_intent` to its `live_result`, `live_error` or `live_unknown`. A `live_intent` with no outcome
 after a crash means the outcome is unknown: check the order book.
 
+The login and the logout write events of their own, each with its `source` (`tool`, `cli`, `callback`, or for a
+[scheduled link](EVENTS.md#scheduled-login-links) `scheduled` or `token_rejected`): `login_link_issued` (with the
+link's expiry, never the link), `login_link_refused` (forcing off and a valid token), `login_ok` (the account: its
+`user_id`, or with the hash pin its `user_id_sha256_prefix`), `login_refused` (a reason code), `logout_ok`,
+`logout_failed` and `logout_refused` (logout off).
+
 A live send, as it appears in the file (shortened):
 
 ```json
@@ -287,8 +293,37 @@ Read it with `kite-connect-mcp audit [--date YYYY-MM-DD] [--limit N]`, with the 
   server: writing or deleting it is refused, the token exchange and logout calls are blocked at the door, and the
   login and logout tools and commands refuse. The server cannot replace or end a session it does not own.
 - **A rejected token is dropped.** If Kite answers `TokenException`, the server stops using that token until a
-  different one appears.
-- **`KITE_MCP_ALLOWED_USER_ID`** makes managed login refuse any Kite account other than yours.
+  different one appears. It remembers the rejection by the token's fingerprint (its SHA-256, never the token): in
+  memory, or with the order events on, in the event store, so a restart does not forget it.
+- **The account pin.** `KITE_MCP_ALLOWED_USER_ID` makes managed login refuse any Kite account other than yours: the
+  session the other account just opened is ended at once (with that session's own token) and nothing is stored.
+  `KITE_MCP_ALLOWED_USER_ID_SHA256` is the same pin given as the SHA-256 of the user ID in upper case, so the plain ID
+  need not be in any file. Either way one check compares SHA-256 digests in constant time, for the login and for the
+  postback route. With the hash pin, the server's own words name the account by the first 12 hex digits of the digest
+  (`user_id_sha256_prefix`, or `sha256:f08b6edab3b2` in a sentence) where they gave its user ID: the audit log's
+  `login_ok` line, the answer of `complete_login`, `session_status` with verify=true, `kite-connect-mcp status --verify`
+  and the `login` command's output. Two limits, plainly: the digest keeps the ID out of plain sight, but it is not a
+  secret, since a user ID is short and its SHA-256 can be found by trying every ID; and Kite's own answers that the
+  read tools pass on, such as `get_profile` and an order's placed_by field, still hold the plain ID.
+- **Logout can be turned off.** With `KITE_MCP_ALLOW_LOGOUT=false` the `logout` tool is not offered and the logout
+  command refuses (exit 2, with a `logout_refused` audit line): nothing this server runs ends the stored session,
+  which lapses at 06:00 IST. Ending a refused account's fresh session is not a logout, and still happens.
+- **Forcing a new login can be turned off.** A login from a new link ends the token in use at Kite. With
+  `KITE_MCP_LOGIN_ALLOW_FORCE=false` no link is issued while a valid token exists (not expired, and not rejected by
+  Kite), whoever asks: the `login` tool even with force=true or deliver=true, and the `login` command. Each refusal is
+  audited (`login_link_refused`). The token then lives until 06:00 IST or until Kite rejects it; a rejection is
+  remembered as above, so with the events on a restart still knows the token is dead and a new link can be issued. An
+  agent asks Kite with `session_status` and verify=true; the `login` command asks Kite once itself (GET /user/profile,
+  read-only) before it refuses.
+- **A login link is a credential.** Whoever holds it can complete one Kite login with it until it expires
+  (`KITE_MCP_LOGIN_LINK_TTL_S`, and never past 05:59 IST). The server never stores it (only a digest of its one-time
+  state), never logs it and never puts it in an event, a status, an audit line or an error. The `login` tool returns it
+  to the client that asked, and the `login` command prints it on standard output. With deliver=true, and for the
+  [scheduled links](EVENTS.md#scheduled-login-links), it goes only to your link command
+  (`KITE_MCP_LOGIN_LINK_COMMAND`), on its standard input, and the agent learns whether it was sent, never the link.
+  The command's output is discarded. Like a consumer, the command runs as the server's user, outside this safety
+  layer, with a minimal environment (never a `KITE_*` variable), and the server refuses one that anyone but its user
+  or root could change.
 - **The HTTP endpoint** needs a bearer token of at least 32 characters (`/mcp` only), checks the `Host` and `Origin`
   headers, writes no access log, and serves unauthenticated HTTP only on loopback. See
   [SELF_HOSTING.md](SELF_HOSTING.md).
@@ -303,7 +338,8 @@ The optional [order events](EVENTS.md) (off by default, `KITE_MCP_EVENTS`) watch
 - **A postback is only a doorbell.** A postback with the right checksum makes the server read that order back from
   Kite, and what is recorded is Kite's answer, never the postback. Kite's checksum covers only the order id and its
   timestamp, so a replayed or altered postback costs one read and changes nothing. Without an API secret the route
-  refuses everything, and with `KITE_MCP_ALLOWED_USER_ID` set it refuses a postback for any other account.
+  refuses everything, and with an account pin set (`KITE_MCP_ALLOWED_USER_ID` or `KITE_MCP_ALLOWED_USER_ID_SHA256`)
+  it refuses a postback for any other account.
 - **Consumers run commands you configure,** as the server's user, with the event on standard input, no shell and a
   minimal environment (never a `KITE_*` variable). They run outside this safety layer: as that user a command could
   read the Kite token and call Kite itself, and the caps and allow-lists cover only what goes through this server's
@@ -402,8 +438,16 @@ KITE_MCP_MAX_QUANTITY=2
 KITE_MCP_TOOLSETS=session,account,orders,portfolio,market,safety
 KITE_MCP_EXCLUDED_TOOLS=modify_order
 KITE_MCP_ALLOWED_USER_ID=AB1234
+KITE_MCP_ALLOW_LOGOUT=false
+KITE_MCP_LOGIN_ALLOW_FORCE=false
 ```
 
+- Turn logout and forcing off, as above: the agent can then neither end the session nor replace a working one with a
+  login of its own. Give the server a link command
+  ([CONFIGURATION.md](CONFIGURATION.md#scheduled-login-links)) and have the agent ask with `login(deliver=true)`: the
+  link goes straight to you through your own channel, and the agent never holds it. `login` without deliver still
+  returns the link to the agent; to rule that out too, hide `login` (`KITE_MCP_EXCLUDED_TOOLS=modify_order,login`) and
+  let the same command send you the scheduled links, so the daily login needs no agent at all.
 - Keep the instrument list to the few symbols the agent really needs, and the caps to what you could lose without
   caring.
 - List only the toolsets the agent needs. A new write tool in a later version would otherwise be available to it.

@@ -13,6 +13,7 @@ default: dry-run trading, a ₹10,000 per-order cap, HTTP on the loopback addres
 - [Tools](#tools)
 - [WebSocket ticker](#websocket-ticker)
 - [Order events](#order-events)
+- [Scheduled login links](#scheduled-login-links)
 - [Logging](#logging)
 - [Other variables that matter](#other-variables-that-matter)
 - [Validation rules](#validation-rules)
@@ -38,8 +39,8 @@ default: dry-run trading, a ₹10,000 per-order cap, HTTP on the loopback addres
    - It must exist, be readable by the server's user, and hold exactly one value with no whitespace in it.
    - `~` in the path is expanded. A value given directly must not contain whitespace either.
 4. **Value types.**
-   - *Booleans:* `true`, `false`, `1`, `0`, `yes`, `no`, `on`, `off`, in any case. An **empty** value counts as
-     false, even for a setting whose default is true; delete the line to get the default.
+   - *Booleans:* `true`, `false`, `1`, `0`, `yes`, `no`, `on`, `off`, in any case. An **empty** value means the
+     default, so `KITE_MCP_ALLOW_LOGOUT=` leaves logout on: write `false` to turn a switch off.
    - *Integers:* whole numbers, with the minimum shown in the tables. An empty value means the default.
    - *Amounts (INR):* non-negative numbers; `10000`, `10,000`, `10_000` and `2500.50` all work.
    - *Choices:* case-insensitive, and `-` counts as `_` (`dry-run` is `dry_run`).
@@ -67,8 +68,16 @@ default: dry-run trading, a ₹10,000 per-order cap, HTTP on the loopback addres
 |---|---|---|---|
 | `KITE_MCP_AUTH_MODE` | `managed` | `managed`: this server owns the daily login (login link, callback, token file, optional logout). `external`: another program writes the token file; this server only reads it. | In `external` mode it never writes, deletes or logs out the token. See [KITE_SETUP.md](KITE_SETUP.md#7-the-daily-login). |
 | `KITE_TOKEN_FILE` | `<state dir>/access_token.json` | The token file. | JSON `{"access_token", "login_date", "logged_in_at", "expires_at"}` (ISO 8601 times with offsets), or a bare token. A bare token, or JSON without `expires_at`, expires at the first 06:00 IST after the file's time. Re-read whenever it changes. A warning is logged if group or others can read it. |
-| `KITE_MCP_ALLOWED_USER_ID` | unset | Refuse a login from any Kite account other than this user ID (for example `AB1234`). | Upper-cased. Recommended in managed mode. |
+| `KITE_MCP_ALLOWED_USER_ID` | unset | Refuse a login from any Kite account other than this user ID (for example `AB1234`). | Upper-cased. Recommended in managed mode (this pin, or the next one). |
+| `KITE_MCP_ALLOWED_USER_ID_SHA256` | unset | The same pin, given as the SHA-256 of the user ID, so the plain ID need not be in any file: 64 hexadecimal digits, the digest of the user ID in upper case, for example `printf %s AB1234 \| sha256sum`. | Any case; never echoed in an error. With both pins set they must name the same account. The server's own output (the audit log, the session tools, `status --verify`, the `login` command) then names the account by the first 12 digits of the digest instead of its user ID; Kite's answers that the read tools pass on (the profile, an order's placed_by) still hold the plain ID. The digest is not a secret: a user ID is short, and its digest can be found by trying every ID. See [SAFETY.md](SAFETY.md#14-sessions-credentials-and-external-mode). |
 | `KITE_MCP_LOGIN_LINK_TTL_S` | `3600` | How long a login link stays usable, in seconds. Integer, at least 60. | Capped at the next 06:00 IST token reset. |
+| `KITE_MCP_ALLOW_LOGOUT` | `true` | `false`: the `logout` tool is not offered, and the logout command refuses (exit 2, with a `logout_refused` audit line). | The stored session then lapses at 06:00 IST. Ending the fresh session of an account the pin refused is not a logout, and still happens. |
+| `KITE_MCP_LOGIN_ALLOW_FORCE` | `true` | `false`: no login link is issued while a valid token exists, whoever asks (the `login` tool, even with force=true and with deliver=true, and the `login` command), as a login from it would end that token at Kite. Each refusal is audited (`login_link_refused`). | Valid means: not expired, and not rejected by Kite. A rejection is remembered by the token's fingerprint, across a restart when the order events are on (in the event store), else until the server stops. An agent asks Kite with `session_status` and verify=true; the `login` command asks Kite once itself (GET /user/profile, read-only) and issues the link if Kite rejected the token. |
+
+These switches, the pins and the [scheduled login links](#scheduled-login-links) belong in the settings file that the
+commands read too (`--env-file`, or the `EnvironmentFile=` that `kite-mcp-ctl` reads on a server), not only in the
+service's own environment: the logout command must see `KITE_MCP_ALLOW_LOGOUT=false` to refuse, and `status` must see
+the link command to show the links.
 
 ## Local state
 
@@ -175,8 +184,35 @@ Off by default. What they are and how to run them: [EVENTS.md](EVENTS.md).
 | `KITE_MCP_EVENTS_KEEP_DAYS` | `30` | Days to keep events. Integer from 1 to 3650. | Older events are deleted with their deliveries. |
 
 The postback route is `KITE_MCP_POSTBACK_PATH` (under [Transport and HTTP](#transport-and-http)); without it the poll
-alone feeds the events. With `KITE_MCP_ALLOWED_USER_ID` set, a postback for any other account is refused, and
-`KITE_API_SECRET` is needed to check postbacks at all.
+alone feeds the events. With `KITE_MCP_ALLOWED_USER_ID` or `KITE_MCP_ALLOWED_USER_ID_SHA256` set, a postback for any
+other account is refused, and `KITE_API_SECRET` is needed to check postbacks at all.
+
+## Scheduled login links
+
+Off by default. At the times you set, when no valid token is stored, the server issues a login link and hands it to a
+program of yours, the link command, which sends it to you (a Telegram message, say); you tap it and log in at Kite.
+The command also gets a link after Kite rejects the stored token (with `KITE_MCP_EVENTS=true`; at most one every two
+hours) and when an agent calls `login` with deliver=true. When a link goes out, the catch-up of a missed time and the
+command's contract: [EVENTS.md](EVENTS.md#scheduled-login-links). An example command for Telegram:
+[examples/README.md](../examples/README.md#a-login-link-command).
+
+| Variable | Default | Meaning | Notes |
+|---|---|---|---|
+| `KITE_MCP_LOGIN_REMINDER_TIMES` | unset | The times of the scheduled links, in IST: `HH:MM`, comma-separated, for example `07:30,08:30`. | Sorted, repeats dropped. Needs `KITE_MCP_LOGIN_LINK_COMMAND`. A time when a valid token is stored sends nothing. |
+| `KITE_MCP_LOGIN_REMINDER_DAYS` | `Mon-Fri` | The days of the scheduled links. | The syntax of `KITE_MCP_ORDER_POLL_DAYS`: `Mon-Fri`, `mon,wed,fri`, `Tue` or `*`. |
+| `KITE_MCP_LOGIN_REMINDER_SKIP_DATES_FILE` | unset | A file of dates with no scheduled link (exchange holidays): one `YYYY-MM-DD` per line. | `#` starts a comment; blank lines are fine. A regular file of at most 64 KiB, UTF-8 with or without a byte-order mark. Read again at each use, so a new list needs no restart. A file that cannot be read, or a line that is not a date, is a warning in the log and skips nothing (the other dates still apply). `~` is expanded. |
+| `KITE_MCP_LOGIN_LINK_COMMAND` | unset | The link command: the absolute path of one executable program, run with no arguments. | No arguments and no whitespace: wrap arguments in a script. It must be a regular file owned by the server's user or root and writable by no one else, and so must the folders on the way to it; checked when the server starts and before each run. |
+| `KITE_MCP_LOGIN_LINK_ENV_PASS` | empty | Names of environment variables to pass to the command, comma-separated, for example `TELEGRAM_BOT_TOKEN,TELEGRAM_CHAT_ID`. | The command gets only `PATH`, `HOME`, `LANG` and these. A `KITE_*` name is refused: the command never gets the server's settings. |
+| `KITE_MCP_LOGIN_LINK_TIMEOUT_S` | `30` | How long the command may run, in seconds. Integer from 1 to 600. | Past it, the command and whatever it started are killed, and the link counts as not sent. |
+
+Times or a command need `KITE_MCP_AUTH_MODE=managed` and `KITE_MCP_PUBLIC_URL` (a link is of use only when Kite's
+redirect reaches this server's callback); `check-config` checks that. They also need the HTTP transport: that is
+checked when `serve` starts, since the systemd sample gives the transport on the command line and the other commands
+read the same settings without it. One serving process sends the links of a state folder: a second one on the same
+`KITE_MCP_STATE_DIR` does not start. With a command set, `session_status`, `kite-connect-mcp status`,
+`kite-connect-mcp events status` and, in the serving process, `get_event_status` show `login_links`: the times, the
+next one, the last time handled and how the last link went. It is kept in `<state dir>/login_links.json` (mode 600),
+which never holds a link.
 
 ## Logging
 
@@ -215,11 +251,24 @@ The server checks these at start-up and when you run `check-config`. Each failur
 | The log level is known | `KITE_MCP_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR or CRITICAL` |
 | Order events need the HTTP transport | `KITE_MCP_EVENTS=true needs KITE_MCP_TRANSPORT=http` |
 | The poll window is `HH:MM-HH:MM`, the start before the end | `must look like 09:00-16:00` / `the start must be before the end` |
-| The poll days are days, and a range runs forward | `must look like Mon-Fri or mon,wed,fri` / `runs backwards (ranges run forward from Mon to Sun)` |
+| The poll days and the reminder days are days, and a range runs forward | `must look like Mon-Fri or mon,wed,fri` / `runs backwards (ranges run forward from Mon to Sun)` |
 | Events are kept 3650 days at most | `KITE_MCP_EVENTS_KEEP_DAYS cannot exceed 3650 (ten years)` |
+| The pin's digest is 64 hexadecimal digits (the value is never shown) | `KITE_MCP_ALLOWED_USER_ID_SHA256 must be 64 hexadecimal digits: the SHA-256 of the user id in upper case` |
+| The two pins name the same account | `KITE_MCP_ALLOWED_USER_ID and KITE_MCP_ALLOWED_USER_ID_SHA256 name different accounts` |
+| The reminder times are `HH:MM` | `KITE_MCP_LOGIN_REMINDER_TIMES must be a comma list of HH:MM times, such as 07:30,08:30` |
+| Reminder times need a link command | `KITE_MCP_LOGIN_REMINDER_TIMES needs KITE_MCP_LOGIN_LINK_COMMAND` |
+| Times or a link command need managed mode | `KITE_MCP_LOGIN_REMINDER_TIMES and KITE_MCP_LOGIN_LINK_COMMAND need KITE_MCP_AUTH_MODE=managed` |
+| Times or a link command need the public URL | `KITE_MCP_LOGIN_REMINDER_TIMES and KITE_MCP_LOGIN_LINK_COMMAND need KITE_MCP_PUBLIC_URL` |
+| The link command is an absolute path to one program (the value is never shown) | `KITE_MCP_LOGIN_LINK_COMMAND must be an absolute path to one program, with no arguments and no spaces` |
+| A path's `~` has a home folder | `NAME starts with a ~ whose home folder cannot be found: give the full path` |
+| The variables passed to the link command are names, and none is a `KITE_*` name | `KITE_MCP_LOGIN_LINK_ENV_PASS must list environment variable names, separated by commas` / `must not pass KITE_* variables` |
+| The link command's timeout is at most 600 seconds | `KITE_MCP_LOGIN_LINK_TIMEOUT_S cannot exceed 600` |
 
 `check-config` does not read the consumers file: the server checks it when it starts (see
-[EVENTS.md](EVENTS.md#consumers)).
+[EVENTS.md](EVENTS.md#consumers)). Nor does it check the login links' serving needs: `serve` refuses to start when
+times or a link command are set and the transport is not HTTP (`need the HTTP transport (serve --transport http)`),
+when the link command is not an executable regular file that only the server's user or root can change, or when
+another process already sends the links of the same state folder.
 
 ## Command-line options
 
@@ -231,8 +280,8 @@ The server checks these at start-up and when you run `check-config`. Each failur
 | `tools` | `--markdown`: print a Markdown reference |
 | `check-config` | none: validate and print the settings |
 | `audit` | `--date YYYY-MM-DD` (IST day, default today), `--limit N` (default 50) |
-| `login` | `--listen` (wait for the redirect on a local callback), `--request-token TOKEN` (exchange a token you pasted) |
-| `logout` | `--yes` (really log out; managed mode only) |
+| `login` | `--listen` (wait for the redirect on a local callback), `--request-token TOKEN` (exchange a token you pasted), `--json` (print the link and its expiry as one JSON line, `{"url", "expires_at"}`, instead of the bare link; not with `--request-token`). Exit 2 without a link while forcing is off and Kite still accepts the stored token |
+| `logout` | `--yes` (really log out; managed mode only). Exit 2 with `KITE_MCP_ALLOW_LOGOUT=false` |
 | `events status` | none: the health of the order events, as JSON |
 | `events tail` | `--limit N` (the newest N events, 1 to 1000, default 20), `--order ID` (one order's events) |
 | `events pause`, `events resume`, `events retry` | a consumer's name; `resume --skip-backlog` marks its waiting deliveries skipped |

@@ -4,6 +4,7 @@
 #
 # Do NOT install this in external auth mode: there another program owns the token and this server never logs it out
 # (the command refuses). The next morning you log in again, as every day.
+# With KITE_MCP_ALLOW_LOGOUT=false the command refuses too (exit 2): do not install the timer then.
 #
 # Same user, settings file and folders as kite-connect-mcp.service; see that file for the assumptions.
 

@@ -91,3 +91,13 @@ def test_the_drop_in_says_where_the_rest_goes_and_how_to_check_it():
     ):
         assert line in text
     assert "ReadWritePaths=" not in text  # LogsDirectory= makes the folder, owned by the service user, and writable
+
+
+def test_the_unit_shows_the_login_settings_commented_out():
+    text = (DEPLOY / "systemd" / "kite-connect-mcp.service").read_text()
+    for name in (
+        "KITE_MCP_ALLOWED_USER_ID_SHA256", "KITE_MCP_ALLOW_LOGOUT", "KITE_MCP_LOGIN_ALLOW_FORCE",
+        "KITE_MCP_LOGIN_REMINDER_TIMES", "KITE_MCP_LOGIN_LINK_COMMAND", "KITE_MCP_LOGIN_LINK_ENV_PASS",
+    ):  # fmt: skip
+        assert re.search(rf"^#\s+{name}=", text, flags=re.M), name
+    assert not re.search(r"^Environment=KITE_MCP_LOGIN", text, flags=re.M)  # settings file only: the commands read it

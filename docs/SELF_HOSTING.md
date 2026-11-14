@@ -477,8 +477,9 @@ You log in once per trading day. On a server it takes about half a minute and wo
    `docker compose exec kite-connect-mcp kite-connect-mcp login`). It prints a link to `kite.zerodha.com`.
 2. Open the link on your phone or laptop and log in with your Zerodha user ID, password and TOTP.
 3. Kite redirects your browser to `https://kite.example.com/callback`. The server checks the one-time state, exchanges
-   the request token, and writes the access token to its state folder. If you set `KITE_MCP_ALLOWED_USER_ID`, a login
-   from any other account is refused.
+   the request token, and writes the access token to its state folder. If you set an account pin
+   (`KITE_MCP_ALLOWED_USER_ID`, or its SHA-256 in `KITE_MCP_ALLOWED_USER_ID_SHA256`), a login from any other account
+   is refused.
 4. Check it: `kite-mcp-ctl status`, or ask the assistant for `session_status`. It shows when the token expires (about
    06:00 IST the next morning).
 
@@ -488,6 +489,40 @@ never past the next 06:00 IST).
 
 Do not log in with the same API key from anywhere else: a new session invalidates the old token. See
 [Why one program owns the login](KITE_SETUP.md#why-one-program-owns-the-login).
+
+**Scheduled login links.** The server can send you the link itself, at the times you choose, when no valid token is
+stored ([EVENTS.md](EVENTS.md#scheduled-login-links)). It hands the link to a program of yours, the link command;
+[examples/login_link_telegram.py](../examples/login_link_telegram.py) sends it to a Telegram chat. Install the command
+under `/opt`, owned by root, as for the consumers: `ProtectHome=true` hides `/home` from the service, and the server
+refuses a command that anyone but `kite-mcp` or root could change.
+
+```bash
+sudo install -d -m 0755 -o root -g root /opt/kite-connect-mcp/bin
+sudo install -m 0755 -o root -g root kite-connect-mcp/examples/login_link_telegram.py \
+    /opt/kite-connect-mcp/bin/send-kite-link
+```
+
+Its settings go in the settings file (`sudoedit /etc/kite-connect-mcp/kite-connect-mcp.env`), which `kite-mcp-ctl`
+reads too, with your own values:
+
+```bash
+KITE_MCP_LOGIN_REMINDER_TIMES=07:30,08:30
+KITE_MCP_LOGIN_LINK_COMMAND=/opt/kite-connect-mcp/bin/send-kite-link
+KITE_MCP_LOGIN_LINK_ENV_PASS=TELEGRAM_BOT_TOKEN,TELEGRAM_CHAT_ID
+TELEGRAM_BOT_TOKEN=123456:ABC-placeholder
+TELEGRAM_CHAT_ID=123456789
+```
+
+They need `KITE_MCP_PUBLIC_URL` (set above) and the HTTP transport, which the unit gives on its command line. Restart
+the service (`sudo systemctl restart kite-connect-mcp`): it does not come up if the command is missing or could be
+changed by others, and the journal says why. `kite-mcp-ctl status` then shows `login_links`: the times, the next one
+and how the last link went. The link command calls `api.telegram.org`, so allow that in your outbound firewall if you
+filter outbound traffic. One serving process sends the links of a state folder.
+
+To keep an assistant from ending or replacing the day's session, add `KITE_MCP_ALLOW_LOGOUT=false` and
+`KITE_MCP_LOGIN_ALLOW_FORCE=false` to the settings file
+([SAFETY.md](SAFETY.md#14-sessions-credentials-and-external-mode)). With forcing off, `kite-mcp-ctl login` asks Kite
+once whether the stored token still works, and gives no link while it does.
 
 ### Optional: an evening logout
 
@@ -505,7 +540,9 @@ systemctl list-timers kite-connect-mcp-logout.timer
 It runs `kite-connect-mcp logout --yes` at 22:30 IST (edit `OnCalendar=` to change the time, and pick a time after your
 last session of the day). Logging out ends the session at Kite, so it also stops any other program that shared this
 token, and every tool returns "not logged in" until you log in again. Do not install it in `external` mode: there the
-command refuses, because the token is not this server's to end. To test it, run
+command refuses, because the token is not this server's to end. Nor with `KITE_MCP_ALLOW_LOGOUT=false` in the settings
+file: the command then refuses too (exit 2, a failed unit every evening and a `logout_refused` line in the audit log),
+so do not install the timer. To test it, run
 `sudo systemctl start kite-connect-mcp-logout` and read `journalctl -u kite-connect-mcp-logout`.
 
 ## Order events on a server
@@ -585,8 +622,8 @@ If the service does not come back, the log says why: most often the consumers fi
 
 **5. Kite and the proxy.** Set your app's postback URL to `https://kite.example.com/postback` in the developer console
 (see [KITE_SETUP.md](KITE_SETUP.md#5-postback-url-optional)). The Caddy and nginx examples of step 5 forward
-`POST /postback`, with a cap on the body of 64 KiB. Set `KITE_MCP_ALLOWED_USER_ID` in the settings file, so that a
-postback for any other account is refused.
+`POST /postback`, with a cap on the body of 64 KiB. Set `KITE_MCP_ALLOWED_USER_ID` (or
+`KITE_MCP_ALLOWED_USER_ID_SHA256`) in the settings file, so that a postback for any other account is refused.
 
 **6. Check it.** The `events` commands run as the service user, who owns the store, through `kite-mcp-ctl`. The
 selftest signs a made-up postback with your API secret, without showing it, and posts it to the public URL, so a 200

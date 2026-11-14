@@ -109,6 +109,11 @@ login.
   `request_token`, and stores the token with mode 600.
 - **`external` mode.** Another program owns the login and writes a token file. This server only reads that file,
   picks up the new token every morning without a restart, and never writes, deletes or logs out that token.
+- **Login guards and scheduled links (optional, managed mode).** Pin the account by its user ID or by a SHA-256 of it,
+  turn logout off, and turn off a forced new login while a valid token exists. The server can also send you the day's
+  login link at the times you choose, through a program of yours that writes to your own channel (a Telegram example
+  is included); an assistant can ask for one with `login(deliver=true)` without ever seeing it. See
+  [docs/EVENTS.md](docs/EVENTS.md#scheduled-login-links).
 
 ## Order events
 

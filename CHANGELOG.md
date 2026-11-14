@@ -3,6 +3,70 @@
 All notable changes are listed here. Versions follow [semantic versioning](https://semver.org); while the version
 is 0.x, minor releases may change tool arguments.
 
+## Unreleased
+
+### Added
+
+- **The account pin by hash.** `KITE_MCP_ALLOWED_USER_ID_SHA256` pins the account by the SHA-256 of its user ID in
+  upper case, so the plain ID need not be in any file. With it, the server's own output (the audit log, the session
+  tools, `kite-connect-mcp status --verify` and the `login` command) names the account by the first 12 hex digits of
+  the digest instead of its user ID. With both pins set they must name the same account. Every account check (the
+  login and the postback route) compares SHA-256 digests in constant time.
+- **Logout off.** With `KITE_MCP_ALLOW_LOGOUT=false` the `logout` tool is not offered and the logout command refuses
+  (exit 2). Ending a refused account's fresh session still happens.
+- **Forcing off.** With `KITE_MCP_LOGIN_ALLOW_FORCE=false` no login link is issued while a valid token exists, whoever
+  asks (the `login` tool, even with force=true, and the `login` command, which first asks Kite once with a read-only
+  GET /user/profile and issues the link if Kite rejected the token).
+- **Session events** `login` (a new token was stored), `login_refused` (another account's login was refused by the
+  pin) and `login_failed` (a login on a link of this server's did not complete; `reason` is `exchange_failed` or
+  `token_not_stored`), each raised once, with the order events on ([docs/EVENTS.md](docs/EVENTS.md)).
+- **Scheduled login links** ([docs/EVENTS.md](docs/EVENTS.md#scheduled-login-links)). At the times you set
+  (`KITE_MCP_LOGIN_REMINDER_TIMES`, `KITE_MCP_LOGIN_REMINDER_DAYS`, `KITE_MCP_LOGIN_REMINDER_SKIP_DATES_FILE`), when
+  no valid token is stored, the server hands a fresh login link to a program of yours that sends it to you
+  (`KITE_MCP_LOGIN_LINK_COMMAND`, `KITE_MCP_LOGIN_LINK_ENV_PASS`, `KITE_MCP_LOGIN_LINK_TIMEOUT_S`). A time missed while
+  the server was down or the machine slept is sent when it comes back within 3 hours: the latest such time, once.
+  With the order events on, a link also goes out after `token_rejected`, at most one every two hours. Managed mode,
+  `KITE_MCP_PUBLIC_URL` and the HTTP transport only; one serving process per state folder.
+- `login(deliver=true)`: the link goes to the person through the link command, and the answer says whether it was
+  sent, never the link.
+- The login links' status, `login_links`, in `session_status`, `kite-connect-mcp status`,
+  `kite-connect-mcp events status` and, in the serving process, `get_event_status`.
+- `kite-connect-mcp login --json`: the link and its expiry as one JSON line, `{"url", "expires_at"}`.
+- Example: a link command that sends the link to a Telegram chat
+  ([examples/login_link_telegram.py](examples/login_link_telegram.py)).
+- Deploy samples: the systemd unit shows the login settings, commented out, for the settings file; the logout unit
+  says not to install its timer with logout off.
+
+### Changed
+
+What a 0.2.0 setup sees without changing a setting:
+
+- With the order events on, a consumer whose `match` takes the `session` kind now also receives `login`,
+  `login_refused` and `login_failed`. `match` has no filter by session name: ignore the names you do not want (exit 0).
+- `token_rejected` is now raised also when a tool call is the first to meet Kite's rejection of the stored token
+  (0.2.0: only the poll and the doorbell). It is still raised once per token, and never by a logout.
+- In managed mode, a token that another process stores beside the serving process (`kite-connect-mcp login` run by
+  hand, say) raises `login`, seen by the poll within seconds.
+- With the order events on, a token Kite rejected stays rejected across a restart: the rejection is kept by the
+  token's fingerprint in the event store (0.2.0 forgot it). A new login that Kite answers with the same token string
+  clears it.
+- The audit log has two new events: `logout_refused` and `login_link_refused`.
+
+### Fixed
+
+- docs/CONFIGURATION.md said that an empty boolean setting counts as false. It means the default, as the server has
+  always read it.
+
+### Security
+
+- A login link handed to the link command is never stored or logged, and never put in an event, a status, an audit
+  line, an error or the answer of `login(deliver=true)`. The command's output is discarded, it gets a minimal
+  environment (never a `KITE_*` variable), and the server refuses a command that anyone but its user or root could
+  change, when it starts and before each run.
+- The hash pin keeps the user ID out of plain sight; it is not a secret, as a short user ID can be found from its
+  SHA-256 by trying them all. Kite's own answers that the read tools pass on (the profile, an order's placed_by) still
+  hold the plain ID.
+
 ## 0.2.0 (2026-11-14)
 
 ### Added
