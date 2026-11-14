@@ -27,14 +27,15 @@
 }
 
 kite.example.com {
-	# an MCP request, a login redirect or a postback is a few kilobytes at most
-	request_body {
-		max_size 1MB
-	}
+	# Each path gets the cap on the request body it needs, inside its handle. No cap for the whole site, on purpose:
+	# a cap inside a handle cannot raise a cap set for the whole site. KB and MB are powers of 1000, KiB of 1024.
 
 	# --- MCP over Streamable HTTP, protected by the bearer token ---
 	@mcp path /mcp /mcp/*
 	handle @mcp {
+		request_body {
+			max_size 1MB
+		}
 		reverse_proxy 127.0.0.1:8765 {
 			# replies can be streamed (Server-Sent Events): send them on as they come
 			flush_interval -1
@@ -47,16 +48,25 @@ kite.example.com {
 		path /callback
 	}
 	handle @callback {
+		request_body {
+			max_size 4KB
+		}
 		reverse_proxy 127.0.0.1:8765
 	}
 
 	# --- optional: Kite order postbacks. Needs KITE_MCP_POSTBACK_PATH=/postback on the server and
-	# https://kite.example.com/postback as the app's postback URL. Delete this block if you do not use them. ---
+	# https://kite.example.com/postback as the app's postback URL. With KITE_MCP_EVENTS=true the postbacks feed the
+	# order events (docs/EVENTS.md), and the server answers 200 once a postback is on disk. Delete this block if you
+	# do not use them. ---
 	@postback {
 		method POST
 		path /postback
 	}
 	handle @postback {
+		# the server's own cap is 64 KiB (65,536 bytes); 64KB would be 64,000
+		request_body {
+			max_size 64KiB
+		}
 		reverse_proxy 127.0.0.1:8765
 	}
 
@@ -67,6 +77,9 @@ kite.example.com {
 		path /health
 	}
 	handle @health {
+		request_body {
+			max_size 4KB
+		}
 		reverse_proxy 127.0.0.1:8765
 	}
 

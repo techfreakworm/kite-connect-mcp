@@ -60,7 +60,8 @@ server {
     # log can still quote the request line when the upstream is down, so keep /var/log/nginx private and rotate it.
     access_log off;
 
-    # an MCP request, a login redirect or a postback is a few kilobytes at most
+    # Each path gets the cap on the request body it needs: 1m here for /mcp, less in the locations below (a location's
+    # own client_max_body_size wins over this one; k and m are powers of 1024).
     client_max_body_size 1m;
 
     # settings shared by every proxied location
@@ -84,15 +85,20 @@ server {
         limit_except GET {
             deny all;
         }
+        client_max_body_size 4k;
         proxy_pass http://kite_connect_mcp;
     }
 
     # --- optional: Kite order postbacks. Needs KITE_MCP_POSTBACK_PATH=/postback on the server and
-    # https://kite.example.com/postback as the app's postback URL. Delete this block if you do not use them. ---
+    # https://kite.example.com/postback as the app's postback URL. With KITE_MCP_EVENTS=true the postbacks feed the
+    # order events (docs/EVENTS.md), and the server answers 200 once a postback is on disk. Delete this block if you
+    # do not use them. ---
     location = /postback {
         limit_except POST {
             deny all;
         }
+        # the server's own cap: 64 KiB (65,536 bytes)
+        client_max_body_size 64k;
         proxy_pass http://kite_connect_mcp;
     }
 
@@ -102,6 +108,7 @@ server {
         limit_except GET {
             deny all;
         }
+        client_max_body_size 4k;
         proxy_pass http://kite_connect_mcp;
     }
 
