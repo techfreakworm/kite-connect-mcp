@@ -280,7 +280,7 @@ another process already sends the links of the same state folder.
 | `tools` | `--markdown`: print a Markdown reference |
 | `check-config` | none: validate and print the settings |
 | `audit` | `--date YYYY-MM-DD` (IST day, default today), `--limit N` (default 50) |
-| `login` | `--listen` (wait for the redirect on a local callback), `--request-token TOKEN` (exchange a token you pasted), `--json` (print the link and its expiry as one JSON line, `{"url", "expires_at"}`, instead of the bare link; not with `--request-token`). Exit 2 without a link while forcing is off and Kite still accepts the stored token, or Kite could not be asked (run it again) |
+| `login` | `--listen` (wait for the redirect on a local callback), `--request-token TOKEN` (exchange a token you pasted), `--json` (print the link and its expiry as one JSON line, `{"url", "expires_at"}`, instead of the bare link; not with `--request-token`). Exit 2 without a link while forcing is off and Kite still accepts the stored token, or Kite could not be asked (run it again), or, with `--request-token`, a token without its link's state while forcing is off and a valid token is stored (paste the whole URL, in quotes) |
 | `logout` | `--yes` (really log out; managed mode only). Exit 2 with `KITE_MCP_ALLOW_LOGOUT=false` |
 | `events status` | none: the health of the order events, as JSON |
 | `events tail` | `--limit N` (the newest N events, 1 to 1000, default 20), `--order ID` (one order's events) |

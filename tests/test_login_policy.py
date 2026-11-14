@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 from pathlib import Path
+from urllib.parse import urlencode
 
 import httpx2
 import pytest
@@ -417,6 +419,58 @@ async def test_forcing_off_the_login_command_refuses_a_pasted_request_token(sett
     out, err = capsys.readouterr()
     assert out == "" and ASKING not in err
     assert ACCESS_TOKEN not in message + err and REQUEST_TOKEN not in message + err
+
+
+async def test_forcing_off_the_link_hint_names_the_whole_url_which_the_next_command_exchanges(
+    settings_factory, fake_kite, kite, capsys
+):
+    # Kite rejected the stored token, so the command issues a link. The next command is a new process that never saw
+    # the rejection (the mark lived in the first one's memory): the bare request token is refused there, the whole URL
+    # the hint asks for carries the link's state and goes through
+    kite_rejects_the_token(fake_kite)
+    settings = settings_factory(**FORCE_OFF)
+    assert await command_login(settings, fake_kite) == 0
+    out, err = capsys.readouterr()
+    hint = " ".join(err.split())
+    assert "copy the whole address from the address bar" in hint and "--request-token '<the whole URL>'" in hint
+    assert "<request_token>" not in hint
+    state = state_of(out.strip())
+    redirected = f"http://127.0.0.1:8765/callback?{urlencode(callback_params(state))}"
+
+    async def paste(pasted: str) -> int:
+        return await cli_login(
+            settings, request_token=pasted, listen=False, transport=fake_kite.transport(), clock=lambda: FIXED_NOW
+        )
+
+    with pytest.raises(ConfigError, match="KITE_MCP_LOGIN_ALLOW_FORCE=false"):
+        await paste(REQUEST_TOKEN)
+    refused_paste_audited(last_audit_line(settings), "cli")
+    assert kite.exchanges == [] and kite_calls(fake_kite) == [PROFILE]
+    assert await paste(redirected) == 0
+    assert len(kite.exchanges) == 1 and NEW_TOKEN in settings.token_file.read_text()
+    assert kite_calls(fake_kite) == [PROFILE, ("POST", "/session/token")]
+    last = last_audit_line(settings)
+    assert (last["event"], last["source"]) == ("login_ok", "cli")
+    out, err = capsys.readouterr()
+    assert out.startswith(f"Logged in as {USER_ID}.")
+    for secret in (REQUEST_TOKEN, state, NEW_TOKEN):
+        assert secret not in out + err
+
+
+async def test_forcing_off_two_pastes_at_once_without_a_token_exchange_once(runtime_factory, kite):
+    # the check runs under the exchange lock: the second paste waits for the first, then meets the token it stored
+    rt = runtime_factory(**FORCE_OFF)
+    rt.settings.token_file.unlink()
+    results = await asyncio.gather(
+        rt.login.complete(REQUEST_TOKEN), rt.login.complete(REQUEST_TOKEN), return_exceptions=True
+    )
+    assert len(kite.exchanges) == 1
+    refused = [r for r in results if isinstance(r, ConfigError)]
+    assert len(refused) == 1 and PASTE_REFUSED in " ".join(str(refused[0]).split())
+    (done,) = [r for r in results if not isinstance(r, BaseException)]
+    assert done.ok and rt.tokens.current().access_token == NEW_TOKEN
+    (line,) = [line for line in rt.audit.read() if line["event"] == "login_link_refused"]
+    refused_paste_audited(line, "tool")
 
 
 def test_forcing_off_main_exits_2_on_a_pasted_request_token(cli_env, monkeypatch, capsys, fake_kite):

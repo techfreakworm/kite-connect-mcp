@@ -77,8 +77,10 @@ kcm status --verify  # also make one read-only call to Kite to prove the token w
   key is set, so look for `"api_key": "set"`.
 - For `login --listen` register `http://127.0.0.1:8765/callback` as your app's redirect URL. The command starts a
   temporary local callback, prints a link, and finishes when you have logged in. If the redirect cannot reach it, log in
-  anyway, copy the `request_token` value from the address bar of the page you land on, and run
-  `kcm login --request-token <value>`. The token is single-use and expires within minutes.
+  anyway, copy the whole address from the address bar of the page you land on, and run
+  `kcm login --request-token '<the whole URL>'`, in quotes. The URL carries the link's state, so the login goes through
+  even where a bare `request_token` is refused (`KITE_MCP_LOGIN_ALLOW_FORCE=false` with a valid token stored). The
+  request token in it is single-use and expires within minutes.
 - `kcm login` without options prints the link for use with a server's `/callback`; see
   [the daily login on a server](#the-daily-login-on-a-server).
 - You do this once per trading day. Kite tokens expire at about 06:00 IST; see

@@ -207,7 +207,10 @@ async def test_login_issues_a_link_with_the_warning_and_instructions(mcp_factory
     assert out["redirect_url"] == "http://127.0.0.1:8765/callback"
     text = " ".join(out["instructions"])
     assert "http://127.0.0.1:8765/callback" in text
-    assert "request_token" in text and "complete_login" in text and "address bar" in text
+    assert "complete_login" in text and "address bar" in text
+    assert "use the whole URL from the address bar" in text  # stdio serves no page: the next instruction says how
+    assert "copy the whole URL from the browser's address bar (it carries this link's state)" in text
+    assert "request_token" not in text  # a bare request token is refused while forcing is off and a token is valid
     assert list(stored_states(rt)) == [digest_of(state_of(out["login_url"]))]
 
 

@@ -54,8 +54,8 @@ through the server's link command (KITE_MCP_LOGIN_LINK_COMMAND) and you never se
 all the same.
 
 Kite then redirects to the app's registered redirect URL (`redirect_url`). This server completes the login
-when that redirect reaches it; if the redirect page cannot be reached, the person can copy the request_token
-from the browser's address bar (or the whole URL) and you call complete_login with it.
+when that redirect reaches it; if the redirect page cannot be reached, the person can copy the whole URL from
+the browser's address bar (it carries this link's state) and you call complete_login with it.
 
 If a valid token already exists nothing is issued, unless force=true (and never while forcing is off on the
 server); a new login ends the old token at Kite. In external auth mode another program owns the login: this

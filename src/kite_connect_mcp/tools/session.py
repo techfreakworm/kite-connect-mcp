@@ -210,8 +210,8 @@ def _register_status_and_login(reg: Registrar) -> None:
         all the same.
 
         Kite then redirects to the app's registered redirect URL (`redirect_url`). This server completes the login
-        when that redirect reaches it; if the redirect page cannot be reached, the person can copy the request_token
-        from the browser's address bar (or the whole URL) and you call complete_login with it.
+        when that redirect reaches it; if the redirect page cannot be reached, the person can copy the whole URL from
+        the browser's address bar (it carries this link's state) and you call complete_login with it.
 
         If a valid token already exists nothing is issued, unless force=true (and never while forcing is off on the
         server); a new login ends the old token at Kite. In external auth mode another program owns the login: this
@@ -262,7 +262,7 @@ def _register_status_and_login(reg: Registrar) -> None:
             handling = (
                 "This server runs over stdio and serves no web page. Either run `kite-connect-mcp login --listen` in "
                 f"a terminal first (the app's redirect URL must then be http://127.0.0.1:{settings.port}"
-                f"{settings.callback_path}), or let the redirect page fail to load and use the request_token from the "
+                f"{settings.callback_path}), or let the redirect page fail to load and use the whole URL from the "
                 "address bar as described below."
             )
         out: dict[str, Any] = {
@@ -276,8 +276,8 @@ def _register_status_and_login(reg: Registrar) -> None:
                 f"Kite then redirects to the registered redirect URL, {redirect} (the Kite app's redirect URL must be "
                 "exactly this).",
                 handling,
-                "If the redirect page cannot be reached, the user can copy the request_token from the browser's "
-                "address bar (pasting the whole URL works too) and you call complete_login with it.",
+                "If the redirect page cannot be reached, the user can copy the whole URL from the browser's address "
+                "bar (it carries this link's state) and you call complete_login with it.",
             ],
         }
         notes = _login_notes(settings, pin)

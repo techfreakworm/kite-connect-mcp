@@ -736,8 +736,9 @@ async def _login_with_link(manager: LoginManager, *, listen: bool, as_json: bool
         ]
     else:
         lines += [
-            "If the redirect page does not load, copy the request_token from the address bar and run:",
-            "  kite-connect-mcp login --request-token <request_token>",
+            "If the redirect page does not load, copy the whole address from the address bar and run, in quotes:",
+            "  kite-connect-mcp login --request-token '<the whole URL>'",
+            "(the URL carries this link's state, which lets the login through).",
         ]
     _note("\n".join(lines))
     if not listen:
