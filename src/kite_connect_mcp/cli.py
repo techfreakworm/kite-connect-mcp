@@ -334,7 +334,7 @@ def cmd_login(args: argparse.Namespace) -> int:
     _setup_logging(settings.log_level)
     from .auth.login import cli_login
 
-    return asyncio.run(cli_login(settings, request_token=args.request_token, listen=args.listen))
+    return asyncio.run(cli_login(settings, request_token=args.request_token, listen=args.listen, as_json=args.json))
 
 
 def cmd_logout(args: argparse.Namespace) -> int:
@@ -379,10 +379,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="Managed mode only. Prints a one-time Kite login link on stdout (everything else goes to stderr). "
         "Open it and log in at Kite; Kite then redirects to the redirect URL registered for your app.",
     )
-    login.add_argument(
+    login_with = login.add_mutually_exclusive_group()
+    login_with.add_argument(
         "--request-token",
         help="finish the login with the request_token from the redirect URL's address bar (the whole URL also works; "
         "put it in quotes)",
+    )
+    login_with.add_argument(
+        "--json",
+        action="store_true",
+        help='print the link and its expiry as one JSON line, {"url", "expires_at"}, instead of the bare link',
     )
     login.add_argument(
         "--listen",

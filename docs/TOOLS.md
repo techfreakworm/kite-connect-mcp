@@ -53,12 +53,13 @@ Kite then redirects to the app's registered redirect URL (`redirect_url`). This 
 when that redirect reaches it; if the redirect page cannot be reached, the person can copy the request_token
 from the browser's address bar (or the whole URL) and you call complete_login with it.
 
-If a valid token already exists nothing is issued, unless force=true; a new login ends the old token at Kite.
-In external auth mode another program owns the login: this only explains and shows the status.
+If a valid token already exists nothing is issued, unless force=true (and never while forcing is off on the
+server); a new login ends the old token at Kite. In external auth mode another program owns the login: this
+only explains and shows the status.
 
 | Argument | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `force` | boolean |  | `false` | issue a new link even though a valid token exists (the new login ends the old token) |
+| `force` | boolean |  | `false` | issue a new link even though a valid token exists (the new login ends the old token); refused when the server turns forcing off (KITE_MCP_LOGIN_ALLOW_FORCE=false) |
 
 ### `complete_login`: Complete the Kite login by hand
 

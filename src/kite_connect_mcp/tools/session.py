@@ -4,7 +4,8 @@ Kite sessions end every day at 06:00 IST. In `managed` auth mode this server own
 link, the person logs in at Kite, and Kite's redirect lands on this server's callback route (added by
 `_callback_hook`) or the person pastes the request_token into `complete_login`. In `external` auth mode another program
 keeps the token file: only `session_status` and an explanatory `login` exist, and `complete_login` / `logout` are not
-registered at all. `logout` is not offered with KITE_MCP_ALLOW_LOGOUT=false.
+registered at all. `logout` is not offered with KITE_MCP_ALLOW_LOGOUT=false, and with KITE_MCP_LOGIN_ALLOW_FORCE=false
+`login` issues no link while a valid token exists, even with force=true.
 
 These tools are kind "auth": they reach /session/token through the login manager (auth/login.py) and never touch the
 write pipeline.
@@ -132,7 +133,10 @@ def _register_status_and_login(reg: Registrar) -> None:
     async def login(
         force: Annotated[
             bool,
-            Field(description="issue a new link even though a valid token exists (the new login ends the old token)"),
+            Field(
+                description="issue a new link even though a valid token exists (the new login ends the old token); "
+                "refused when the server turns forcing off (KITE_MCP_LOGIN_ALLOW_FORCE=false)"
+            ),
         ] = False,
     ) -> Any:
         """Start the daily Kite login (managed auth mode): returns a one-time login link for the person to open.
@@ -143,8 +147,9 @@ def _register_status_and_login(reg: Registrar) -> None:
         when that redirect reaches it; if the redirect page cannot be reached, the person can copy the request_token
         from the browser's address bar (or the whole URL) and you call complete_login with it.
 
-        If a valid token already exists nothing is issued, unless force=true; a new login ends the old token at Kite.
-        In external auth mode another program owns the login: this only explains and shows the status."""
+        If a valid token already exists nothing is issued, unless force=true (and never while forcing is off on the
+        server); a new login ends the old token at Kite. In external auth mode another program owns the login: this
+        only explains and shows the status."""
         status = rt.tokens.status()
         if not managed:
             return {
@@ -156,12 +161,26 @@ def _register_status_and_login(reg: Registrar) -> None:
                 "token_file": str(settings.token_file),
             }
         if status.get("logged_in") and not force:
+            if settings.login_allow_force:
+                advice = (
+                    "Call login with force=true only if a fresh login is really wanted (it ends the current token at "
+                    "Kite once completed)."
+                )
+            else:  # never advise a call the server refuses
+                advice = (
+                    "Forcing a new login is off on this server (KITE_MCP_LOGIN_ALLOW_FORCE=false): no link is issued "
+                    "until the token expires or Kite rejects it."
+                )
             return {
                 "already_logged_in": True,
                 "session": status,
-                "message": "Already logged in with a valid token. Call login with force=true only if a fresh login is "
-                "really wanted (it ends the current token at Kite once completed).",
+                "message": f"Already logged in with a valid token. {advice}",
             }
+        if status.get("logged_in") and not settings.login_allow_force:
+            raise ToolInputError(
+                "forcing a new login is off on this server (KITE_MCP_LOGIN_ALLOW_FORCE=false) and the token is still "
+                "valid: no link is issued until it expires or Kite rejects it (session_status shows when)"
+            )
         manager = _manager(rt)
         url, expires_at = await manager.issue_link()
         redirect = manager.redirect_url()

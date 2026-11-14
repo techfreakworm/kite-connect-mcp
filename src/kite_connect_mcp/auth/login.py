@@ -11,6 +11,10 @@ logout() ends the stored session for every client of the token. With KITE_MCP_AL
 is not offered, and the command exits 2 with a `logout_refused` audit line); ending a refused account's fresh session is
 not a logout and stays.
 
+A login from a new link ends the token in use at Kite. With KITE_MCP_LOGIN_ALLOW_FORCE=false, issue_link() refuses (a
+`login_link_refused` audit line) while a valid token exists, whoever asks: the token then lives until 06:00 IST or until
+Kite rejects it.
+
 The exchange, for a callback or a pasted token (`_finish`), one at a time per process:
 
     reserve the state (if any)  ->  POST /session/token  ->  account pin  ->  write the token file  ->  commit
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import logging
 import re
 import secrets
@@ -219,8 +224,11 @@ class LoginManager:
     # --- the link -----------------------------------------------------------------------------------------------------
 
     async def issue_link(self, *, source: str = "tool") -> tuple[str, dt.datetime]:
-        """A new login URL and when it expires. Only the digest of its state is kept."""
+        """A new login URL and when it expires. Only the digest of its state is kept. With forcing off
+        (KITE_MCP_LOGIN_ALLOW_FORCE=false) no link is issued while a valid token exists, whoever asks: ConfigError, and
+        a `login_link_refused` audit line."""
         self._require_managed()
+        self._refuse_while_valid(source)
         api_key = self.settings.require_api_key()
         self.settings.require_api_secret()  # a link that could never be completed is not worth issuing
         now = to_ist(self.clock())
@@ -229,6 +237,21 @@ class LoginManager:
         await asyncio.to_thread(self.states.issue, state, now, expires_at)
         self._audit("login_link_issued", source=source, expires_at=expires_at)
         return build_login_url(self.settings.login_url, api_key, state), expires_at
+
+    def _refuse_while_valid(self, source: str) -> None:
+        """With forcing off (KITE_MCP_LOGIN_ALLOW_FORCE=false), no link while a valid token exists: a login from it
+        would end that token at Kite. ConfigError, audited."""
+        if self.settings.login_allow_force:
+            return
+        record = self.tokens.current()
+        if record is None:
+            return
+        self._audit("login_link_refused", source=source, reason="token_valid")
+        until = f" until {to_ist(record.expires_at):%Y-%m-%d %H:%M} IST" if record.expires_at else ""
+        raise ConfigError(
+            f"a valid Kite token exists{until} and forcing a new login is off (KITE_MCP_LOGIN_ALLOW_FORCE=false): no "
+            "login link is issued until the token expires or Kite rejects it"
+        )
 
     # --- completing a login -------------------------------------------------------------------------------------------
 
@@ -534,13 +557,16 @@ async def cli_login(
     *,
     request_token: str | None,
     listen: bool,
+    as_json: bool = False,
     transport: httpx2.AsyncBaseTransport | None = None,
     clock: Callable[[], dt.datetime] | None = None,
 ) -> int:
     """`kite-connect-mcp login`. Without options: print a login link (stdout; everything else goes to stderr). With
     `request_token`: exchange it. With `listen`: print the link, then serve the callback on KITE_MCP_HOST:KITE_MCP_PORT
-    until one login completes or LISTEN_TIMEOUT_S passes. `transport` and `clock` exist for tests. Exit codes: 0 done,
-    1 the login did not happen, 2 not possible in this configuration."""
+    until one login completes or LISTEN_TIMEOUT_S passes. With `as_json`: the link is printed as one JSON line
+    {"url", "expires_at"}. `transport` and `clock` exist for tests. Exit codes: 0 done, 1 the login did not happen, 2
+    not possible in this configuration (a ConfigError, such as forcing off while a valid token exists, leaves this
+    function and main() turns it into 2)."""
     if settings.auth_mode != "managed":
         _note(
             "login is managed by another program (KITE_MCP_AUTH_MODE=external); this server does not log in. "
@@ -557,7 +583,7 @@ async def cli_login(
             raise ConfigError("the login manager is not available")
         if request_token:
             return await _login_with_token(manager, request_token)
-        return await _login_with_link(manager, listen=listen)
+        return await _login_with_link(manager, listen=listen, as_json=as_json)
     finally:
         await rt.aclose()
 
@@ -574,9 +600,12 @@ async def _login_with_token(manager: LoginManager, pasted: str) -> int:
     return 0
 
 
-async def _login_with_link(manager: LoginManager, *, listen: bool) -> int:
+async def _login_with_link(manager: LoginManager, *, listen: bool, as_json: bool = False) -> int:
     url, expires_at = await manager.issue_link(source="cli")
-    print(url, flush=True)
+    if as_json:
+        print(json.dumps({"url": url, "expires_at": to_ist(expires_at).isoformat(timespec="seconds")}), flush=True)
+    else:
+        print(url, flush=True)
     redirect = manager.redirect_url()
     lines = [
         AI_RISK_WARNING,
