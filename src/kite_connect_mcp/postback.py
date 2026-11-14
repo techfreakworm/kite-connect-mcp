@@ -28,15 +28,15 @@ Without the event service a signed selftest (`kite-connect-mcp events selftest`,
 
 With KITE_MCP_EVENTS=true the route is registered whenever KITE_MCP_POSTBACK_PATH is set, the ticker on or off, and a
 verified postback rings the event service's doorbell (or records a selftest): the order is then re-read from Kite and
-nothing from the payload is stored (see events/doorbell.py). With KITE_MCP_ALLOWED_USER_ID set, a postback for another
-account is refused. When the ticker's order updates are on (`ticker_order_updates`), an accepted postback also goes to
-their buffer, as without the events. Every refusal is counted under a fixed reason (service.REFUSALS), and written at
-most once a second (EventService.refused). A repeat of a postback accepted in the last ten seconds (Kite sending it
-twice, or a replay) is answered 200 without ringing again (RepeatGuard). A repeat is the same JSON, whitespace and key
-order aside, and only the whole of it: the checksum covers only order_id and order_timestamp, so an order's later
-updates can carry the same one. A replay altered in another field is not a repeat, so the event service writes one
-order at most once every two seconds and merges the rings in between into one more write
-(EventService.accept_postback).
+nothing from the payload is stored (see events/doorbell.py). With an account pin (KITE_MCP_ALLOWED_USER_ID or
+KITE_MCP_ALLOWED_USER_ID_SHA256) set, a postback for another account is refused. When the ticker's order updates are on
+(`ticker_order_updates`), an accepted postback also goes to their buffer, as without the events. Every refusal is
+counted under a fixed reason (service.REFUSALS), and written at most once a second (EventService.refused). A repeat of
+a postback accepted in the last ten seconds (Kite sending it twice, or a replay) is answered 200 without ringing again
+(RepeatGuard). A repeat is the same JSON, whitespace and key order aside, and only the whole of it: the checksum covers
+only order_id and order_timestamp, so an order's later updates can carry the same one. A replay altered in another
+field is not a repeat, so the event service writes one order at most once every two seconds and merges the rings in
+between into one more write (EventService.accept_postback).
 """
 
 from __future__ import annotations
@@ -221,7 +221,7 @@ class PostbackRoute:
         if not selftest and (order_id.startswith(SELFTEST_PREFIX) or not ORDER_ID_RE.fullmatch(order_id)):
             return refuse(400, "bad order id", "the order id has an unexpected form")
         if not selftest and not events.user_allowed(payload.get("user_id")):
-            return refuse(403, "another account", "the postback is for another account than KITE_MCP_ALLOWED_USER_ID")
+            return refuse(403, "another account", "the postback is for another account than the pinned one")
         now = self.rt.clock()
         key = repeat_key(payload, body)
         if self.recent.is_repeat(key, now):

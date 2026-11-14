@@ -35,6 +35,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
+from ..auth.account import AccountPin
 from ..config import Settings
 from ..errors import ConfigError
 from ..timeutil import now_ist, to_ist
@@ -102,6 +103,7 @@ class EventService:
         self.client = client
         self.tokens = tokens
         self.clock = clock
+        self.pin = AccountPin.from_settings(settings)
         self.config = config if config is not None else ConsumersConfig.load(settings.events_consumers_file)
         self.store = store if store is not None else EventStore(settings.events_db)
         self._event_listeners: list[Callable[[], None]] = []
@@ -430,11 +432,9 @@ class EventService:
         self._refused_count = 0
 
     def user_allowed(self, user_id: object) -> bool:
-        """With KITE_MCP_ALLOWED_USER_ID set, a postback must name that account."""
-        pinned = self.settings.allowed_user_id
-        if pinned is None:
-            return True
-        return isinstance(user_id, str) and user_id.strip().upper() == pinned
+        """With an account pin (KITE_MCP_ALLOWED_USER_ID or KITE_MCP_ALLOWED_USER_ID_SHA256), a postback must name that
+        account."""
+        return self.pin.allows(user_id)
 
     # --- status ---------------------------------------------------------------------------------------------------
 

@@ -13,11 +13,12 @@ The exchange, for a callback or a pasted token (`_finish`), one at a time per pr
 
 A state is reserved for one exchange and committed only once the token is on disk, which also closes every other open
 link. Whatever fails before that releases the state, so the same link can be tried again with a fresh Kite login. If
-KITE_MCP_ALLOWED_USER_ID is set and Kite says another account logged in, that new session is ended at once, nothing is
-stored, and the login is refused.
+an account pin is set (auth/account.py) and Kite says another account logged in, that new session is ended at once,
+nothing is stored, and the login is refused.
 
 What is never written anywhere (logs, audit log, results, error messages): the access token, the request token, the
-state, names, e-mail addresses. The audit log gets event names, reason codes and the user id of a successful login.
+state, names, e-mail addresses. The audit log gets event names, reason codes and the account of a successful login:
+its user id, or with the hash pin the first 12 hex digits of the digest.
 
 In `external` auth mode every entry point refuses before doing anything; the HTTP client refuses session calls too.
 """
@@ -46,6 +47,7 @@ from ..config import Settings
 from ..errors import ConfigError, KiteAPIError, KiteMCPError, OutcomeUnknown, TokenError, ToolInputError
 from ..safety.audit import AuditLog
 from ..timeutil import next_token_reset, now_ist, to_ist
+from .account import AccountPin
 from .callback import make_callback_handler
 from .loginstate import Reservation, StateStore
 from .tokenstore import TokenProvider, TokenRecord
@@ -181,6 +183,7 @@ class LoginManager:
         self.tokens = tokens
         self.audit = audit
         self.clock = clock
+        self.pin = AccountPin.from_settings(settings)
         self.states = StateStore(settings.state_dir / STATE_FILE)
         self._flow_lock = asyncio.Lock()  # one exchange or logout at a time, so token writes cannot land out of order
         self._noise: deque[float] = deque()
@@ -309,12 +312,11 @@ class LoginManager:
             return self._refuse("exchange_failed", "Kite's answer held no usable access token", source)
         access_token, user_id = unpacked
 
-        pin = (self.settings.allowed_user_id or "").upper()
-        if pin and user_id != pin:
+        if self.pin.pinned and not self.pin.allows(user_id):
             ended = await self._invalidate(api_key, access_token)
             return self._refuse(
                 "account_mismatch",
-                "the Kite account that logged in is not the one this server is pinned to (KITE_MCP_ALLOWED_USER_ID); "
+                f"the Kite account that logged in is not the one this server is pinned to ({self.pin.setting}); "
                 + (
                     "that new session was ended and nothing was stored"
                     if ended
@@ -338,7 +340,7 @@ class LoginManager:
                 source,
             )
         self.tokens.accept(access_token)
-        self._audit("login_ok", source=source, user_id=user_id, expires_at=record.expires_at)
+        self._audit("login_ok", source=source, **self.pin.label(user_id), expires_at=record.expires_at)
         log.info("Kite login completed (%s)", source)
         return LoginResult(True, "ok", "logged in", user_id=user_id, expires_at=record.expires_at)
 
@@ -554,7 +556,7 @@ async def _login_with_token(manager: LoginManager, pasted: str) -> int:
         _note(f"login failed: {result.message}")
         return 1
     until = to_ist(result.expires_at) if result.expires_at else None
-    who = f" as {result.user_id}" if result.user_id else ""
+    who = f" as {manager.pin.describe(result.user_id)}" if result.user_id else ""
     print(f"Logged in{who}. The token works until {until:%Y-%m-%d %H:%M} IST." if until else f"Logged in{who}.")
     return 0
 

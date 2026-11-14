@@ -20,6 +20,7 @@ from mcp.server import MCPServer
 from mcp_types import ToolAnnotations
 from pydantic import Field
 
+from ..auth.account import AccountPin
 from ..auth.callback import CallbackRateLimiter, make_callback_handler
 from ..auth.login import AI_RISK_WARNING, LoginManager, unpack_redirect
 from ..config import Settings
@@ -73,13 +74,14 @@ def _register_status_and_login(reg: Registrar) -> None:
     rt = reg.rt
     settings = rt.settings
     managed = settings.auth_mode == "managed"
+    pin = AccountPin.from_settings(settings)
 
     async def verify_with_kite() -> dict[str, Any]:
         try:
             profile = await rt.client.get("/user/profile")
         except KiteMCPError as exc:  # no token, expired, rejected, network...
             return {"ok": False, "error": rt.client.scrub(str(exc))}
-        return {"ok": True, "user_id": profile.get("user_id") if isinstance(profile, dict) else None}
+        return {"ok": True, **pin.label(profile.get("user_id") if isinstance(profile, dict) else None)}
 
     @reg.tool("session_status", title="Session status", toolset="session", kind="read")
     async def session_status(
@@ -193,8 +195,11 @@ def _register_status_and_login(reg: Registrar) -> None:
         notes = []
         if settings.access_token:
             notes.append("KITE_ACCESS_TOKEN is set and takes precedence over the token file; unset it for this login")
-        if not settings.allowed_user_id:
-            notes.append("KITE_MCP_ALLOWED_USER_ID is not set: any Kite account that completes this login is accepted")
+        if not pin.pinned:
+            notes.append(
+                "no account pin is set (KITE_MCP_ALLOWED_USER_ID or KITE_MCP_ALLOWED_USER_ID_SHA256): any Kite "
+                "account that completes this login is accepted"
+            )
         if notes:
             out["notes"] = notes
         return out
@@ -204,6 +209,7 @@ def _register_managed(reg: Registrar) -> None:
     """complete_login, logout and the HTTP callback route: only where this server owns the login."""
     rt = reg.rt
     settings = rt.settings
+    pin = AccountPin.from_settings(settings)
 
     @reg.tool("complete_login", title="Complete the Kite login by hand", toolset="session", kind="auth")
     async def complete_login(
@@ -223,8 +229,9 @@ def _register_managed(reg: Registrar) -> None:
     ) -> Any:
         """Finish a Kite login with a request_token the person copied from the browser's address bar after logging in
         (use it when the redirect page could not be reached). Exchanges the token with Kite and stores the access
-        token for every client of this server. Request tokens are single use and last only a few minutes. If
-        KITE_MCP_ALLOWED_USER_ID is set, a login by any other Kite account is ended and refused."""
+        token for every client of this server. Request tokens are single use and last only a few minutes. With an
+        account pin set (KITE_MCP_ALLOWED_USER_ID or KITE_MCP_ALLOWED_USER_ID_SHA256), a login by any other Kite
+        account is ended and refused."""
         token, linked_state = unpack_redirect(request_token, state)
         result = await _manager(rt).complete(token, linked_state, source="tool")
         if not result.ok:
@@ -232,7 +239,7 @@ def _register_managed(reg: Registrar) -> None:
         expires = to_ist(result.expires_at) if result.expires_at else None
         return {
             "logged_in": True,
-            "user_id": result.user_id,
+            **pin.label(result.user_id),
             "expires_at": expires.isoformat(timespec="minutes") if expires else None,
             "message": "Logged in. The token is shared by every client of this server until the 06:00 IST reset.",
         }

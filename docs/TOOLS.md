@@ -66,8 +66,9 @@ In external auth mode another program owns the login: this only explains and sho
 
 Finish a Kite login with a request_token the person copied from the browser's address bar after logging in
 (use it when the redirect page could not be reached). Exchanges the token with Kite and stores the access
-token for every client of this server. Request tokens are single use and last only a few minutes. If
-KITE_MCP_ALLOWED_USER_ID is set, a login by any other Kite account is ended and refused.
+token for every client of this server. Request tokens are single use and last only a few minutes. With an
+account pin set (KITE_MCP_ALLOWED_USER_ID or KITE_MCP_ALLOWED_USER_ID_SHA256), a login by any other Kite
+account is ended and refused.
 
 | Argument | Type | Required | Default | Description |
 |---|---|---|---|---|

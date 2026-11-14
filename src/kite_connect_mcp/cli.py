@@ -96,6 +96,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     settings = _settings(args)
+    from .auth.account import AccountPin
     from .server import build_runtime
 
     rt = build_runtime(settings, with_events=False)  # a status read never touches the serving process's store
@@ -113,7 +114,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             if args.verify:
                 try:
                     profile = await rt.client.get("/user/profile")
-                    out["live_check"] = {"verified": True, "user_id": (profile or {}).get("user_id")}
+                    user_id = (profile or {}).get("user_id")
+                    out["live_check"] = {"verified": True, **AccountPin.from_settings(settings).label(user_id)}
                 except KiteMCPError as exc:
                     out["live_check"] = {"verified": False, "error": rt.client.scrub(str(exc))}
             return out

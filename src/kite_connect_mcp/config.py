@@ -18,6 +18,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal
 
+from .auth.account import user_id_digest
 from .errors import ConfigError
 
 AuthMode = Literal["managed", "external"]
@@ -103,6 +104,21 @@ def _choice(env: Mapping[str, str], name: str, default: str, choices: tuple[str,
         problems.append(f"{name} must be one of {', '.join(choices)}, not {raw!r}")
         return default
     return value
+
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _sha256(env: Mapping[str, str], name: str, problems: list[str]) -> str | None:
+    """64 hexadecimal digits, any case, kept in lower case. The value is never echoed in a problem: a plain user id put
+    there by mistake must not reach a log."""
+    raw = env.get(name, "").strip().lower()
+    if not raw:
+        return None
+    if not _SHA256_RE.fullmatch(raw):
+        problems.append(f"{name} must be 64 hexadecimal digits: the SHA-256 of the user id in upper case")
+        return None
+    return raw
 
 
 def _window(
@@ -238,6 +254,7 @@ class Settings:
     auth_mode: AuthMode = "managed"
     token_file: Path = Path("access_token.json")
     allowed_user_id: str | None = field(default=None, repr=False)  # refuse logins from any other Kite account
+    allowed_user_id_sha256: str | None = field(default=None, repr=False)  # the pin as a digest (auth/account.py)
     login_link_ttl_s: int = 3600
 
     # --- endpoints ---
@@ -375,6 +392,7 @@ class Settings:
             auth_mode=_choice(env, "KITE_MCP_AUTH_MODE", "managed", ("managed", "external"), problems),  # type: ignore[arg-type]
             token_file=token_file,
             allowed_user_id=(env.get("KITE_MCP_ALLOWED_USER_ID", "").strip().upper() or None),
+            allowed_user_id_sha256=_sha256(env, "KITE_MCP_ALLOWED_USER_ID_SHA256", problems),
             login_link_ttl_s=_int(env, "KITE_MCP_LOGIN_LINK_TTL_S", 3600, problems, minimum=60),
             api_base_url=env.get("KITE_API_BASE_URL", DEFAULT_API_BASE_URL).strip().rstrip("/") or DEFAULT_API_BASE_URL,
             login_url=env.get("KITE_LOGIN_URL", DEFAULT_LOGIN_URL).strip() or DEFAULT_LOGIN_URL,
@@ -431,6 +449,15 @@ class Settings:
 
     def _consistency_problems(self) -> list[str]:
         problems: list[str] = []
+        if (
+            self.allowed_user_id is not None
+            and self.allowed_user_id_sha256 is not None
+            and user_id_digest(self.allowed_user_id) != self.allowed_user_id_sha256
+        ):
+            problems.append(
+                "KITE_MCP_ALLOWED_USER_ID and KITE_MCP_ALLOWED_USER_ID_SHA256 name different accounts: set one of them "
+                "(the digest is the SHA-256 of the user id in upper case)"
+            )
         if self.ticker_max_subscriptions > 3000:
             problems.append("KITE_MCP_TICKER_MAX_SUBSCRIPTIONS cannot exceed 3000 (Kite's per-connection limit)")
         if self.live_confirmation == "allowlist" and self.allowed_instruments is None:
@@ -482,6 +509,7 @@ KNOWN_VARIABLES = frozenset(
         "KITE_TICKER_URL",
         "KITE_MCP_AUTH_MODE",
         "KITE_MCP_ALLOWED_USER_ID",
+        "KITE_MCP_ALLOWED_USER_ID_SHA256",
         "KITE_MCP_LOGIN_LINK_TTL_S",
         "KITE_MCP_HTTP_TIMEOUT_S",
         "KITE_MCP_STATE_DIR",
