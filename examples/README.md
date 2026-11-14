@@ -1,8 +1,9 @@
-# Example event consumers
+# Example event consumers, and a login link command
 
 With `KITE_MCP_EVENTS=true`, the server records changes to your orders and hands each event to the consumers you list
 in the consumers file (`KITE_MCP_EVENTS_CONSUMERS_FILE`). A consumer is any program: it reads one event on stdin and
 says by its exit code whether it is done. These examples are starting points; copy one and change it to suit you.
+[A login link command](#a-login-link-command), for the scheduled login links, is at the end.
 
 | File | What it does | Settings (environment) |
 |---|---|---|
@@ -56,3 +57,49 @@ store with `KITE_MCP_EVENTS_DB`:
 ```bash
 kite-connect-mcp events tail --limit 1 | python3 examples/consumers/log_to_file.py; echo "exit $?"
 ```
+
+## A login link command
+
+With `KITE_MCP_LOGIN_LINK_COMMAND` set (in managed mode, with `KITE_MCP_PUBLIC_URL`, on the HTTP transport), the
+server hands a fresh Kite login link to a program of yours: at each reminder time (`KITE_MCP_LOGIN_REMINDER_TIMES`) when no valid token is stored,
+after Kite rejected the stored token, and when you call `login(deliver=true)`. You tap the link, log in to Kite, and
+Kite sends you back to the server, which stores the new token.
+
+| File | Input (stdin) | Exit | Settings (environment) |
+|---|---|---|---|
+| [login_link_telegram.py](login_link_telegram.py) | One JSON object: `{"url", "expires_at", "reason"}`, where `reason` is `scheduled`, `token_rejected` or `requested` | 0 sent; anything else not sent | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, optional `TELEGRAM_API_BASE` |
+
+The example sends a line saying why (time to log in, the stored session was rejected, or the link you asked for),
+the time the link expires, and the link on a line of its own. The link logs in to your account, once, until it
+expires: send it only to your own chat. The example never prints it and asks Telegram not to fetch a preview of it.
+The server does not retry a link that was not sent: its next scheduled time is the retry. It sends the command's
+output nowhere and notes only how it ended (`exit 1`), so run the command by hand to see its message.
+
+### Installing it
+
+1. Copy it somewhere only the server's user (or root) can change, for example `/usr/local/bin/send-kite-link`, and
+   make it executable: `chmod 755 /usr/local/bin/send-kite-link`. It must be owned by the server's user or root and
+   writable by no one else, and so must the folders on the way to it: the server checks it when it starts and before
+   each run. The server runs it with no arguments, through its first line (`#!/usr/bin/env python3`), so `python3`
+   must be on the server's `PATH`. Under systemd, as in [SELF_HOSTING.md](../docs/SELF_HOSTING.md), keep it out of
+   `/home`, which `ProtectHome=true` hides.
+2. Put the Telegram variables in the server's settings file, with your own values, and name them in
+   `KITE_MCP_LOGIN_LINK_ENV_PASS`: the command gets only `PATH`, `HOME`, `LANG` and the variables named there,
+   never the server's `KITE_*` settings.
+
+   ```bash
+   KITE_MCP_LOGIN_LINK_COMMAND=/usr/local/bin/send-kite-link
+   KITE_MCP_LOGIN_LINK_ENV_PASS=TELEGRAM_BOT_TOKEN,TELEGRAM_CHAT_ID
+   KITE_MCP_LOGIN_REMINDER_TIMES=07:30,08:30
+   TELEGRAM_BOT_TOKEN=123456:ABC-placeholder
+   TELEGRAM_CHAT_ID=123456789
+   ```
+
+3. Restart the server. `kite-connect-mcp status` then shows `login_links`: the times, the next one and how the last
+   link went. To try the command, ask your AI client for `login(deliver=true)`, or feed it a made-up link by hand,
+   with `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in your environment:
+
+   ```bash
+   echo '{"url": "https://kite.zerodha.com/connect/login?v=3&api_key=...", "reason": "requested"}' \
+       | /usr/local/bin/send-kite-link; echo "exit $?"
+   ```

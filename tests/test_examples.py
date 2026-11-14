@@ -275,3 +275,149 @@ def test_the_sample_consumers_file_is_valid(tmp_path):
     config = ConsumersConfig.load(path)
     assert {c.name for c in config.consumers} == {"telegram", "log"}
     assert "mytag" in config.tag_labels
+
+
+# --- the example login link command (KITE_MCP_LOGIN_LINK_COMMAND) ---------------------------------------------------
+
+LINK = "https://kite.zerodha.com/connect/login?v=3&api_key=testapikey0001&redirect_params=state%3DTestState0001"
+LINK_INPUT = {"url": LINK, "expires_at": "2026-11-17T05:59:00+05:30", "reason": "scheduled"}
+LINK_CMD = [sys.executable, str(EXAMPLES / "login_link_telegram.py")]
+
+
+def test_the_link_command_sends_the_link_to_the_chat(telegram):
+    base, fake = telegram
+    result = run(LINK_CMD, LINK_INPUT, {**TG_ENV, "TELEGRAM_API_BASE": base})
+    assert result.returncode == 0, result.stderr
+    (sent,) = fake.received
+    assert sent["path"] == f"/bot{BOT}/sendMessage" and sent["body"]["chat_id"] == "123456789"
+    assert LINK in sent["body"]["text"] and "05:59" in sent["body"]["text"]
+    assert sent["body"]["disable_web_page_preview"] is True  # Telegram must not fetch the one-time link
+    assert LINK not in (result.stdout + result.stderr).decode()
+
+
+def test_the_message_has_the_reason_the_expiry_and_the_link_on_its_own_line(telegram):
+    base, fake = telegram
+    assert run(LINK_CMD, LINK_INPUT, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 0
+    assert fake.received[0]["body"]["text"].splitlines() == [
+        "Time to log in to Kite.",
+        "It works once, until 05:59 IST.",
+        LINK,
+    ]
+
+
+def test_the_expiry_is_given_in_ist(telegram):
+    base, fake = telegram
+    expires_at = "2026-11-17T00:29:00+00:00"  # 05:59 IST
+    assert (
+        run(LINK_CMD, {**LINK_INPUT, "expires_at": expires_at}, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 0
+    )
+    assert "It works once, until 05:59 IST." in fake.received[0]["body"]["text"]
+
+
+@pytest.mark.parametrize("expires_at", [None, "", "tomorrow", 5])
+def test_an_expiry_that_does_not_parse_is_left_out(telegram, expires_at):
+    base, fake = telegram
+    link_input = {**LINK_INPUT, "expires_at": expires_at}
+    assert run(LINK_CMD, link_input, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 0
+    assert fake.received[0]["body"]["text"].splitlines() == ["Time to log in to Kite.", LINK]
+
+
+@pytest.mark.parametrize(
+    ("reason", "words"),
+    [("scheduled", "log in to Kite"), ("token_rejected", "rejected"), ("requested", "you asked for")],
+)
+def test_the_message_says_why(telegram, reason, words):
+    base, fake = telegram
+    assert run(LINK_CMD, {**LINK_INPUT, "reason": reason}, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 0
+    assert words in fake.received[0]["body"]["text"]
+
+
+@pytest.mark.parametrize("reason", ["something_new", None])
+def test_a_reason_it_does_not_know_still_sends_the_link(telegram, reason):
+    base, fake = telegram
+    link_input = {**LINK_INPUT, "reason": reason}
+    assert run(LINK_CMD, link_input, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 0
+    assert fake.received[0]["body"]["text"].splitlines()[0] == "Kite login link."
+
+
+@pytest.mark.parametrize("status", [400, 429, 502])
+def test_any_refusal_is_a_failure_without_retry(telegram, status):
+    base, fake = telegram
+    fake.status = status
+    assert (
+        run(LINK_CMD, LINK_INPUT, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 1
+    )  # the next time is the retry
+
+
+@pytest.mark.parametrize("bad", [{}, {"url": "ftp://x"}, {"url": "https://kite.example.com/x y"}])
+def test_input_without_a_link_is_refused(telegram, bad):
+    base, fake = telegram
+    assert run(LINK_CMD, bad, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 1 and fake.received == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"not json\n",
+        b"",
+        b'["https://kite.example.com/x"]\n',  # not an object
+        b'{"url": 5}\n',
+        b'{"url": "https://kite.example.com/x\\ny"}\n',  # a line break in the link
+        b'{"url": "https://"}\n',
+    ],
+)
+def test_input_that_is_not_a_link_object_is_refused_in_one_line(telegram, payload):
+    base, fake = telegram
+    result = subprocess.run(
+        LINK_CMD,
+        input=payload,
+        env={"PATH": os.environ["PATH"], **TG_ENV, "TELEGRAM_API_BASE": base},
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 1 and fake.received == []
+    assert result.stderr == b"login_link_telegram: the input holds no login link\n"
+
+
+@pytest.mark.parametrize(
+    "env",
+    [{}, {"TELEGRAM_BOT_TOKEN": BOT}, {"TELEGRAM_CHAT_ID": "123456789"}, {**TG_ENV, "TELEGRAM_CHAT_ID": " "}],
+)
+def test_the_link_command_without_its_settings_fails_naming_them(env):
+    result = run(LINK_CMD, LINK_INPUT, env)
+    assert result.returncode == 1
+    assert b"TELEGRAM_BOT_TOKEN" in result.stderr and b"TELEGRAM_CHAT_ID" in result.stderr
+    assert b"KITE_MCP_LOGIN_LINK_ENV_PASS" in result.stderr
+    assert LINK.encode() not in result.stdout + result.stderr
+
+
+def test_the_link_command_with_telegram_unreachable_fails():
+    result = run(LINK_CMD, LINK_INPUT, {**TG_ENV, "TELEGRAM_API_BASE": "http://127.0.0.1:9"})
+    assert result.returncode == 1  # no retry here: the next scheduled time is the retry
+    printed = result.stdout + result.stderr
+    assert LINK.encode() not in printed and b"127.0.0.1" not in printed and b"Traceback" not in printed
+    assert result.stderr.startswith(b"login_link_telegram: ") and result.stderr.count(b"\n") == 1
+
+
+@pytest.mark.parametrize(
+    ("base", "bot"),
+    [
+        ("127.0.0.1", BOT),  # no scheme: refused before any request is made
+        (None, "123456:ABC placeholder"),  # a space: http.client's error would quote the path, token and all
+        (None, "123456:ABCé"),  # not ASCII: the encoder's error would quote the request line, token and all
+    ],
+)
+def test_the_link_command_never_prints_the_token_or_the_link(telegram, base, bot):
+    url, fake = telegram
+    result = run(LINK_CMD, LINK_INPUT, {**TG_ENV, "TELEGRAM_BOT_TOKEN": bot, "TELEGRAM_API_BASE": base or url})
+    assert result.returncode == 1
+    printed = result.stdout + result.stderr
+    assert bot.encode() not in printed and b"ABC" not in printed and b"Traceback" not in printed
+    assert LINK.encode() not in printed and b"TestState0001" not in printed
+    assert result.stderr.startswith(b"login_link_telegram: ") and result.stderr.count(b"\n") == 1
+    assert fake.received == []
+
+
+def test_the_link_command_is_one_executable_program():
+    path = EXAMPLES / "login_link_telegram.py"
+    assert os.access(path, os.X_OK) and path.read_text().startswith("#!/usr/bin/env python3\n")
