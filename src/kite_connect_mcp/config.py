@@ -256,7 +256,7 @@ class Settings:
     allowed_user_id: str | None = field(default=None, repr=False)  # refuse logins from any other Kite account
     allowed_user_id_sha256: str | None = field(default=None, repr=False)  # the pin as a digest (auth/account.py)
     login_link_ttl_s: int = 3600
-    allow_logout: bool = True  # false: the logout tool and command refuse (auth/login.py)
+    allow_logout: bool = True  # false: no logout tool, and the logout command exits 2 (auth/login.py)
 
     # --- endpoints ---
     api_base_url: str = DEFAULT_API_BASE_URL

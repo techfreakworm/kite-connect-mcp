@@ -247,8 +247,8 @@ def _register_managed(reg: Registrar) -> None:
 
     if settings.allow_logout:
         _register_logout(reg)
-    else:
-        reg.skipped["logout"] = "KITE_MCP_ALLOW_LOGOUT=false"
+    else:  # the registrar's own reason first (toolset off, excluded), else the setting
+        reg.skipped["logout"] = reg.enabled("logout", "session", "auth") or "KITE_MCP_ALLOW_LOGOUT=false"
 
     if rt.login is not None:
         rt.extras.setdefault("http_routes", []).append(_callback_hook(rt, rt.login))

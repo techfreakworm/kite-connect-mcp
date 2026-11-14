@@ -8,7 +8,8 @@
 The human always logs in at Kite; nothing here types credentials for them (Zerodha's guidance forbids automating it).
 
 logout() ends the stored session for every client of the token. With KITE_MCP_ALLOW_LOGOUT=false it refuses (the tool
-is not offered and the command exits 2); ending a refused account's fresh session is not a logout and stays.
+is not offered, and the command exits 2 with a `logout_refused` audit line); ending a refused account's fresh session is
+not a logout and stays.
 
 The exchange, for a callback or a pasted token (`_finish`), one at a time per process:
 
@@ -392,7 +393,8 @@ class LoginManager:
         """End the Kite session of the stored token, delete the token file and close every open login link. If Kite
         cannot be reached the file is kept (deleting the only copy of a live token would leave it unrevocable) and an
         error is raised. A token Kite no longer knows, or one past its expiry, counts as ended. With
-        KITE_MCP_ALLOW_LOGOUT=false it refuses before reading anything."""
+        KITE_MCP_ALLOW_LOGOUT=false it refuses (audit event `logout_refused`) before it reads the token file or calls
+        Kite."""
         self._require_managed()
         if not self.settings.allow_logout:
             self._audit("logout_refused", source=source, reason="logout_off")
@@ -672,6 +674,12 @@ async def cli_logout(
         _note("the token is managed by another program (KITE_MCP_AUTH_MODE=external); this server does not log out.")
         return 2
     if not settings.allow_logout:
+        try:  # a logout timer left installed leaves a trace; this builds no runtime and never reads the token
+            AuditLog(settings.audit_dir, clock=clock or now_ist).write(
+                "logout_refused", tool="logout", source="cli", reason="logout_off"
+            )
+        except OSError as exc:
+            log.warning("could not write the audit log (%s)", exc.strerror)
         _note(LOGOUT_OFF)
         return 2
     if not yes:
