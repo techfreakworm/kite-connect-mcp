@@ -239,7 +239,9 @@ class EventService:
 
     def note_login(self, access_token: str, *, logged_in_at: dt.datetime, expires_at: dt.datetime) -> int | None:
         """A new token was stored: one `login` event per token (seeded with its fingerprint), whoever reports it (the
-        login manager, or the poll for a token stored beside this process)."""
+        login manager, or the poll for a token stored beside this process). A later login that Kite answers with the
+        same token string (one it rejected before) raises no second `login`: the event is the token's, not the
+        login's."""
         now = self.clock()
         body = login_event(
             seed=token_fingerprint(access_token), logged_in_at=logged_in_at, expires_at=expires_at, received_at=now

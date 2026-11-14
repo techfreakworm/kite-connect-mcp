@@ -489,8 +489,13 @@ async def test_a_listener_that_fails_is_logged_and_the_call_still_raises(events_
     assert rt.tokens.current() is None  # marked all the same (in memory)
 
 
-@pytest.mark.parametrize("env_token", [None, "testenvaccesstoken0000000000000003"], ids=["file", "environment"])
-def test_only_a_rejection_of_the_token_in_use_is_reported(events_rt, env_token):
+TOKEN_SOURCES = pytest.mark.parametrize(
+    "env_token", [None, "testenvaccesstoken0000000000000003"], ids=["file", "environment"]
+)
+
+
+@TOKEN_SOURCES
+def test_only_a_new_rejection_of_the_token_in_use_is_reported(events_rt, env_token):
     rt = events_rt(KITE_ACCESS_TOKEN=env_token)
     in_use = env_token or ACCESS_TOKEN
     other = ACCESS_TOKEN if env_token else NEW_TOKEN
@@ -498,11 +503,105 @@ def test_only_a_rejection_of_the_token_in_use_is_reported(events_rt, env_token):
     rt.tokens.on_rejected = heard.append
     rt.tokens.reject(other, report=True)  # a token no longer in use (the file was replaced since it was sent)
     assert heard == [] and rt.tokens.current().access_token == in_use
-    rt.tokens.reject(in_use)  # a logout's or a refused account's session call: never reported
-    assert heard == [] and rt.tokens.current() is None
     rt.tokens.reject(in_use, report=True)
+    assert heard == [in_use] and rt.tokens.current() is None
+    rt.tokens.reject(in_use, report=True)  # another call that met the same rejection: the mark is not new
     assert heard == [in_use]
     assert rt.events.store.events() == []  # the listener was replaced: nothing reached the store
+
+
+@TOKEN_SOURCES
+def test_a_token_a_session_call_marked_is_not_reported_by_a_later_call(events_rt, env_token):
+    rt = events_rt(KITE_ACCESS_TOKEN=env_token)
+    in_use = env_token or ACCESS_TOKEN
+    heard: list[str] = []
+    rt.tokens.on_rejected = heard.append
+    rt.tokens.reject(in_use)  # a logout's or a refused account's session call: never reported
+    assert heard == [] and rt.tokens.current() is None
+    rt.tokens.reject(in_use, report=True)  # a call in flight that Kite refused after the mark
+    assert heard == []
+
+
+def refused(_request: httpx2.Request) -> httpx2.Response:
+    """Kite's answer to a call sent with a token it no longer knows."""
+    body = {"status": "error", "message": "Incorrect token", "error_type": "TokenException", "data": None}
+    return httpx2.Response(403, json=body)
+
+
+async def in_flight(fake_kite, path: str, count: int) -> None:
+    """Let the event loop run until `count` calls to GET `path` have reached Kite, each sent with the token in use."""
+    for _ in range(1000):
+        if len(fake_kite.calls("GET", path)) >= count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"fewer than {count} calls to {path} reached Kite")
+
+
+async def test_a_call_kite_refuses_during_a_logout_raises_no_token_rejected(events_rt, fake_kite, monkeypatch):
+    KiteSession(fake_kite)  # the logout ends the session
+    answer = asyncio.Event()
+
+    async def refused_once_the_logout_marked_the_token(request: httpx2.Request) -> httpx2.Response:
+        await answer.wait()
+        return refused(request)
+
+    fake_kite.on("GET", "/user/profile", handler=refused_once_the_logout_marked_the_token)
+    rt = events_rt()
+    loop = asyncio.get_running_loop()
+    answered = threading.Event()
+    remove = rt.tokens.file.remove
+
+    def remove_once_the_call_is_answered() -> bool:
+        # the logout has ended the session and marked the token, and the file still holds it until this returns
+        loop.call_soon_threadsafe(answer.set)
+        answered.wait(5)
+        return remove()
+
+    monkeypatch.setattr(rt.tokens.file, "remove", remove_once_the_call_is_answered)
+    call = asyncio.create_task(rt.client.get("/user/profile"))  # a tool call, sent with the stored token
+    await in_flight(fake_kite, "/user/profile", 1)
+    logout = asyncio.create_task(rt.login.logout())
+    try:
+        with pytest.raises(TokenError):
+            await asyncio.wait_for(call, 5)  # Kite refuses it: the logout ended its session
+    finally:
+        answered.set()
+    assert (await logout).kite == "ended"
+    assert rt.events.store.events() == []  # a deliberate logout, not a rejection: no token_rejected
+
+
+async def test_several_calls_that_meet_one_rejection_report_it_once(events_rt, fake_kite, monkeypatch):
+    answer = asyncio.Event()
+
+    async def refused_together(request: httpx2.Request) -> httpx2.Response:
+        await answer.wait()
+        return refused(request)
+
+    fake_kite.on("GET", "/user/profile", handler=refused_together)
+    rt = events_rt()
+    reports: list[str] = []
+    report = rt.tokens.on_rejected
+
+    def counted(access_token: str) -> object:
+        reports.append(access_token)
+        return report(access_token)
+
+    rt.tokens.on_rejected = counted
+    inserts = []
+    insert = rt.events.store.insert_event
+
+    def counted_insert(*args, **kwargs):
+        inserts.append(1)
+        return insert(*args, **kwargs)
+
+    monkeypatch.setattr(rt.events.store, "insert_event", counted_insert)
+    calls = [asyncio.create_task(rt.client.get("/user/profile")) for _ in range(3)]
+    await in_flight(fake_kite, "/user/profile", 3)
+    answer.set()
+    results = await asyncio.wait_for(asyncio.gather(*calls, return_exceptions=True), 5)
+    assert [type(result) for result in results] == [TokenError] * 3
+    assert reports == [ACCESS_TOKEN] and len(inserts) == 1  # one report, one write of the event
+    assert [e["session"] for e in rt.events.store.events()] == ["token_rejected"]
 
 
 async def test_without_the_events_a_refused_call_works_as_before(runtime_factory, fake_kite):

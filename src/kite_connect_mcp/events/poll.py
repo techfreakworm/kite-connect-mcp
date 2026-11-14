@@ -21,7 +21,9 @@ In managed mode, a new token that another process stored beside this one (a logi
 event `login`; the login manager reports its own logins, and the two are one event (seeded with the token). The token
 in use when the service starts is not a login (prime()). Kite may answer such a login with the very token string it
 rejected before; the login command clears that mark only in its own memory, so a newer login record of a token marked
-rejected clears the mark here, and counts as a login.
+rejected clears the mark here, and the poll counts it as a login (it polls at once). Both session events are seeded with
+the token alone, though: `login` is raised for it only when that token has no `login` event yet (usually it has), and a
+second rejection of it raises no second `token_rejected`.
 """
 
 from __future__ import annotations
@@ -125,8 +127,9 @@ class Poller:
         that mark itself, but the login command beside it (`kite-connect-mcp login`) clears it only in its own memory,
         and this process would go on refusing a token Kite accepts. So in managed mode a record of the same token with
         a later login time than the record seen last, while that token is marked rejected, is such a login: its mark
-        is cleared. True when a mark was cleared (the caller counts it as a login). A login made while the service was
-        down is not seen: prime() takes the record of that time as the one seen."""
+        is cleared. True when a mark was cleared (the caller counts it as a login and polls; the session event `login`
+        is raised only when that token has none yet, as it is seeded with the token alone). A login made while the
+        service was down is not seen: prime() takes the record of that time as the one seen."""
         record = self._file_record()
         seen, self._file_seen = self._file_seen, record
         if record is None or seen is None or record.access_token != seen.access_token:
@@ -221,7 +224,8 @@ class Poller:
         try:
             self.prime()
         except Exception:
-            # no token is remembered, so the first one a tick can read counts as a login and is polled at once
+            # no token is remembered, so the first one a tick can read counts as a login and is polled at once; in
+            # managed mode it also raises the session event `login` for that token, though it was in use at the start
             log.exception("order events: could not read the token at start; the poll tries again")
         await self._safe_poll("startup")
         while not stop.is_set():
@@ -258,8 +262,9 @@ class Poller:
         store itself was stored by another process beside it (`kite-connect-mcp login`, which runs without the
         events): raise the session event `login` for it. The login manager reports its own logins too; both reports
         are seeded with the token's fingerprint, and the store keeps an event id once, so one token gives one event
-        whichever report comes first. In external mode the token is another program's: nothing is raised, as in
-        0.2.0. Never raises: the poll goes ahead."""
+        whichever report comes first. So a token Kite gave again after rejecting it (_relogin_of_a_rejected_token)
+        raises `login` only if it has no `login` event yet. In external mode the token is another program's: nothing
+        is raised, as in 0.2.0. Never raises: the poll goes ahead."""
         if self.settings.auth_mode != "managed":
             return
         svc = self.service

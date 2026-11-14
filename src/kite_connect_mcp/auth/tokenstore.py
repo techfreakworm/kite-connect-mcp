@@ -303,11 +303,15 @@ class TokenProvider:
     def reject(self, access_token: str, *, report: bool = False) -> None:
         """Kite said TokenException for this token: stop using it until a different token appears. With `report`
         (KiteClient.request, for a call that is not a session call) the listener `on_rejected` hears of it too, when the
-        token is the one in use (the environment's or the file's): the event service then raises token_rejected
-        whichever call met the rejection first. A logout and the end of another account's refused session never
-        report. A listener that fails is logged, never raised."""
-        self.rejections.add(token_fingerprint(access_token))
-        if not report or self.on_rejected is None:
+        mark is new and the token is the one in use (the environment's or the file's): the event service then raises
+        token_rejected whichever call met the rejection first. A logout and the end of another account's refused
+        session never report. A token already marked is not reported again: a logout marks the stored token before it
+        deletes the file, so a call in flight that Kite then refuses reports nothing, and several calls that meet one
+        rejection report it once. A listener that fails is logged, never raised."""
+        fingerprint = token_fingerprint(access_token)
+        known = fingerprint in self.rejections
+        self.rejections.add(fingerprint)
+        if known or not report or self.on_rejected is None:
             return
         record = self._env or self.file.read()
         if record is None or record.access_token != access_token:
