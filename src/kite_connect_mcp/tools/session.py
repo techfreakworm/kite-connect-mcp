@@ -176,13 +176,8 @@ def _register_status_and_login(reg: Registrar) -> None:
                 "session": status,
                 "message": f"Already logged in with a valid token. {advice}",
             }
-        if status.get("logged_in") and not settings.login_allow_force:
-            raise ToolInputError(
-                "forcing a new login is off on this server (KITE_MCP_LOGIN_ALLOW_FORCE=false) and the token is still "
-                "valid: no link is issued until it expires or Kite rejects it (session_status shows when)"
-            )
         manager = _manager(rt)
-        url, expires_at = await manager.issue_link()
+        url, expires_at = await manager.issue_link()  # refuses (audited) while forcing is off and the token is valid
         redirect = manager.redirect_url()
         if settings.transport == "http":
             handling = (

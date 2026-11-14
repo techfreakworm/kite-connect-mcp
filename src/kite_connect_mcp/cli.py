@@ -377,7 +377,9 @@ def build_parser() -> argparse.ArgumentParser:
         "login",
         help="managed mode: print a login link, or exchange a request_token",
         description="Managed mode only. Prints a one-time Kite login link on stdout (everything else goes to stderr). "
-        "Open it and log in at Kite; Kite then redirects to the redirect URL registered for your app.",
+        "Open it and log in at Kite; Kite then redirects to the redirect URL registered for your app. With "
+        "KITE_MCP_LOGIN_ALLOW_FORCE=false and a valid stored token, it first asks Kite once (GET /user/profile) and "
+        "exits 2 without a link while Kite still accepts that token.",
     )
     login_with = login.add_mutually_exclusive_group()
     login_with.add_argument(
