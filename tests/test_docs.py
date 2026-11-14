@@ -1,4 +1,5 @@
-"""The docs stay true to the code: every tool name and every KITE_* setting they mention exists."""
+"""The docs stay true to the code: every tool name and every KITE_* setting they mention exists. And the repo names
+only made-up funds."""
 
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ TOOL_WORD = re.compile(
 NOT_TOOLS = {"authorise_url"}  # result fields that happen to look like tool names
 SETTING = re.compile(r"\b(KITE_[A-Z][A-Z0-9_]*[A-Z0-9])\b(?!\.md)")
 NOT_SETTINGS = {"KITE_EVENT_CONSUMER"}  # the server sets it for each consumer command; it reads no such setting
+FUND_ISIN = re.compile(r"\bINF[0-9A-Z]{9}\b")
+SCANNED = ("src", "tests", "docs", "examples", "deploy")
 
 
 @pytest.fixture(scope="module")
@@ -83,3 +86,17 @@ def test_tool_reference_is_current(mcp_factory_module):
         "docs/TOOLS.md is stale: run KITE_MCP_ALLOW_MF_WRITES=true KITE_MCP_EVENTS_DB=<a store> kite-connect-mcp tools "
         "--markdown > docs/TOOLS.md, with a store made by EventStore(path).close()"
     )
+
+
+def test_only_made_up_funds_are_named():
+    """A real fund's ISIN in a test, a doc or a tool description could point at the holdings of whoever wrote it, so
+    every fund the repo names is made up, with the issuer code 000 (INF000...)."""
+    paths = [*ROOT.glob("*.md"), *(p for top in SCANNED for p in (ROOT / top).rglob("*") if p.is_file())]
+    real = sorted(
+        f"{path.relative_to(ROOT)}: {isin}"
+        for path in paths
+        if "__pycache__" not in path.parts
+        for isin in set(FUND_ISIN.findall(path.read_bytes().decode("utf-8", errors="ignore")))
+        if not isin.startswith("INF000")
+    )
+    assert real == []
