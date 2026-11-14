@@ -1,6 +1,6 @@
 """The consumers file: which consumer gets which event, how long its command may take and how its delivery is retried,
-which environment the command gets, and the labels shown for order tags. The router (events/router.py, part 1B)
-runs the commands.
+which environment the command gets, and the labels shown for order tags. The router (events/router.py) runs the
+commands.
 
 The consumers file (KITE_MCP_EVENTS_CONSUMERS_FILE) is JSON:
 

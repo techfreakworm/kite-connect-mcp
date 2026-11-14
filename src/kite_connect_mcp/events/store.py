@@ -558,8 +558,8 @@ class EventStore:
     ) -> bool:
         """Give a pending delivery its final status: done, failed (`events retry` can queue it again) or skipped. A
         new `error` replaces the last one; None keeps it. False, with nothing changed, when the delivery is no longer
-        pending: an operator's skip stays a skip even when the outcome of the try in flight lands after it. With
-        `con`, inside that write(), so it is kept or rolled back with what the block writes."""
+        pending: a skip by `events resume --skip-backlog` stays a skip even when the outcome of the try in flight
+        lands after it. With `con`, inside that write(), so it is kept or rolled back with what the block writes."""
         if status not in FINAL_STATUSES:
             raise ValueError(f"not a final delivery status: {status!r}")
         sql = (

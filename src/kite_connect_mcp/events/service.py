@@ -333,7 +333,7 @@ class EventService:
         self._refused_count = 0
 
     def user_allowed(self, user_id: object) -> bool:
-        """With KITE_MCP_ALLOWED_USER_ID set, a postback must name that account. (Plan 2 adds the hash pin.)"""
+        """With KITE_MCP_ALLOWED_USER_ID set, a postback must name that account."""
         pinned = self.settings.allowed_user_id
         if pinned is None:
             return True

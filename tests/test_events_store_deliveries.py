@@ -143,7 +143,7 @@ def test_the_summary(store):
     assert "other" in out["paused"]
 
 
-# --- beyond the plan's tests ----------------------------------------------------------------------------------------
+# --- one delivery at a time per order, consumers, retries and the summary -------------------------------------------
 
 
 def test_a_final_delivery_lets_the_next_event_of_its_order_go(store):
@@ -273,10 +273,10 @@ def test_a_skip_by_resume_survives_a_late_finish(store):
     add(store, "1", 100)
     picked, _ = store.next_delivery("notify", T0)  # the router picks seq 1 and runs the command ...
     store.pause("notify", T0)
-    assert store.resume("notify", skip_backlog=True, now=T0) == 1  # ... while the operator skips the backlog
+    assert store.resume("notify", skip_backlog=True, now=T0) == 1  # ... while you skip the backlog
     assert store.finish_delivery("notify", picked.seq, "failed", T0, "exit 1") is False
     assert row(store, "notify", 1) == ("skipped", 0, 0, SKIP_NOTE)
-    assert store.retry_failed("notify", T0) == 0  # so `events retry` does not send what the operator skipped
+    assert store.retry_failed("notify", T0) == 0  # so `events retry` does not send what you skipped
     assert store.finish_delivery("notify", picked.seq, "done", T0) is False  # a late success leaves it skipped too
     assert row(store, "notify", 1) == ("skipped", 0, 0, SKIP_NOTE)
     assert store.next_delivery("notify", T0) == (None, None)

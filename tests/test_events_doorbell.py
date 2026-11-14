@@ -145,7 +145,7 @@ async def test_wait_any_with_no_events_waits_the_timeout():
     assert loop.time() - started >= 0.02
 
 
-# --- beyond the plan's tests ----------------------------------------------------------------------------------------
+# --- replays, failed reads and rings that arrive while an order is read ---------------------------------------------
 
 
 def _doorbell_logs(caplog) -> str:

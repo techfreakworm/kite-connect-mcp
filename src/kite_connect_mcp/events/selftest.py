@@ -3,7 +3,7 @@
 The service recognizes its own signed selftest (the `selftest-` order id with a valid checksum) and stores it as a
 SelftestEvent, which only consumers that ask for selftests get. A 200 through the public URL proves the path up to the
 store: the proxy, the route, the checksum and the store's write. The command checks only that answer; whether a consumer
-that asks for selftests got it is for the operator to see (`events tail`, `events status`, the consumer's own output).
+that asks for selftests got it is for you to check (`events tail`, `events status`, the consumer's own output).
 
 A server without the event service answers a selftest 404 (postback.py), so the command fails there instead of
 reporting a test of nothing; without --url it refuses to run when this configuration has the service off. The command

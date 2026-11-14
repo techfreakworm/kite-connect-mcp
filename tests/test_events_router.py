@@ -449,7 +449,7 @@ async def test_a_delivery_skipped_while_it_runs_stays_skipped(build, tmp_path):
     real_run = router.run_command
 
     async def skip_while_running(c, body):
-        svc.store.resume("notify", skip_backlog=True, now=clock())  # the operator skips the backlog meanwhile
+        svc.store.resume("notify", skip_backlog=True, now=clock())  # you skip the backlog meanwhile
         return await real_run(c, body)
 
     router.run_command = skip_while_running

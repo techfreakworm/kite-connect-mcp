@@ -221,7 +221,7 @@ def test_a_write_that_fails_is_a_store_error(store):
         store.ring(ORDER_ID, FIXED_NOW)
 
 
-# --- beyond the plan's tests ----------------------------------------------------------------------------------------
+# --- the store's files, failed writes, prune and the read-only store ------------------------------------------------
 
 
 def _deliveries(store):
@@ -296,7 +296,7 @@ def test_a_read_only_store_opens_when_the_writer_is_closed(store):
         reader.close()
 
 
-# --- each order's last event id, opening, schema version, and the review's edge cases ------------------------------
+# --- each order's last event id, opening, schema version, and edge cases --------------------------------------------
 
 
 def ingest(store, row, *, source="poll", now=FIXED_NOW):
