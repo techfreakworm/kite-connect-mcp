@@ -100,4 +100,4 @@ def test_the_unit_shows_the_login_settings_commented_out():
         "KITE_MCP_LOGIN_REMINDER_TIMES", "KITE_MCP_LOGIN_LINK_COMMAND", "KITE_MCP_LOGIN_LINK_ENV_PASS",
     ):  # fmt: skip
         assert re.search(rf"^#\s+{name}=", text, flags=re.M), name
-    assert not re.search(r"^Environment=KITE_MCP_LOGIN", text, flags=re.M)  # settings file only: the commands read it
+    assert not re.search(r"^Environment=KITE_MCP_(ALLOW|LOGIN)", text, flags=re.M)  # settings file: commands read it

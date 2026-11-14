@@ -45,8 +45,8 @@ What a 0.2.0 setup sees without changing a setting:
   `login_refused` and `login_failed`. `match` has no filter by session name: ignore the names you do not want (exit 0).
 - `token_rejected` is now raised also when a tool call is the first to meet Kite's rejection of the stored token
   (0.2.0: only the poll and the doorbell). It is still raised once per token, and never by a logout.
-- In managed mode, a token that another process stores beside the serving process (`kite-connect-mcp login` run by
-  hand, say) raises `login`, seen by the poll within seconds.
+- With the order events on, in managed mode, a token that another process stores beside the serving process
+  (`kite-connect-mcp login` run by hand, say) raises `login`, seen by the poll within seconds.
 - With the order events on, a token Kite rejected stays rejected across a restart: the rejection is kept by the
   token's fingerprint in the event store (0.2.0 forgot it). A new login that Kite answers with the same token string
   clears it.
@@ -56,6 +56,9 @@ What a 0.2.0 setup sees without changing a setting:
 
 - docs/CONFIGURATION.md said that an empty boolean setting counts as false. It means the default, as the server has
   always read it.
+- docs/SELF_HOSTING.md said that a variable only in the `--env-file` file (`HTTPS_PROXY`, say) is not exported. The
+  server exports the file's variables to its own process, without replacing one already set. And a login link stops
+  working at 05:59 IST at the latest, not 06:00, as docs/CONFIGURATION.md and `.env.example` said.
 
 ### Security
 

@@ -37,7 +37,9 @@ class AccountPin:
     # the pinned account's digest; None: no pin, any account is accepted. Out of the repr, as on Settings: the plain
     # id can be found from it by trying them all
     digest: str | None = field(repr=False)
-    by_hash: bool = False  # given as KITE_MCP_ALLOWED_USER_ID_SHA256: the plain id is never written
+    # given as KITE_MCP_ALLOWED_USER_ID_SHA256: the server's own words name the account by a digest prefix (Kite's
+    # answers that the read tools pass on still hold the plain id)
+    by_hash: bool = False
 
     @classmethod
     def from_settings(cls, settings: Settings) -> AccountPin:

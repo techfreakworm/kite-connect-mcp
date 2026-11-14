@@ -243,10 +243,10 @@ in a tool cannot, by itself, send an unreviewed write.
 | `live_result` | Kite accepted the request | `counts`, `order_count`, `value_inr`, `notional_inr`, `order_id`, `response` |
 | `live_error` | Kite answered with an error | `error_type`, `status`, `error` |
 | `live_unknown` | No answer (timeout, dropped connection): the write may have happened | `counts`, `order_count`, `value_inr`, `notional_inr`, `error` |
+| `kill_switch_engaged` | `engage_kill_switch` ran | `reason` |
 
 `value_inr` is what a write adds to today's usage (for a modification, its increase; for a conversion or a cancel,
 nothing); `notional_inr` is the full value of its legs, kept for the record.
-| `kill_switch_engaged` | `engage_kill_switch` ran | `reason` |
 
 The `call_id` ties a `live_intent` to its `live_result`, `live_error` or `live_unknown`. A `live_intent` with no outcome
 after a crash means the outcome is unknown: check the order book.
@@ -306,8 +306,9 @@ Read it with `kite-connect-mcp audit [--date YYYY-MM-DD] [--limit N]`, with the 
   secret, since a user ID is short and its SHA-256 can be found by trying every ID; and Kite's own answers that the
   read tools pass on, such as `get_profile` and an order's placed_by field, still hold the plain ID.
 - **Logout can be turned off.** With `KITE_MCP_ALLOW_LOGOUT=false` the `logout` tool is not offered and the logout
-  command refuses (exit 2, with a `logout_refused` audit line): nothing this server runs ends the stored session,
-  which lapses at 06:00 IST. Ending a refused account's fresh session is not a logout, and still happens.
+  command refuses (exit 2, with a `logout_refused` audit line): no logout ends the stored session, which lapses at
+  06:00 IST (a new login still does, unless forcing is off too: see the next point). Ending a refused account's fresh
+  session is not a logout, and still happens.
 - **Forcing a new login can be turned off.** A login from a new link ends the token in use at Kite. With
   `KITE_MCP_LOGIN_ALLOW_FORCE=false` no link is issued while a valid token exists (not expired, and not rejected by
   Kite), whoever asks: the `login` tool even with force=true or deliver=true, and the `login` command. Each refusal is

@@ -68,6 +68,16 @@ def test_the_health_answer_is_shown_as_it_is(doc):
 
 
 @pytest.mark.parametrize("doc", DOCS, ids=lambda p: p.name)
+def test_the_digest_recipe_keeps_the_id_out_of_the_shell_history(doc):
+    """KITE_MCP_ALLOWED_USER_ID_SHA256 is there so the plain id need not be in any file: a recipe with the id on the
+    command line writes it to the shell's history file, and sha256sum's "  -" after the digest fails the check. So
+    the id is read from the terminal, and only the 64 digits are printed."""
+    for line in doc.read_text(encoding="utf-8").splitlines():
+        if "sha256sum" in line:
+            assert "read -r" in line and "cut -d' ' -f1" in line, f"{doc.name}: {line.strip()}"
+
+
+@pytest.mark.parametrize("doc", DOCS, ids=lambda p: p.name)
 def test_settings_in_docs_exist(doc):
     mentioned = set(SETTING.findall(doc.read_text(encoding="utf-8")))
     unknown = sorted(m for m in mentioned - KNOWN_VARIABLES - _FILE_VARIANTS - NOT_SETTINGS if not m.endswith("_FILE"))

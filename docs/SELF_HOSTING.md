@@ -464,9 +464,9 @@ addresses, your own and your family's only) are in [KITE_SETUP.md](KITE_SETUP.md
 - **No static IP on this machine?** Send the server's requests to Kite through a forward proxy on a host that has one, by
   adding `HTTPS_PROXY=http://203.0.113.10:3128` (your proxy's address) to the settings file that systemd or Docker reads.
   The server's HTTP client honours the standard proxy variables. Register the proxy's address with Zerodha. The variable
-  has to be in the process environment: one that is only in a file passed to `--env-file` is not exported and has no
-  effect, so give it to a client through its `env` block instead. Check your proxy's logs for a CONNECT to
-  `api.kite.trade:443` after the first request.
+  works from the process environment or from a file passed to `--env-file`: the server exports that file's variables to
+  its own process, without replacing one already set. Check your proxy's logs for a CONNECT to `api.kite.trade:443`
+  after the first request.
 - **Reading and dry runs work without any of this.** You only need the static IP when you want to send a live order.
 
 ### The daily login on a server
@@ -485,7 +485,7 @@ You log in once per trading day. On a server it takes about half a minute and wo
 
 Everything connected to the server uses that token until it expires, and the server picks it up again after a restart.
 If the link no longer works, ask for a new one (a link is valid for `KITE_MCP_LOGIN_LINK_TTL_S`, an hour by default, and
-never past the next 06:00 IST).
+never past 05:59 IST, the minute before the token reset).
 
 Do not log in with the same API key from anywhere else: a new session invalidates the old token. See
 [Why one program owns the login](KITE_SETUP.md#why-one-program-owns-the-login).
@@ -519,10 +519,16 @@ changed by others, and the journal says why. `kite-mcp-ctl status` then shows `l
 and how the last link went. The link command calls `api.telegram.org`, so allow that in your outbound firewall if you
 filter outbound traffic. One serving process sends the links of a state folder.
 
+**Docker.** Mount the command into the container read-only (at `/opt/kite-connect-mcp/bin/send-kite-link`, say),
+owned by root or by uid 10001, the image's user, and writable by no one else, and put its settings, the Telegram
+variables included, in the env file. The example's first line, `#!/usr/bin/env python3`, finds the image's Python
+(`/usr/local/bin/python3`) through `PATH`. The image runs HTTP already.
+
 To keep an assistant from ending or replacing the day's session, add `KITE_MCP_ALLOW_LOGOUT=false` and
 `KITE_MCP_LOGIN_ALLOW_FORCE=false` to the settings file
 ([SAFETY.md](SAFETY.md#14-sessions-credentials-and-external-mode)). With forcing off, `kite-mcp-ctl login` asks Kite
-once whether the stored token still works, and gives no link while it does.
+once whether the stored token still works, and gives no link (exit 2) while it does, or when Kite could not be asked
+(run it again).
 
 ### Optional: an evening logout
 

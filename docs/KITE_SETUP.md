@@ -201,7 +201,9 @@ result.
    `POST /session/token` with a checksum of `api_key + request_token + api_secret`.
 6. If you set an account pin, the server refuses a login from any other Kite account (and ends the session it
    opened). The pin is your user ID in `KITE_MCP_ALLOWED_USER_ID`, or its SHA-256 in
-   `KITE_MCP_ALLOWED_USER_ID_SHA256` (`printf %s AB1234 | sha256sum`), so the plain ID need not be in any file.
+   `KITE_MCP_ALLOWED_USER_ID_SHA256`, so the plain ID need not be in any file. To make it, run
+   `read -r id && printf %s "$id" | tr '[:lower:]' '[:upper:]' | sha256sum | cut -d' ' -f1` and type your user ID:
+   the ID stays out of the shell's history, and only the 64 digits are printed.
 7. The server stores the access token in its state directory with mode 600. Every client connected to the server now
    uses it, and the server picks it up again after a restart.
 8. The token stops working at about 06:00 IST the next morning, before the market opens. Repeat from step 1.

@@ -759,8 +759,14 @@ too. With the times `07:30,08:30` on a weekday with no valid token:
 - the server is down from 07:00 and comes back at 09:10: it sends the 08:30 link at once, and the 07:30 one never;
 - it comes back at 11:45 instead: it sends nothing, as 08:30 is more than 3 hours past; the next link is the next
   reminder time;
-- it is stopped while the command runs: a command still running 10 seconds later is killed and nothing is recorded,
-  so a restart within the 3 hours sends that time again.
+- it is stopped while the command runs, and only the server gets the stop signal (`docker stop`, or a systemd unit
+  with `KillMode=mixed`): the command has up to 10 seconds to finish, and its outcome is recorded if it does; one still
+  running then is killed (by the server, or by Docker's own stop timeout, also 10 seconds by default) and nothing is
+  recorded, so a restart within the 3 hours sends that time again;
+- it is stopped by systemd with the default `KillMode=control-group`, as in the shipped unit: systemd sends SIGTERM to
+  every process of the service at once, the command included, and a command that does not catch it (the Telegram
+  example does not) ends at once. That attempt is recorded as failed (`killed by SIGTERM`) with its time, so a
+  restart does not send that time again: the next reminder time is the one.
 
 A late link is logged as caught up. A failed link is not retried: the next scheduled time is the retry.
 
@@ -781,8 +787,9 @@ A late link is logged as caught up. A failed link is not retried: the next sched
 ```
 
 `url` is the login link; `expires_at` when it stops working (`KITE_MCP_LOGIN_LINK_TTL_S` after it was issued, and
-never past 05:59 IST); `reason` is `scheduled`, `token_rejected` or `requested`. Whoever holds the link can complete
-one login to your account with it until it expires: send it only to yourself, and never print or log it.
+never past 05:59 IST); `reason` is `scheduled`, `token_rejected` or `requested`. Whoever holds the link can use it
+once, until it expires, to complete a Kite login to this server (with any account the pin allows): send it only to
+yourself, and never print or log it.
 
 ### What is never stored or logged
 
