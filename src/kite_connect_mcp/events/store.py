@@ -155,10 +155,10 @@ class Doorbell:
 @dataclass(frozen=True)
 class Delivery:
     """One consumer's pending delivery of one event (`seq`). `order_key` groups the deliveries that go one at a time
-    and in order. `attempts` counts the failed tries since the delivery was queued (retry_failed starts it
-    again at 0), `first_try_at` is when the first of them was made (None before any), `next_try_at` when the delivery
-    is due, `last_error` the last error a try gave. `delayed_sent` says whether the delivery_delayed alert for it has
-    been recorded (mark_alerted), so that alert is sent once."""
+    and in order. `attempts` counts the failed tries since the delivery was queued (retry_failed, and resume after a
+    pause, start it again at 0), `first_try_at` is when the first of them was made (None before any), `next_try_at`
+    when the delivery is due, `last_error` the last error a try gave. `delayed_sent` says whether the delivery_delayed
+    alert for it has been recorded (mark_alerted), so that alert is sent once."""
 
     consumer: str
     seq: int
@@ -442,16 +442,20 @@ class EventStore:
 
     # --- doorbells ------------------------------------------------------------------------------------------------
 
-    def ring(self, order_id: str, now: dt.datetime) -> None:
+    def ring(self, order_id: str, now: dt.datetime, *, rings: int = 1) -> None:
         """Keep a doorbell for `order_id` (one per order, however often it rings; each ring adds one to its `rings`)
-        and count the ring in `postback_accepted`, in one transaction: on a StoreError neither is kept."""
+        and count the rings in `postback_accepted`, in one transaction: on a StoreError neither is kept. `rings` (one or
+        more; ValueError otherwise) is how many rings this write stands for: the event service merges the rings of one
+        order that come close together."""
+        if rings < 1:
+            raise ValueError("a doorbell rings once or more")
         with self.write() as con:
             con.execute(
-                "INSERT INTO doorbells (order_id, first_rung_at) VALUES (?, ?) "
-                "ON CONFLICT(order_id) DO UPDATE SET rings = doorbells.rings + 1",
-                (order_id, iso(now)),
+                "INSERT INTO doorbells (order_id, first_rung_at, rings) VALUES (?, ?, ?) "
+                "ON CONFLICT(order_id) DO UPDATE SET rings = doorbells.rings + excluded.rings",
+                (order_id, iso(now), rings),
             )
-            _bump(con, "postback_accepted", now)
+            _bump(con, "postback_accepted", now, by=rings)
 
     def doorbells(self) -> list[tuple[str, int]]:
         """(order_id, tries), oldest first."""
@@ -625,10 +629,18 @@ class EventStore:
 
     def resume(self, consumer: str, *, skip_backlog: bool, now: dt.datetime) -> int:
         """Deliver again; with `skip_backlog` the waiting deliveries are marked skipped. Returns how many were
-        skipped."""
+        skipped. A paused consumer's waiting deliveries start their tries afresh (no tries, no alert sent, as
+        retry_failed does), so the time spent paused counts towards neither their alert nor their give-up point: a
+        target fixed an hour later is not failed for good by one temporary error on the first try after the resume."""
         with self.write() as con:
-            con.execute("DELETE FROM paused WHERE consumer = ?", (consumer,))
+            was_paused = con.execute("DELETE FROM paused WHERE consumer = ?", (consumer,)).rowcount == 1
             if not skip_backlog:
+                if was_paused:
+                    con.execute(
+                        "UPDATE deliveries SET attempts = 0, first_try_at = NULL, delayed_sent = 0, updated_at = ? "
+                        "WHERE consumer = ? AND status = 'pending'",
+                        (iso(now), consumer),
+                    )
                 return 0
             return int(
                 con.execute(

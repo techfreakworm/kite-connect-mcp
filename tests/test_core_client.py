@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import gzip
 import json
+import os
 from pathlib import Path
 
 import httpx2
@@ -372,6 +373,39 @@ def test_a_utf8_token_file_without_a_token_does_not_blame_the_encoding(tmp_path,
     assert TokenFile(path, writable=False).read() is None
     (line,) = [r.getMessage() for r in caplog.records if "token file" in r.getMessage()]
     assert line.endswith("does not hold a usable token")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads and stats whatever the modes say")
+def test_a_token_file_that_cannot_be_read_is_logged_once_per_error(tmp_path, caplog):
+    """The event service's poll reads the token every few seconds: a file it cannot read is logged when that starts
+    and when the error changes, not on every read."""
+    folder = tmp_path / "tokens"
+    folder.mkdir()
+    path = write_token_file(folder / "t.json")
+    token_file = TokenFile(path, writable=False)
+
+    def lines() -> list[str]:
+        return [r.getMessage() for r in caplog.records if "token file" in r.getMessage()]
+
+    try:
+        path.chmod(0o040)  # cannot read it (its group could, which is said only once the file is read)
+        for _ in range(3):
+            assert token_file.read() is None
+        assert len(lines()) == 1 and lines()[0].startswith("cannot read the token file")
+        folder.chmod(0o000)  # cannot even look at it: another error
+        for _ in range(3):
+            assert token_file.read() is None
+        assert len(lines()) == 2 and lines()[1].startswith("cannot stat the token file")
+        folder.chmod(0o700)
+        path.chmod(0o600)
+        assert token_file.read() is not None  # it works again...
+        path.chmod(0o000)
+        os.utime(path, ns=(1, 1))  # (another file: not the cached one)
+        assert token_file.read() is None
+        assert len(lines()) == 3  # ...so the same error is news again
+    finally:
+        folder.chmod(0o700)
+        path.chmod(0o600)
 
 
 def test_expired_token_is_not_used(tmp_path):

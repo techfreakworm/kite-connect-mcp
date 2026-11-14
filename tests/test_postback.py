@@ -16,6 +16,7 @@ import pytest
 from mcp import Client
 
 from conftest import API_SECRET, BEARER, tool_json
+from events_helpers import Clock
 from kite_connect_mcp import postback as postback_module
 from kite_connect_mcp.postback import MAX_BODY_BYTES, PostbackRoute, compute_checksum, verify_checksum
 from kite_connect_mcp.server import build_http_app, build_server
@@ -354,6 +355,24 @@ async def test_building_the_server_twice_registers_the_hook_once(runtime_factory
 
 
 # --- logs ------------------------------------------------------------------------------------------------------------
+
+
+async def test_accepted_postbacks_are_logged_at_most_once_a_minute(make_app, http, caplog):
+    """A replayed postback is accepted as often as it is sent, so its line is limited like a refusal's."""
+    caplog.set_level(logging.INFO)
+    rt, _, app = make_app()
+    rt.clock = clock = Clock()
+    client = http(app)
+    for _ in range(3):
+        assert (await send(client, postback())).status_code == 200
+
+    def lines() -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.getMessage().startswith("postback accepted")]
+
+    assert lines() == ["postback accepted"] and len(buffered(rt)) == 3  # each still reaches the buffer
+    clock.advance(60)
+    await send(client, postback())
+    assert lines()[-1] == "postback accepted (2 more like it since the last such line)"
 
 
 async def test_the_payload_never_reaches_the_logs(make_app, http, caplog):

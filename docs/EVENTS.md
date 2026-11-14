@@ -99,19 +99,31 @@ order, and refuses it with a bare response (no body) at the first check that fai
 
 Refusals are counted in `postback_refused`, with the last one's reason as its note; a wrong API secret shows up there
 as `bad checksum`. They are written to the store at most once a second and logged at most once a minute per reason, so
-junk sent to the route can neither keep the disk busy nor flood the log. Nothing from a refused request is stored, and
-the route logs nothing from any request (no order id, no checksum, no user).
+junk sent to the route can neither keep the disk busy nor flood the log. The line for an accepted postback is logged at
+most once a minute too, since a replay can repeat it as often. Nothing from a refused request is stored, and the route
+logs nothing from any request (no order id, no checksum, no user).
 
 A postback that passes every check is answered:
 
 - **200** once its doorbell is on disk: the order id is kept in the store and counted in `postback_accepted`;
+- **200 at once, with the ring written within 2 seconds,** when its order's doorbell was written less than 2 seconds
+  ago. One order's doorbell is written at most once every 2 seconds: the postbacks in between are held in memory and
+  written as one ring (each counted) when the 2 seconds are over, or when the server stops. So a burst of updates still
+  gets one more read after its last postback, and a captured postback replayed with a field changed (which the checksum
+  does not cover) costs at most one write and one read every 2 seconds. A held ring that cannot be written (it is
+  logged), or that a crash loses, is left to the poll. A selftest within 2 seconds of the same one is answered 200 and
+  not written again;
 - **503** when the store cannot write: nothing is written to the store, the log says so, and the poll catches the
   change later;
-- **200 without a write** when it repeats, byte for byte, a postback accepted in the last 10 seconds (Kite sending it
-  twice, or a replay): its doorbell has rung already.
+- **200 without a write** when it repeats a postback accepted in the last 10 seconds (Kite sending it twice, or a
+  replay): its doorbell has rung already. A repeat is the same JSON, whitespace and the order of the keys aside.
 
 A worker then reads each waiting doorbell's order from Kite (`GET /orders/{order_id}`), takes the last row of its
 history, and records Kite's answer, with `postback` as its source, if it reports a change (see [Events](#events)).
+The `gtt` marker and the check on the exchange's update time (see
+[Deduplication](#deduplication-and-why-progress-only-moves-forward)) need Kite to include `meta` and
+`exchange_update_timestamp` in the history's rows as in the order book's: without them an event from a postback reads
+`gtt` false, and is judged without the exchange's time.
 
 - **No token.** Without a valid token nothing is read, and the doorbells wait. The poll that a login starts reads them
   first, so a fill that happened before your morning login (of an AMO placed through this API key, say) is reported
@@ -441,7 +453,9 @@ How it ends decides what the router does:
 
 **Retries.** By default a delivery is tried again after 10 s, 30 s, 1 min, 2 min and 5 min, then every 5 min, until
 30 minutes have passed since its first try; then it fails and `delivery_failed` is raised. A delivery still retrying
-past its alert point (60 s by default) raises `delivery_delayed`, once per round of tries.
+past its alert point (60 s by default) raises `delivery_delayed`, once per round of tries. A paused consumer's
+deliveries raise no alert, and `events resume` starts their tries afresh, so the time paused counts towards neither
+point.
 
 **Two traps.**
 
@@ -509,8 +523,8 @@ uid 10001 or root.
 |---|---|
 | `kite-connect-mcp events status` | The health of the postbacks, the poll and each consumer, as JSON (below). |
 | `kite-connect-mcp events tail [--limit N] [--order ID]` | The newest events, oldest first, one JSON object per line: 20 by default, from 1 to 1000. `--order` keeps one order's events. |
-| `kite-connect-mcp events pause NAME` | Hold a consumer's deliveries. Events are still recorded, and its deliveries wait. |
-| `kite-connect-mcp events resume NAME [--skip-backlog]` | Deliver again, the backlog first. With `--skip-backlog` the waiting deliveries are marked skipped instead (events you have dealt with by hand). |
+| `kite-connect-mcp events pause NAME` | Hold a consumer's deliveries. Events are still recorded, and its deliveries wait, with no `delivery_delayed` alert. |
+| `kite-connect-mcp events resume NAME [--skip-backlog]` | Deliver again, the backlog first; a delivery that was retrying starts its tries afresh, as a new one. With `--skip-backlog` the waiting deliveries are marked skipped instead (events you have dealt with by hand). |
 | `kite-connect-mcp events retry NAME` | Queue a consumer's failed deliveries again. |
 | `kite-connect-mcp events selftest [--url URL]` | Post a signed, made-up postback and check that the answer is 200. |
 
@@ -633,10 +647,11 @@ states not updated since, and doorbells older than two days.
 - **A forged postback** (made without the API secret) fails the checksum: a bare 403, counted, nothing stored.
 - **A replayed or altered postback** (a real one, captured) passes the checksum, but only rings the doorbell: it costs
   one read of that order from Kite, plus one in each later round while Kite fails, until it is given up. What is
-  stored is Kite's own answer, so a replay can neither invent a state nor hold an order in an old one. An exact repeat
-  within 10 seconds costs no write at all.
+  stored is Kite's own answer, so a replay can neither invent a state nor hold an order in an old one. A repeat (the
+  same JSON) within 10 seconds costs no write at all, and one order's doorbell is written at most once every 2 seconds
+  however its postbacks vary.
 - **No payload in the logs.** The route logs nothing from a request (no order id, checksum or user), and logs its
-  refusals at most once a minute per reason.
+  refusals, and the accepted postbacks, at most once a minute per reason.
 - **The consumers' environment is minimal:** argv only, no shell, `PATH`, `HOME`, `LANG`, `KITE_EVENT_CONSUMER` and the
   names in `env_pass`, never a `KITE_*` variable. The consumers file and the programs must not be changeable by others
   (see [File permissions](#file-permissions)).

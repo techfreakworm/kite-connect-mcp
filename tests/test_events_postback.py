@@ -3,6 +3,7 @@ and the log in a burst); exact repeats not rung again; selftests recorded."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator, Callable
@@ -14,7 +15,7 @@ from mcp import Client
 
 from conftest import API_SECRET, BEARER, tool_json
 from events_helpers import ORDER_ID, Clock, order_row
-from kite_connect_mcp.events.store import StoreError
+from kite_connect_mcp.events.store import EventStore, StoreError
 from kite_connect_mcp.postback import PostbackRoute, RepeatGuard, compute_checksum
 from kite_connect_mcp.server import build_http_app, build_server
 
@@ -190,7 +191,7 @@ async def test_refused_and_selftest_postbacks_stay_out_of_the_ticker_buffer(make
 
 async def test_an_exact_repeat_within_ten_seconds_is_answered_without_ringing_again(make_app, http):
     rt, app = make_app()
-    rt.clock = clock = Clock()
+    rt.clock = rt.events.clock = clock = Clock()  # one clock, as in a server
     client = http(app)
     first = signed(status="OPEN")
     assert (await post(client, first)).status_code == 200
@@ -207,11 +208,13 @@ async def test_an_exact_repeat_within_ten_seconds_is_answered_without_ringing_ag
 
 async def test_a_new_update_of_the_same_order_is_rung_at_once(make_app, http):
     """Kite's checksum covers only order_id and order_timestamp, so an order's fill carries the same checksum as its
-    placement: only an identical body is a repeat."""
+    placement: only the same body is a repeat."""
     rt, app = make_app()
+    rt.clock = rt.events.clock = clock = Clock()
     client = http(app)
     await post(client, signed(status="OPEN", filled_quantity=0))
     rt.events.store.doorbell_done(ORDER_ID, rings=1)
+    clock.advance(rt.events.RING_EVERY_S)  # (sooner, it would be held: see the next tests)
     await post(client, signed(status="COMPLETE", filled_quantity=25))
     assert rt.events.store.doorbells() == [(ORDER_ID, 0)]
     assert rt.events.store.counters()["postback_accepted"]["count"] == 2
@@ -222,7 +225,7 @@ async def test_a_repeat_after_a_503_is_rung(make_app, http, monkeypatch):
     client = http(app)
     ring = rt.events.ring
 
-    def broken(order_id):
+    def broken(order_id, **_):
         raise StoreError("cannot write the event store: disk I/O error")
 
     monkeypatch.setattr(rt.events, "ring", broken)
@@ -230,6 +233,134 @@ async def test_a_repeat_after_a_503_is_rung(make_app, http, monkeypatch):
     monkeypatch.setattr(rt.events, "ring", ring)
     assert (await post(client, signed())).status_code == 200
     assert rt.events.store.doorbells() == [(ORDER_ID, 0)]
+
+
+async def test_a_copy_with_other_whitespace_or_key_order_is_a_repeat(make_app, http):
+    """A repeat is the same JSON, not the same bytes: a captured postback with a space added would otherwise cost a
+    write and a read from Kite each time."""
+    rt, app = make_app()
+    client = http(app)
+    body = signed(status="OPEN")
+    assert (await post(client, body)).status_code == 200
+    rt.events.store.doorbell_done(ORDER_ID, rings=1)  # the worker read the order
+    copies = [
+        json.dumps(body).encode() + b" ",
+        json.dumps(body, indent=2).encode(),
+        json.dumps(dict(reversed(body.items())), separators=(",", ":")).encode(),
+        b'{"status": "REJECTED", ' + json.dumps(body).encode()[1:],  # a key given twice: JSON keeps the last one
+    ]
+    for copy in copies:
+        assert (await post(client, copy)).status_code == 200
+    assert rt.events.store.doorbells() == [] and rt.events.store.counters()["postback_accepted"]["count"] == 1
+
+
+async def test_rings_of_one_order_are_written_at_most_every_two_seconds_and_merged(make_app, http, fake_kite):
+    """A captured postback with a field changed that the checksum does not cover is a new body each time: each would
+    cost a write that waits for the disk, on the event loop, and a read from Kite. So one order's doorbell is written
+    at most once every RING_EVERY_S; the rings in between are held and written as one when it ends, so the order is
+    still read again after its last ring."""
+    rt, app = make_app()
+    svc = rt.events
+    rt.clock = svc.clock = clock = Clock()
+    client = http(app)
+    assert (await post(client, signed(status="OPEN"))).status_code == 200
+    svc.store.doorbell_done(ORDER_ID, rings=1)  # the worker read the order
+    for n in range(5):
+        assert (await post(client, signed(status="COMPLETE", filled_quantity=n))).status_code == 200
+    assert svc.store.doorbells() == [] and svc.store.counters()["postback_accepted"]["count"] == 1  # held
+    other = "250101000000002"
+    assert (
+        await post(client, signed(order_id=other, checksum=compute_checksum(other, STAMP, API_SECRET)))
+    ).status_code == 200
+    assert svc.store.doorbells() == [(other, 0)]  # another order is not held
+    clock.advance(svc.RING_EVERY_S)
+    svc.flush_rings()  # what the timer does when the interval ends
+    assert sorted(svc.store.doorbells()) == [(ORDER_ID, 0), (other, 0)]  # one more read of the order
+    assert svc.store.counters()["postback_accepted"]["count"] == 7  # every accepted postback is counted
+    svc.flush_rings()  # nothing held: nothing written
+    assert svc.store.counters()["postback_accepted"]["count"] == 7
+    clock.advance(svc.RING_EVERY_S)
+    assert (await post(client, signed(status="CANCELLED"))).status_code == 200  # the interval is over: at once
+    assert svc.store.counters()["postback_accepted"]["count"] == 8
+    assert fake_kite.requests == []
+
+
+async def test_held_rings_are_written_when_the_interval_ends(make_app, http):
+    rt, app = make_app()
+    svc = rt.events
+    svc.RING_EVERY_S = 0.05  # the service's clock does not move here: the timer waits the whole interval
+    client = http(app)
+    await post(client, signed(status="OPEN"))
+    svc.store.doorbell_done(ORDER_ID, rings=1)
+    woken = []
+    svc.on_doorbell(lambda: woken.append(1))
+    await post(client, signed(status="COMPLETE"))
+    await post(client, signed(status="COMPLETE", filled_quantity=25))
+    assert svc.store.doorbells() == [] and woken == []
+    await asyncio.sleep(0.2)
+    assert svc.store.doorbells() == [(ORDER_ID, 0)] and woken == [1]  # one write, and the worker is woken
+    assert svc.store.counters()["postback_accepted"]["count"] == 3
+
+
+async def test_stop_writes_the_rings_still_held(make_app, http):
+    rt, app = make_app()
+    svc = rt.events
+    client = http(app)
+    await post(client, signed(status="OPEN"))
+    svc.store.doorbell_done(ORDER_ID, rings=1)
+    await post(client, signed(status="COMPLETE"))  # held
+    path = svc.store.path
+    await svc.stop()
+    reader = EventStore(path, readonly=True)
+    try:
+        assert reader.doorbells() == [(ORDER_ID, 0)] and reader.counters()["postback_accepted"]["count"] == 2
+    finally:
+        reader.close()
+    assert (await post(client, signed(status="REJECTED"))).status_code == 503  # stopped: the store is closed
+
+
+async def test_a_held_ring_that_cannot_be_written_is_logged_and_left_to_the_poll(make_app, http, caplog):
+    rt, app = make_app()
+    svc = rt.events
+    client = http(app)
+    await post(client, signed(status="OPEN"))
+    await post(client, signed(status="COMPLETE"))  # held
+    svc.store.close()
+    svc.flush_rings()
+    assert "could not keep 1 held postback ring" in caplog.text
+    assert ORDER_ID not in caplog.text
+
+
+async def test_a_selftest_repeated_within_two_seconds_is_not_written_again(make_app, http):
+    """Its event is stored once per id anyway: a copy moments later, even with another field, adds nothing."""
+    rt, app = make_app()
+    client = http(app)
+    order_id = "selftest-0a1b2c3d4e5f"
+    selftest = signed(order_id=order_id, checksum=compute_checksum(order_id, STAMP, API_SECRET))
+    assert (await post(client, selftest)).status_code == 200
+    assert (await post(client, {**selftest, "status": "OPEN"})).status_code == 200
+    assert rt.events.store.counters()["selftest_received"]["count"] == 1
+    assert len(rt.events.store.events()) == 1
+
+
+async def test_accepted_postbacks_are_logged_at_most_once_a_minute(make_app, http, caplog):
+    caplog.set_level(logging.INFO)
+    rt, app = make_app()
+    rt.clock = rt.events.clock = clock = Clock()
+    client = http(app)
+    for n in range(3):
+        order_id = f"25010100000000{n + 1}"
+        assert (
+            await post(client, signed(order_id, checksum=compute_checksum(order_id, STAMP, API_SECRET)))
+        ).status_code == 200
+
+    def lines() -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.getMessage().startswith("postback accepted")]
+
+    assert lines() == ["postback accepted"]
+    clock.advance(60)
+    await post(client, signed(status="OPEN"))
+    assert lines()[-1] == "postback accepted (2 more like it since the last such line)"
 
 
 def test_the_repeat_guard_is_bounded_and_forgets_after_its_window():

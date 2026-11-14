@@ -429,6 +429,45 @@ async def test_pause_holds_deliveries_and_resume_delivers_the_backlog(build, tmp
     assert len(lines(out)) == 1
 
 
+async def test_a_paused_consumer_raises_no_delayed_alert(build, tmp_path):
+    """Its deliveries wait because you paused it: the other consumers are not told that they are late."""
+    spec, _ = consumer("notify", "sys.exit(75)", tmp_path, alert_after_s=5, retry={"delays_s": [10]})
+    watcher, _ = consumer("watch", "pass", tmp_path, match={"kinds": ["router"]})
+    svc, router, clock = build(spec, watcher)
+    notify = router.config.get("notify")
+    svc.ingest_order(order_row(), source="poll")
+    assert await router.step(notify) is None  # try 1 fails at t=0: the retry is due at t=10, the alert at t=5
+    svc.store.pause("notify", clock())
+    clock.advance(60)
+    assert await router.step(notify) == Router.PAUSED_S
+    assert router_events(svc) == []
+
+
+async def test_resume_starts_the_retries_of_a_waiting_delivery_afresh(build, tmp_path):
+    """A pause does not use up a delivery's give-up window: with the target fixed an hour later, a temporary failure on
+    the first try after the resume is retried, not failed for good, and its alert counts from that try."""
+    spec, out = consumer(
+        "notify",
+        RECORD + "\nsys.exit(75)",
+        tmp_path,
+        alert_after_s=60,
+        retry={"delays_s": [10], "give_up_after_s": 100},
+    )
+    svc, router, clock = build(spec)
+    notify = router.config.get("notify")
+    svc.ingest_order(order_row(), source="poll")
+    assert await router.step(notify) is None  # try 1 fails at t=0
+    svc.store.pause("notify", clock())
+    clock.advance(3600)
+    svc.store.resume("notify", skip_backlog=False, now=clock())
+    assert await router.step(notify) is None  # try 2 fails: retried
+    summary = svc.store.summary()["consumers"]["notify"]
+    assert summary["failed"] == 0 and summary["retrying"] == 1 and len(lines(out)) == 2
+    assert router_events(svc) == []
+    delivery, _ = svc.store.next_delivery("notify", clock.now + dt.timedelta(days=1))
+    assert delivery.attempts == 1 and delivery.first_try_at == clock.now
+
+
 async def test_a_restart_loses_nothing(build, tmp_path):
     spec, out = consumer("notify", RECORD, tmp_path)
     svc, _, _ = build(spec)

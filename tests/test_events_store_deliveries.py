@@ -107,6 +107,22 @@ def test_pause_resume_and_skip_the_backlog(store):
     assert store.next_delivery("notify", T0) == (None, None)
 
 
+def test_resume_starts_a_paused_consumers_waiting_deliveries_afresh(store):
+    """Time spent paused does not count towards a delivery's give-up and alert points: its tries start again."""
+    add(store, "1", 100)
+    later = T0 + dt.timedelta(hours=1)
+    store.retry_delivery("notify", 1, first_try_at=T0, next_try_at=T0 + dt.timedelta(seconds=10), now=T0, error="e")
+    store.mark_alerted("notify", 1)
+    store.pause("notify", T0)
+    assert store.resume("notify", skip_backlog=False, now=later) == 0
+    assert row(store, "notify", 1) == ("pending", 0, 0, "e")  # the last error stays for the status
+    delivery, _ = store.next_delivery("notify", later)
+    assert delivery.seq == 1 and delivery.first_try_at is None
+    store.retry_delivery("notify", 1, first_try_at=later, next_try_at=later, now=later, error="e")
+    store.resume("notify", skip_backlog=False, now=later)  # not paused: nothing to start again
+    assert row(store, "notify", 1) == ("pending", 1, 0, "e")
+
+
 def test_the_consumer_names_are_those_with_deliveries_or_paused(store):
     assert store.consumer_names() == set()
     add(store, "1", 100, consumers=("notify", "audit"))

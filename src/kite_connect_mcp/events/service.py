@@ -6,7 +6,9 @@ It owns the store and the consumers config, and is the only place events are cre
     record_selftest       a verified selftest postback -> a selftest event
     fail_delivery         a delivery that failed for good -> its failure and a delivery_failed router event
     alert_delayed         a delivery still retrying past its alert point -> a delivery_delayed router event, once
-    ring / refused        the postback route's doorbell and its refusal counter (written at most once a second)
+    accept_postback       the postback route's write for a verified postback: a ring (or a selftest), at most one
+                          write per order every RING_EVERY_S, the rings in between merged into one more
+    ring / refused        the doorbell's write, and the route's refusal counter (written at most once a second)
 
 A router event never goes to the consumer it is about, and nothing is raised about a router event itself.
 
@@ -29,6 +31,7 @@ import datetime as dt
 import fcntl
 import logging
 import os
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -41,6 +44,7 @@ from .doorbell import DoorbellWorker
 from .model import (
     ORDER_ID_RE,
     OrderView,
+    is_selftest_id,
     judge,
     order_event,
     order_key,
@@ -118,6 +122,11 @@ class EventService:
         self._refused_at: dt.datetime | None = None
         self._refused_written_at: dt.datetime | None = None  # the last write of them, or try
         self._refused_timer: asyncio.TimerHandle | None = None
+        # the postback route's writes (see accept_postback): when each order id was last written, for RING_EVERY_S at
+        # most; the rings held for one more write, and the timers that write them
+        self._written: OrderedDict[str, dt.datetime] = OrderedDict()
+        self._held: dict[str, int] = {}
+        self._held_timers: dict[str, asyncio.TimerHandle] = {}
 
     # --- listeners ------------------------------------------------------------------------------------------------
 
@@ -277,14 +286,102 @@ class EventService:
 
     # --- the postback route's side ----------------------------------------------------------------------------------
 
-    def ring(self, order_id: str) -> None:
-        """A verified postback for `order_id`: keep its doorbell on disk and count it (postback_accepted) in one
-        transaction, then wake the worker that re-reads the order from Kite. ValueError for an id that is not an order
-        id; StoreError when the store cannot write, and then nothing was kept."""
+    def ring(self, order_id: str, *, rings: int = 1) -> None:
+        """Keep the doorbell of `order_id` on disk and count its `rings` (postback_accepted) in one transaction, then
+        wake the worker that re-reads the order from Kite. At once: the postback route goes through accept_postback.
+        ValueError for an id that is not an order id; StoreError when the store cannot write, and then nothing was
+        kept."""
         if not isinstance(order_id, str) or not ORDER_ID_RE.fullmatch(order_id):
             raise ValueError("not an order id")
-        self.store.ring(order_id, self.clock())
+        self.store.ring(order_id, self.clock(), rings=rings)
         self._tell(self._doorbell_listeners)
+
+    RING_EVERY_S = 2.0  # the postback route writes for one order id at most this often (see accept_postback)
+    WRITTEN_MAX = 1000  # the most order ids remembered for that, each for RING_EVERY_S
+
+    def accept_postback(self, order_id: str) -> bool:
+        """The postback route's write for a verified postback: record a selftest (record_selftest), or ring the doorbell
+        of an order (ring). True when it was written now, False when it was not needed or is held.
+
+        A captured postback with a field changed that the checksum does not cover is a new postback each time, and each
+        write waits for the disk on the event loop. So one order id is written at most once every RING_EVERY_S. A ring
+        sooner is held: the rings held for an order are written as one when its interval ends (by a timer, or by stop()
+        through flush_rings), so a burst of real updates still gets one more read from Kite after its last ring, and a
+        replayed burst costs one write and one read every RING_EVERY_S. A selftest sooner is not written at all: its
+        event is stored once per id anyway. Without a running event loop (no timer) the ring is written at once.
+
+        ValueError for an id that is neither an order id nor a selftest id; StoreError when the store cannot write,
+        and then nothing was kept now (rings held before stay held)."""
+        selftest = is_selftest_id(order_id)
+        if not selftest and (not isinstance(order_id, str) or not ORDER_ID_RE.fullmatch(order_id)):
+            raise ValueError("not an order id")
+        now = self.clock()
+        wait = self._wait_left(order_id, now)
+        if wait is not None and not self._stopped:
+            if selftest:
+                return False
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None  # nothing could write it later: written now, below
+            if loop is not None:
+                self._held[order_id] = self._held.get(order_id, 0) + 1
+                if order_id not in self._held_timers:
+                    self._held_timers[order_id] = loop.call_later(wait, self._write_held, order_id)
+                return False
+        if selftest:
+            self.record_selftest(order_id)
+        else:
+            self.ring(order_id, rings=1 + self._held.get(order_id, 0))  # with any held rings: one write for all
+            self._held.pop(order_id, None)
+            timer = self._held_timers.pop(order_id, None)
+            if timer is not None:
+                timer.cancel()
+        self._remember_write(order_id, now)
+        return True
+
+    def flush_rings(self) -> None:
+        """Write every ring held by accept_postback now (stop() does, before it closes the store)."""
+        for order_id in list(self._held):
+            self._write_held(order_id)
+
+    def _write_held(self, order_id: str) -> None:
+        """Write the rings held for `order_id` as one (its timer, or flush_rings). A store that cannot write is logged,
+        and those rings are dropped: the poll catches the order's change."""
+        timer = self._held_timers.pop(order_id, None)
+        if timer is not None:
+            timer.cancel()  # harmless from the timer's own callback
+        rings = self._held.pop(order_id, 0)
+        if not rings:
+            return
+        try:
+            self.ring(order_id, rings=rings)
+        except StoreError as exc:
+            log.warning(
+                "order events: could not keep %d held postback ring(s) (the poll will catch up): %s", rings, exc
+            )
+            return
+        self._remember_write(order_id, self.clock())
+
+    def _wait_left(self, order_id: str, now: dt.datetime) -> float | None:
+        """The seconds left until `order_id` may be written again, None when it may be now."""
+        at = self._written.get(order_id)
+        if at is None or not self._fresh(at, now):
+            return None
+        return (at + dt.timedelta(seconds=self.RING_EVERY_S) - now).total_seconds()
+
+    def _fresh(self, at: dt.datetime, now: dt.datetime) -> bool:
+        """A write at `at` is less than RING_EVERY_S old; a clock that went back holds nothing."""
+        return dt.timedelta(0) <= now - at < dt.timedelta(seconds=self.RING_EVERY_S)
+
+    def _remember_write(self, order_id: str, now: dt.datetime) -> None:
+        """Note the write of `order_id`, and forget the writes too old to matter (at most WRITTEN_MAX are kept)."""
+        self._written.pop(order_id, None)
+        self._written[order_id] = now
+        while self._written and (
+            len(self._written) > self.WRITTEN_MAX or not self._fresh(next(iter(self._written.values())), now)
+        ):
+            self._written.popitem(last=False)  # the oldest first
 
     REFUSAL_WRITE_S = 1.0  # refused postbacks are written to the store at most this often
 
@@ -396,6 +493,7 @@ class EventService:
                 self._tasks = []
                 if first:
                     try:
+                        self.flush_rings()  # both log a store that cannot write, rather than raise
                         self.flush_refusals()
                     finally:
                         # the store first, so that the lock covers this process's last use of the file (SQLite

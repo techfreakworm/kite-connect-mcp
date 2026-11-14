@@ -204,6 +204,37 @@ def test_ring_and_refused(svc):
     assert svc.store.counters()["postback_refused"] == {"count": 1, "last_at": iso(FIXED_NOW), "note": "bad checksum"}
 
 
+def test_without_an_event_loop_a_postbacks_ring_is_written_at_once(svc):
+    """No loop, no timer to write a held ring later: it is written now rather than lost."""
+    assert svc.accept_postback(ORDER_ID) is True
+    assert svc.accept_postback(ORDER_ID) is True
+    assert svc.store.counters()["postback_accepted"]["count"] == 2
+    with pytest.raises(ValueError):
+        svc.accept_postback("not an order id!")
+
+
+async def test_the_postback_writes_remembered_are_bounded(svc):
+    svc.WRITTEN_MAX = 3
+    ids = [f"25010100000000{n}" for n in range(1, 5)]
+    for order_id in ids:
+        assert svc.accept_postback(order_id) is True
+    assert svc.accept_postback(ids[0]) is True  # forgotten (the oldest of four): written at once
+    assert svc.accept_postback(ids[3]) is False  # remembered: held
+    svc.flush_rings()
+    assert svc.store.counters()["postback_accepted"]["count"] == 6
+
+
+async def test_a_selftest_is_written_at_most_once_every_ring_interval(svc):
+    clock = svc.clock = Clock()
+    order_id = "selftest-0a1b2c3d4e5f"
+    assert svc.accept_postback(order_id) is True
+    assert svc.accept_postback(order_id) is False  # not held either: there is nothing more to read
+    svc.flush_rings()
+    clock.advance(svc.RING_EVERY_S)
+    assert svc.accept_postback(order_id) is True
+    assert svc.store.counters()["selftest_received"]["count"] == 2 and len(svc.store.events()) == 1
+
+
 def test_listeners_are_told_about_new_events_and_doorbells(svc):
     seen = []
     svc.on_event(lambda: seen.append("event"))

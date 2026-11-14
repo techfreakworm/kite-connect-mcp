@@ -207,11 +207,13 @@ class Router:
 
     async def step(self, consumer: Consumer) -> float | None:
         """Do one thing for `consumer`: report overdue retries, then run one due delivery. Returns None when it ran a
-        delivery (look again at once), else how many seconds to wait before looking again."""
-        now = self.clock()
-        self._report_delays(consumer, now)
+        delivery (look again at once), else how many seconds to wait before looking again. A paused consumer does
+        neither: its deliveries wait because someone paused it, so they are not reported late (and `events resume`
+        starts their tries afresh)."""
         if self.store.is_paused(consumer.name):
             return self.PAUSED_S
+        now = self.clock()
+        self._report_delays(consumer, now)
         delivery, later = self.store.next_delivery(consumer.name, now)
         if delivery is not None:
             await self.deliver(consumer, delivery)

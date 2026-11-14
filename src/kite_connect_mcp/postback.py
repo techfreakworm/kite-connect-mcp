@@ -15,7 +15,8 @@ the bearer token protects /mcp only, and Kite cannot send one. So it must defend
 * nothing from the payload (no ids, no checksum, no user) is logged, and the buffer keeps only the documented order
   fields (see manager.clean_order);
 * a refusal is logged at most once a minute for each reason (the next line for it says how many were not), so junk
-  requests cannot flood the log; so is the 503 answered while the event store cannot write;
+  requests cannot flood the log; so are the 503 answered while the event store cannot write, and the line for an
+  accepted postback, which a replay can repeat as often as a refusal;
 * with no API secret configured the endpoint refuses everything instead of accepting unverified data.
 
 What the checksum does not cover: it binds the order_id and order_timestamp only, so a captured postback could be
@@ -30,9 +31,12 @@ verified postback rings the event service's doorbell (or records a selftest): th
 nothing from the payload is stored (see events/doorbell.py). With KITE_MCP_ALLOWED_USER_ID set, a postback for another
 account is refused. When the ticker's order updates are on (`ticker_order_updates`), an accepted postback also goes to
 their buffer, as without the events. Every refusal is counted under a fixed reason (service.REFUSALS), and written at
-most once a second (EventService.refused). An exact repeat of a postback accepted in the last ten seconds (Kite sending
-it twice, or a replay) is answered 200 without ringing again (RepeatGuard). Only the whole body makes a repeat: the
-checksum covers only order_id and order_timestamp, so an order's later updates can carry the same one.
+most once a second (EventService.refused). A repeat of a postback accepted in the last ten seconds (Kite sending it
+twice, or a replay) is answered 200 without ringing again (RepeatGuard). A repeat is the same JSON, whitespace and key
+order aside, and only the whole of it: the checksum covers only order_id and order_timestamp, so an order's later
+updates can carry the same one. A replay altered in another field is not a repeat, so the event service writes one
+order at most once every two seconds and merges the rings in between into one more write
+(EventService.accept_postback).
 """
 
 from __future__ import annotations
@@ -114,10 +118,21 @@ def ensure_postback_route(rt: Runtime, *, to_ticker: bool = False) -> PostbackRo
     return route
 
 
+def repeat_key(payload: Mapping[str, Any], body: bytes) -> bytes:
+    """What makes two postbacks repeats: the SHA-256 of the payload as canonical JSON (sorted keys, no whitespace, ASCII
+    escapes), so a copy with other whitespace or key order, or with a key given twice (JSON keeps the last), is still a
+    repeat. A payload too deep to write out again (it parsed, so this is unlikely) falls back to the body."""
+    try:
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    except (ValueError, RecursionError):
+        return hashlib.sha256(body).digest()
+    return hashlib.sha256(canonical.encode()).digest()
+
+
 class RepeatGuard:
-    """The postbacks accepted in the last WINDOW_S seconds, by the SHA-256 of their body (nothing else is kept), at most
+    """The postbacks accepted in the last WINDOW_S seconds, by their repeat_key (nothing else is kept), at most
     MAX_ENTRIES of them. A repeat is answered without ringing again, so a replayed postback costs no disk write. A new
-    update of the same order has another body, and is rung at once."""
+    update of the same order has another payload, and is rung (see EventService.accept_postback)."""
 
     WINDOW_S = 10.0
     MAX_ENTRIES = 1000
@@ -147,7 +162,9 @@ class RepeatGuard:
 class PostbackRoute:
     """The route hook: `rt.extras["http_routes"]` holds callables that take the MCPServer and add their routes."""
 
-    REFUSAL_LOG_S = 60.0  # the refusals for one reason, and the 503s, are each logged at most once in this many seconds
+    # the refusals for one reason, the 503s, the accepted postbacks and the selftests are each logged at most once in
+    # this many seconds
+    REFUSAL_LOG_S = 60.0
 
     def __init__(self, rt: Runtime):
         self.rt = rt
@@ -196,7 +213,7 @@ class PostbackRoute:
             if ticker is None:
                 return _bare(503)
             ticker.record_order_update(payload, source="postback")
-            log.info("postback accepted")
+            self._log_limited("accepted", logging.INFO, "postback accepted")
             return _ok()
         order_id = payload["order_id"]  # a str: verify_checksum checked it
         selftest = is_selftest_id(order_id)
@@ -206,27 +223,27 @@ class PostbackRoute:
         if not selftest and not events.user_allowed(payload.get("user_id")):
             return refuse(403, "another account", "the postback is for another account than KITE_MCP_ALLOWED_USER_ID")
         now = self.rt.clock()
-        key = hashlib.sha256(body).digest()
+        key = repeat_key(payload, body)
         if self.recent.is_repeat(key, now):
             return _ok()  # accepted moments ago (Kite sent it twice, or a replay): rung already, nothing to write
         if not selftest and self.to_ticker and self.rt.ticker is not None:
             self.rt.ticker.record_order_update(payload, source="postback")  # first: the buffer does not need the store
         try:
-            if selftest:
-                events.record_selftest(order_id)
-            else:
-                events.ring(order_id)
+            events.accept_postback(order_id)  # written now, or held for one more write moments later
         except StoreError as exc:  # its text is SQLite's message (a write names no path), nothing from the payload
             self._log_limited("503", logging.ERROR, f"postback: answering 503 (the poll will catch up): {exc}")
             return _bare(503)
         self.recent.remember(key, now)
-        log.info("postback selftest received" if selftest else "postback accepted")
+        if selftest:
+            self._log_limited("selftest", logging.INFO, "postback selftest received")
+        else:
+            self._log_limited("accepted", logging.INFO, "postback accepted")
         return _ok()
 
     def _log_limited(self, what: str, level: int, line: str) -> None:
-        """Log `line`, at most once every REFUSAL_LOG_S for each `what` (a refusal's reason, or "503"): the lines in
-        between are only counted, and the next one logged says how many there were. `line` never holds text from the
-        request."""
+        """Log `line`, at most once every REFUSAL_LOG_S for each `what` (a refusal's reason, "503", "accepted" or
+        "selftest"): the lines in between are only counted, and the next one logged says how many there were. `line`
+        never holds text from the request."""
         now = self.rt.clock()
         since, unlogged = self._log_times.get(what, (None, 0))
         if since is not None and dt.timedelta(0) <= now - since < dt.timedelta(seconds=self.REFUSAL_LOG_S):

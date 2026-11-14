@@ -143,7 +143,10 @@ def parse_token_file(text: str, mtime: dt.datetime) -> TokenRecord | None:
 
 
 class TokenFile:
-    """The token file. Reads are cached by (mtime, size, inode) so a busy server does not re-read it per request."""
+    """The token file. Reads are cached by (mtime, size, inode) so a busy server does not re-read it per request.
+
+    A file that cannot be looked at or read is not cached (it may work on the next read), but its error is logged only
+    when it starts and when it changes: the event service's poll reads the token every few seconds, all day."""
 
     def __init__(self, path: Path, *, writable: bool):
         self.path = Path(path)
@@ -151,40 +154,51 @@ class TokenFile:
         self._lock = threading.Lock()
         self._cached_key: tuple[int, int, int] | None = None
         self._cached: TokenRecord | None = None
+        self._error: tuple[object, ...] | None = None  # the stat or read error logged last, until a read works
+
+    def _log_error(self, error: tuple[object, ...], what: str, exc: OSError) -> None:
+        """Log `exc` as "cannot <what> the token file", unless it is `error`, the one logged last."""
+        with self._lock:
+            if error == self._error:
+                return
+            self._error = error
+        log.warning(
+            "cannot %s the token file %s: %s (logged again only when this changes)", what, self.path, exc.strerror
+        )
 
     def read(self) -> TokenRecord | None:
         try:
             st = self.path.stat()
         except FileNotFoundError:
             with self._lock:
-                self._cached_key, self._cached = None, None
+                self._cached_key, self._cached, self._error = None, None, None
             return None
         except OSError as exc:
-            log.warning("cannot stat the token file %s: %s", self.path, exc.strerror)
+            self._log_error(("stat", exc.errno), "stat", exc)
             return None
         key = (st.st_mtime_ns, st.st_size, st.st_ino)
         with self._lock:
             if key == self._cached_key:
                 return self._cached
-        if stat.S_IMODE(st.st_mode) & 0o077:
+        why = ""  # what to check, when the file says why it holds no token
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except OSError as exc:
+            self._log_error(("read", exc.errno, key), "read", exc)  # a new file with the same error is news
+            return None
+        except UnicodeDecodeError:  # not UTF-8 (a UTF-16 file, say): no usable token, cached like any other such file
+            text, why = "", " (it is not UTF-8 text)"
+        if stat.S_IMODE(st.st_mode) & 0o077:  # after the read: like its result, said once per file
             log.warning(
                 "the token file %s is readable by group/others (mode %o); run chmod 600",
                 self.path,
                 stat.S_IMODE(st.st_mode),
             )
-        why = ""  # what to check, when the file says why it holds no token
-        try:
-            text = self.path.read_text(encoding="utf-8")
-        except OSError as exc:
-            log.warning("cannot read the token file %s: %s", self.path, exc.strerror)
-            return None
-        except UnicodeDecodeError:  # not UTF-8 (a UTF-16 file, say): no usable token, cached like any other such file
-            text, why = "", " (it is not UTF-8 text)"
         record = parse_token_file(text, dt.datetime.fromtimestamp(st.st_mtime, IST))
         if record is None:
             log.warning("the token file %s does not hold a usable token%s", self.path, why)
         with self._lock:
-            self._cached_key, self._cached = key, record
+            self._cached_key, self._cached, self._error = key, record, None
         return record
 
     def write(self, record: TokenRecord) -> None:

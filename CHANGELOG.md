@@ -31,7 +31,13 @@ is 0.x, minor releases may change tool arguments.
 - The postback route: with `KITE_MCP_EVENTS=true` it exists whenever `KITE_MCP_POSTBACK_PATH` is set (the ticker on or
   off), feeds the order events, refuses a postback for any account other than `KITE_MCP_ALLOWED_USER_ID`, answers 200
   once the postback is on disk and 503 when the store cannot write, and counts its refusals. With `KITE_MCP_EVENTS`
-  off it is unchanged, except that a signed selftest is answered 404 and never reaches the ticker's buffer.
+  off it works as before, except that a signed selftest is answered 404 and never reaches the ticker's buffer.
+- The postback route's log lines, with the events on or off: a refusal is logged at most once a minute per reason, and
+  so is the line for an accepted postback; the next line says how many were not logged.
+- `kite-connect-mcp serve` runs uvicorn with `lifespan="on"`: a server whose start-up fails (the event service, say)
+  exits instead of serving without it.
+- A token file that cannot be looked at or read (a wrong owner or mode) is logged when that starts and when the error
+  changes, not on every read.
 - The Caddy and nginx samples cap request bodies per path: 1 MB for `/mcp`, 4 KB for `/callback` and `/health`,
   64 KiB for `/postback` (the server's own cap).
 
