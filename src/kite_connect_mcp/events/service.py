@@ -3,6 +3,9 @@
 It owns the store and the consumers config, and is the only place events are created:
     ingest_order          a row read from Kite (the doorbell's re-read, or the poll) -> an order event, or nothing
     note_token_rejected   Kite refused the stored token -> one session event per token
+    note_login            a new token was stored -> one `login` session event per token
+    note_login_refused    another account's login was refused (the account pin) -> one `login_refused` per session
+    note_login_failed     a real login on a link of ours did not complete -> one `login_failed` per link
     record_selftest       a verified selftest postback -> a selftest event
     fail_delivery         a delivery that failed for good -> its failure and a delivery_failed router event
     alert_delayed         a delivery still retrying past its alert point -> a delivery_delayed router event, once
@@ -47,6 +50,9 @@ from .model import (
     OrderView,
     is_selftest_id,
     judge,
+    login_event,
+    login_failed_event,
+    login_refused_event,
     order_event,
     order_key,
     router_event,
@@ -218,6 +224,30 @@ class EventService:
         token itself is never stored)."""
         now = self.clock()
         body = session_event("token_rejected", seed=token_fingerprint(access_token), received_at=now)
+        return self._insert(body, order_id=None, consumers=self.config.matching(body), now=now)
+
+    def note_login(self, access_token: str, *, logged_in_at: dt.datetime, expires_at: dt.datetime) -> int | None:
+        """A new token was stored: one `login` event per token (seeded with its fingerprint), whoever reports it (the
+        login manager, or the poll for a token stored beside this process)."""
+        now = self.clock()
+        body = login_event(
+            seed=token_fingerprint(access_token), logged_in_at=logged_in_at, expires_at=expires_at, received_at=now
+        )
+        return self._insert(body, order_id=None, consumers=self.config.matching(body), now=now)
+
+    def note_login_refused(self, access_token: str, *, session_ended: bool) -> int | None:
+        """Another account's login was refused: one `login_refused` event per refused session (seeded with a
+        fingerprint of that session's token, which is never stored)."""
+        now = self.clock()
+        body = login_refused_event(seed=token_fingerprint(access_token), session_ended=session_ended, received_at=now)
+        return self._insert(body, order_id=None, consumers=self.config.matching(body), now=now)
+
+    def note_login_failed(self, seed: str, *, reason: str) -> int | None:
+        """A real login on a link this server issued did not complete: one `login_failed` event per link. `seed` is
+        the digest of the link's state (never the state itself); `reason` one of LOGIN_FAILURES (events/model.py),
+        ValueError for any other."""
+        now = self.clock()
+        body = login_failed_event(seed=seed, reason=reason, received_at=now)
         return self._insert(body, order_id=None, consumers=self.config.matching(body), now=now)
 
     def record_selftest(self, order_id: str) -> int | None:

@@ -25,6 +25,11 @@ link. Whatever fails before that releases the state, so the same link can be tri
 an account pin is set (auth/account.py) and Kite says another account logged in, that new session is ended at once,
 nothing is stored, and the login is refused.
 
+With the order events on, a stored login raises the session event `login`, a refused account's login `login_refused`,
+and a real login on a link of ours that failed at the exchange or could not be stored `login_failed` (once per link);
+nothing else does. They reach the event service through `SessionNotes`; one that cannot be recorded is logged, and the
+login, the refusal or the failure stands.
+
 What is never written anywhere (logs, audit log, results, error messages): the access token, the request token, the
 state, names, e-mail addresses. The audit log gets event names, reason codes and the account of a successful login:
 its user id, or with the hash pin the first 12 hex digits of the digest.
@@ -45,7 +50,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import parse_qs, urlencode
 
 import httpx2
@@ -55,11 +60,12 @@ from starlette.routing import Route
 from ..client.http import KiteClient, checksum
 from ..config import Settings
 from ..errors import ConfigError, KiteAPIError, KiteMCPError, OutcomeUnknown, TokenError, ToolInputError
+from ..events.model import LOGIN_FAILURES
 from ..safety.audit import AuditLog
 from ..timeutil import next_token_reset, now_ist, to_ist
 from .account import AccountPin
 from .callback import make_callback_handler
-from .loginstate import Reservation, StateStore
+from .loginstate import Reservation, StateStore, digest_of
 from .tokenstore import TokenProvider, TokenRecord
 
 log = logging.getLogger(__name__)
@@ -108,6 +114,15 @@ class LoginResult:
 class LogoutResult:
     kite: str  # "ended", "already_invalid" (Kite no longer knew the token) or "no_token"
     file_removed: bool
+
+
+class SessionNotes(Protocol):
+    """What the login tells the order events (events/service.py EventService). A call may raise (a store that cannot
+    write): the login, the refusal or the failure it reports stands anyway."""
+
+    def note_login(self, access_token: str, *, logged_in_at: dt.datetime, expires_at: dt.datetime) -> object: ...
+    def note_login_refused(self, access_token: str, *, session_ended: bool) -> object: ...
+    def note_login_failed(self, seed: str, *, reason: str) -> object: ...
 
 
 # --- the link ------------------------------------------------------------------------------------------------------
@@ -199,6 +214,7 @@ class LoginManager:
         self.clock = clock
         self.pin = AccountPin.from_settings(settings)
         self.states = StateStore(settings.state_dir / STATE_FILE)
+        self.session_notes: SessionNotes | None = None  # set by build_runtime when the events run here
         self._flow_lock = asyncio.Lock()  # one exchange or logout at a time, so token writes cannot land out of order
         self._noise: deque[float] = deque()
         self._noise_dropped = 0
@@ -339,6 +355,11 @@ class LoginManager:
                 await self._commit(reservation)
             else:
                 await self._release(reservation)
+                if reservation is not None and state is not None and result.reason in LOGIN_FAILURES:
+                    # a real login on a link of ours did not complete: one event per link (the noise never gets here:
+                    # it has no reserved state, and a pasted request token without a state has none either)
+                    seed, reason = digest_of(state), result.reason
+                    self._tell_events("login_failed", lambda notes: notes.note_login_failed(seed, reason=reason))
             return result
 
     async def _exchange_and_store(self, request_token: str, state: str | None, source: str) -> LoginResult:
@@ -378,6 +399,9 @@ class LoginManager:
 
         if self.pin.pinned and not self.pin.allows(user_id):
             ended = await self._invalidate(api_key, access_token)
+            self._tell_events(
+                "login_refused", lambda notes: notes.note_login_refused(access_token, session_ended=ended)
+            )
             return self._refuse(
                 "account_mismatch",
                 f"the Kite account that logged in is not the one this server is pinned to ({self.pin.setting}); "
@@ -390,7 +414,8 @@ class LoginManager:
                 session_ended=ended,
             )
 
-        record = TokenRecord.new(access_token, to_ist(self.clock()))
+        logged_in_at = to_ist(self.clock())
+        record = TokenRecord.new(access_token, logged_in_at)
         try:
             await asyncio.to_thread(self.tokens.file.write, record)
         except (OSError, ConfigError) as exc:
@@ -405,6 +430,12 @@ class LoginManager:
             )
         self.tokens.accept(access_token)
         self._audit("login_ok", source=source, **self.pin.label(user_id), expires_at=record.expires_at)
+        self._tell_events(
+            "login",
+            lambda notes: notes.note_login(
+                access_token, logged_in_at=logged_in_at, expires_at=next_token_reset(logged_in_at)
+            ),
+        )
         log.info("Kite login completed (%s)", source)
         return LoginResult(True, "ok", "logged in", user_id=user_id, expires_at=record.expires_at)
 
@@ -534,6 +565,17 @@ class LoginManager:
             self.audit.write(event, tool=tool, **fields)
         except OSError as exc:  # a full disk must not undo a login the person just did
             log.warning("could not write the audit log (%s)", exc.strerror)
+
+    def _tell_events(self, what: str, call: Callable[[SessionNotes], object]) -> None:
+        """Report session event `what` to the order events, when they run in this process. Never raises: only the
+        exception's type is logged (never its text, which could hold what the event leaves out)."""
+        notes = self.session_notes
+        if notes is None:
+            return
+        try:
+            call(notes)
+        except Exception as exc:  # never undo the login, the refusal or the failure for the event's sake
+            log.warning("could not record the %s session event (%s)", what, type(exc).__name__)
 
     def _scrubbed(self, text: str, *secrets_: str | None) -> str:
         text = self.client.scrub(text)

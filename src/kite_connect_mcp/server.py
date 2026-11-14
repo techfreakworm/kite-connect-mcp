@@ -71,6 +71,7 @@ def build_runtime(
 
         rt.events = EventService(settings, client, tokens, clock=clock)
         tokens.keep_rejections_in(StoredRejections(rt.events.store))
+        rt.login.session_notes = rt.events  # login, login_refused and login_failed (auth/login.py)
     elif settings.events and settings.events_db is not None:
         # a command beside the serving process (status, login, logout): the marks the service keeps, read-only
         from .events.rejections import SnapshotRejections

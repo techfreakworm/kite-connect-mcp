@@ -36,9 +36,21 @@ CHANGES = ("placed", "partial_fill", "modified", "filled", "cancelled", "rejecte
 KINDS = ("order", "session", "router", "selftest")
 ORDER_SOURCES = ("postback", "poll")
 TRANSACTION_TYPES = ("BUY", "SELL")
-SESSION_TEXT = {
+SESSION_TEXT = {  # the session events built by session_event; the login's three have builders of their own
     "token_rejected": "Kite rejected the stored access token: log in again to resume the order events.",
 }
+SESSIONS = ("token_rejected", "login", "login_refused", "login_failed")  # every session event's name
+LOGIN_REFUSED_TEXT = "A Kite login by another account was refused, and the session it opened was ended."
+LOGIN_REFUSED_OPEN_TEXT = (
+    "A Kite login by another account was refused; ending the session it opened failed, so it lapses at 06:00 IST."
+)
+LOGIN_FAILED_TEXT = {
+    "exchange_failed": (
+        "A Kite login did not complete: Kite did not accept the login. Tap the link again or ask for a new one."
+    ),
+    "token_not_stored": "A Kite login did not complete: the token could not be stored.",
+}
+LOGIN_FAILURES = tuple(LOGIN_FAILED_TEXT)  # the LoginResult reasons (auth/login.py) that raise login_failed
 ORDER_ID_RE = re.compile(r"[A-Za-z0-9_\-]{1,64}")  # the only order-id shape passed to GET /orders/{id}
 SELFTEST_PREFIX = "selftest-"
 MAX_REASON_CHARS = 160
@@ -358,18 +370,56 @@ def token_fingerprint(access_token: str) -> str:
     return hashlib.sha256(access_token.encode("utf-8", "replace")).hexdigest()
 
 
-def session_event(name: str, *, seed: str, received_at: dt.datetime) -> dict[str, Any]:
-    """`seed` makes the id: the same seed (e.g. a fingerprint of one token) gives the same event, stored once."""
-    if name not in SESSION_TEXT:
-        raise ValueError(f"unknown session event {name!r}")
+def _session(name: str, seed: str, received_at: dt.datetime, text: str) -> dict[str, Any]:
     return {
         "kind": "session",
         "event_id": digest("session", name, seed),
         "source": "service",
         "received_at": stamp(received_at),
         "session": name,
-        "text": SESSION_TEXT[name],
+        "text": text,
     }
+
+
+def session_event(name: str, *, seed: str, received_at: dt.datetime) -> dict[str, Any]:
+    """`seed` makes the id: the same seed (e.g. a fingerprint of one token) gives the same event, stored once."""
+    if name not in SESSION_TEXT:
+        raise ValueError(f"unknown session event {name!r}")
+    return _session(name, seed, received_at, SESSION_TEXT[name])
+
+
+def login_event(
+    *, seed: str, logged_in_at: dt.datetime, expires_at: dt.datetime, received_at: dt.datetime
+) -> dict[str, Any]:
+    """A login stored a new token. `seed` (a fingerprint of that token) makes the id: once per token."""
+    start, end = to_ist(logged_in_at), to_ist(expires_at)
+    days = (end.date() - start.date()).days
+    when = "today" if days == 0 else "tomorrow" if days == 1 else f"on {end:%a %d %b}"
+    text = f"Kite login completed: the session is valid until {end:%H:%M} IST {when}."
+    body = _session("login", seed, received_at, text)
+    body["logged_in_at"] = start.isoformat(timespec="seconds")
+    body["expires_at"] = end.isoformat(timespec="seconds")
+    return body
+
+
+def login_refused_event(*, seed: str, session_ended: bool, received_at: dt.datetime) -> dict[str, Any]:
+    """Another account's login was refused (the account pin). `seed` (a fingerprint of that session's token, which is
+    never stored) makes the id: once per refused session."""
+    text = LOGIN_REFUSED_TEXT if session_ended else LOGIN_REFUSED_OPEN_TEXT
+    body = _session("login_refused", seed, received_at, text)
+    body["session_ended"] = session_ended
+    return body
+
+
+def login_failed_event(*, seed: str, reason: str, received_at: dt.datetime) -> dict[str, Any]:
+    """A real login on a link this server issued did not complete. `seed` (the digest of the link's state,
+    auth/loginstate.py digest_of) makes the id: once per link. `reason` is one of LOGIN_FAILURES; Kite's own words
+    never reach an event. ValueError for any other reason."""
+    if reason not in LOGIN_FAILED_TEXT:
+        raise ValueError(f"unknown login failure {reason!r}")
+    body = _session("login_failed", seed, received_at, LOGIN_FAILED_TEXT[reason])
+    body["reason"] = reason
+    return body
 
 
 def _is_link(word: str) -> bool:
