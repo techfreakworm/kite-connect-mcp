@@ -46,7 +46,10 @@ def build_runtime(
 ) -> Runtime:
     """The runtime of one server process. `with_events=False` leaves the event service out even with
     KITE_MCP_EVENTS=true: a command that is not the server (`status`, `tools`, `login`, `logout`) must not open, lock
-    or create the store the serving process owns. The events tools then read the store read-only, when it exists."""
+    or create the store the serving process owns. The events tools then read the store read-only, when it exists.
+
+    With the events on, Kite's rejections of tokens are kept in the store (events/rejections.py); a command beside the
+    service reads them read-only when it first asks."""
     token_file = TokenFile(settings.token_file, writable=settings.auth_mode == "managed")
     tokens = TokenProvider(token_file=token_file, env_token=settings.access_token, clock=clock)
     client = KiteClient(settings, tokens, transport=transport, limiter=limiter or RateLimiter(sleep=sleep), sleep=sleep)
@@ -63,9 +66,16 @@ def build_runtime(
     rt.ticker = TickerManager(settings, tokens, clock=clock, connect=ticker_connect)
     rt.login = LoginManager(settings, client, tokens, audit, clock=clock)
     if settings.events and with_events:  # a bad consumers file is a ConfigError here, so the server does not start
+        from .events.rejections import StoredRejections
         from .events.service import EventService
 
         rt.events = EventService(settings, client, tokens, clock=clock)
+        tokens.keep_rejections_in(StoredRejections(rt.events.store))
+    elif settings.events and settings.events_db is not None:
+        # a command beside the serving process (status, login, logout): the marks the service keeps, read-only
+        from .events.rejections import SnapshotRejections
+
+        tokens.keep_rejections_in(SnapshotRejections(settings.events_db))
     return rt
 
 

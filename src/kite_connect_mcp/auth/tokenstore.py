@@ -28,12 +28,14 @@ import os
 import re
 import stat
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from secrets import token_hex
+from typing import Protocol
 
 from ..errors import ConfigError
+from ..events.model import token_fingerprint
 from ..timeutil import IST, next_token_reset, now_ist, to_ist
 
 log = logging.getLogger(__name__)
@@ -222,8 +224,44 @@ class TokenFile:
         return True
 
 
+class Rejections(Protocol):
+    """Where the fingerprints of the tokens Kite rejected are kept (events/model.py token_fingerprint), never the
+    tokens. Oldest first."""
+
+    def __contains__(self, fingerprint: object) -> bool: ...
+    def add(self, fingerprint: str) -> None: ...
+    def discard(self, fingerprint: str) -> None: ...
+    def fingerprints(self) -> list[str]: ...
+
+
+class MemoryRejections:
+    """The marks in memory: a restart forgets them. The default, and what a server without the order events keeps."""
+
+    def __init__(self, fingerprints: Iterable[str] = ()) -> None:
+        self._held: dict[str, None] = dict.fromkeys(fingerprints)  # insertion order: oldest first
+        self._lock = threading.Lock()
+
+    def __contains__(self, fingerprint: object) -> bool:
+        with self._lock:
+            return fingerprint in self._held
+
+    def add(self, fingerprint: str) -> None:
+        with self._lock:
+            self._held.pop(fingerprint, None)
+            self._held[fingerprint] = None
+
+    def discard(self, fingerprint: str) -> None:
+        with self._lock:
+            self._held.pop(fingerprint, None)
+
+    def fingerprints(self) -> list[str]:
+        with self._lock:
+            return list(self._held)
+
+
 class TokenProvider:
-    """The token to use right now, with the knowledge of whether Kite has already rejected it."""
+    """The token to use right now, with the knowledge of whether Kite has already rejected it. Kite's rejections are
+    kept by fingerprint (Rejections): in memory, or in the event store."""
 
     def __init__(
         self,
@@ -231,12 +269,22 @@ class TokenProvider:
         token_file: TokenFile,
         env_token: str | None = None,
         clock: Callable[[], dt.datetime] = now_ist,
+        rejections: Rejections | None = None,
     ):
         self.file = token_file
         self._env = TokenRecord(env_token, None, None, None, "env") if env_token else None
         self._clock = clock
-        self._rejected: set[str] = set()  # sha-free: held only in memory, never logged
-        self._lock = threading.Lock()
+        self.rejections: Rejections = rejections if rejections is not None else MemoryRejections()
+
+    def keep_rejections_in(self, rejections: Rejections) -> None:
+        """Keep the marks in `rejections` from now on (the event store's, so a restart remembers them); the marks held
+        so far go along."""
+        for fingerprint in self.rejections.fingerprints():
+            rejections.add(fingerprint)
+        self.rejections = rejections
+
+    def _is_rejected(self, record: TokenRecord) -> bool:
+        return token_fingerprint(record.access_token) in self.rejections
 
     def current(self) -> TokenRecord | None:
         """The token to send: the environment token if set, else the file's, else None. Expired or rejected tokens are
@@ -244,21 +292,18 @@ class TokenProvider:
         record = self._env or self.file.read()
         if record is None:
             return None
-        with self._lock:
-            if record.access_token in self._rejected:
-                return None
+        if self._is_rejected(record):
+            return None
         if not record.valid_at(self._clock()):
             return None
         return record
 
     def reject(self, access_token: str) -> None:
         """Kite said TokenException for this token: stop using it until a different token appears."""
-        with self._lock:
-            self._rejected.add(access_token)
+        self.rejections.add(token_fingerprint(access_token))
 
     def accept(self, access_token: str) -> None:
-        with self._lock:
-            self._rejected.discard(access_token)
+        self.rejections.discard(token_fingerprint(access_token))
 
     def status(self) -> dict[str, object]:
         now = self._clock()
@@ -266,9 +311,7 @@ class TokenProvider:
         if record is None:
             return {"logged_in": False, "problem": "no access token (log in, or check KITE_TOKEN_FILE)"}
         out: dict[str, object] = {"logged_in": True, **record.describe(now)}
-        with self._lock:
-            rejected = record.access_token in self._rejected
-        if rejected:
+        if self._is_rejected(record):
             out.update(logged_in=False, problem="Kite rejected this token (TokenException); log in again")
         elif not record.valid_at(now):
             out.update(logged_in=False, problem="the token has expired (tokens reset at 06:00 IST); log in again")
