@@ -114,7 +114,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             if args.verify:
                 try:
                     profile = await rt.client.get("/user/profile")
-                    user_id = (profile or {}).get("user_id")
+                    user_id = profile.get("user_id") if isinstance(profile, dict) else None
                     out["live_check"] = {"verified": True, **AccountPin.from_settings(settings).label(user_id)}
                 except KiteMCPError as exc:
                     out["live_check"] = {"verified": False, "error": rt.client.scrub(str(exc))}

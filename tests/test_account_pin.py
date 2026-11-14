@@ -43,8 +43,12 @@ def test_a_value_that_is_not_a_digest_is_refused_and_never_echoed(settings_facto
 
 
 def test_both_pins_must_name_the_same_account(settings_factory):
-    s = settings_factory(KITE_MCP_ALLOWED_USER_ID="ab1234", **HASH_PIN)
-    assert AccountPin.from_settings(s).allows("AB1234")
+    pin = AccountPin.from_settings(settings_factory(KITE_MCP_ALLOWED_USER_ID="ab1234", **HASH_PIN))
+    assert pin.allows("AB1234")
+    # with both set the hash pin wins: the account is still named only by its digest prefix
+    assert pin.by_hash and pin.setting == "KITE_MCP_ALLOWED_USER_ID_SHA256"
+    assert pin.label("AB1234") == {"user_id_sha256_prefix": AB1234_SHA256[:12]}
+    assert pin.describe("AB1234") == f"sha256:{AB1234_SHA256[:12]}"
     with pytest.raises(ConfigError, match="different accounts") as info:
         settings_factory(KITE_MCP_ALLOWED_USER_ID="ZZ9999", **HASH_PIN)
     assert "ZZ9999" not in str(info.value)
@@ -60,6 +64,13 @@ def test_one_check_for_either_pin(settings_factory, env, by_hash):
     assert pin.allows("AB1234") and pin.allows(" ab1234 ")
     for other in ("ZZ9999", "", "  ", None, 5, ["AB1234"]):
         assert not pin.allows(other), other
+
+
+@pytest.mark.parametrize("env", [{"KITE_MCP_ALLOWED_USER_ID": "AB1234"}, HASH_PIN])
+def test_the_pin_keeps_its_digest_out_of_its_repr(settings_factory, env):
+    pin = AccountPin.from_settings(settings_factory(**env))
+    assert pin.digest == AB1234_SHA256  # the check still has it
+    assert AB1234_SHA256 not in repr(pin) and AB1234_SHA256[:12] not in str(pin) and USER_ID not in repr(pin)
 
 
 def test_without_a_pin_any_account_is_allowed(settings_factory):
@@ -80,7 +91,8 @@ def test_the_check_compares_digests_in_constant_time(settings_factory, monkeypat
 def test_with_the_hash_pin_an_account_is_named_by_a_digest_prefix(settings_factory):
     pin = AccountPin.from_settings(settings_factory(**HASH_PIN))
     assert pin.label("ab1234") == {"user_id_sha256_prefix": AB1234_SHA256[:12]}
-    assert pin.label(None) == {"user_id_sha256_prefix": None}
+    for odd in (None, 5, "", "  ", ["AB1234"]):  # Kite's answer passed on as it came: no prefix, and no error
+        assert pin.label(odd) == {"user_id_sha256_prefix": None}, odd
     assert pin.describe("AB1234") == f"sha256:{AB1234_SHA256[:12]}"
 
 
@@ -103,6 +115,9 @@ async def test_a_hash_pinned_login_by_another_account_is_ended_and_refused(runti
     assert "KITE_MCP_ALLOWED_USER_ID_SHA256" in result.message and "ZZ9999" not in result.message
     assert kite.logouts and kite.logouts[0]["access_token"] == NEW_TOKEN  # that session's own token only
     assert rt.settings.token_file.read_text() == before and rt.tokens.current().access_token == ACCESS_TOKEN
+    audit = rt.audit.read()
+    assert [e["reason"] for e in audit if e["event"] == "login_refused"] == ["account_mismatch"]
+    assert "ZZ9999" not in json.dumps(audit)  # the other account is not named either
 
 
 def test_the_postback_check_uses_the_hash_pin(service_factory, tmp_path):
@@ -143,6 +158,23 @@ def test_status_verify_names_the_account_by_its_digest_prefix(cli_env, capsys, m
     out, err = capsys.readouterr()
     assert json.loads(out)["live_check"] == {"verified": True, "user_id_sha256_prefix": AB1234_SHA256[:12]}
     assert USER_ID not in out + err
+
+
+@pytest.mark.parametrize("profile", [[USER_ID], "AB1234", {"user_id": 5}])
+def test_status_verify_survives_a_profile_that_is_not_the_expected_object(
+    cli_env, capsys, monkeypatch, fake_kite, profile
+):
+    real_build = server_module.build_runtime
+    monkeypatch.setattr(
+        server_module,
+        "build_runtime",
+        lambda settings, **kw: real_build(settings, transport=fake_kite.transport(), clock=lambda: FIXED_NOW, **kw),
+    )
+    monkeypatch.setenv("KITE_MCP_ALLOWED_USER_ID_SHA256", AB1234_SHA256)
+    fake_kite.on("GET", "/user/profile", profile)
+    assert cli.main(["status", "--verify"]) == 0
+    out, _ = capsys.readouterr()
+    assert json.loads(out)["live_check"] == {"verified": True, "user_id_sha256_prefix": None}
 
 
 async def test_the_login_tool_notes_a_missing_pin_by_either_setting(mcp_factory):

@@ -86,7 +86,7 @@ class LoginResult:
     ok: bool
     reason: str
     message: str = ""
-    user_id: str | None = None
+    user_id: str | None = None  # the plain id: name it to a person only through LoginManager.pin.label/describe
     expires_at: dt.datetime | None = None
 
 

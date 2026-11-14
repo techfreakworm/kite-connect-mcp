@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -34,7 +34,9 @@ def user_id_digest(user_id: str) -> str:
 
 @dataclass(frozen=True)
 class AccountPin:
-    digest: str | None  # the pinned account's digest; None: no pin, any account is accepted
+    # the pinned account's digest; None: no pin, any account is accepted. Out of the repr, as on Settings: the plain
+    # id can be found from it by trying them all
+    digest: str | None = field(repr=False)
     by_hash: bool = False  # given as KITE_MCP_ALLOWED_USER_ID_SHA256: the plain id is never written
 
     @classmethod
@@ -63,7 +65,7 @@ class AccountPin:
             return False
         return hmac.compare_digest(user_id_digest(user_id), self.digest)
 
-    def label(self, user_id: str | None) -> dict[str, str | None]:
+    def label(self, user_id: object) -> dict[str, object]:
         """How an account is named in the audit log and in results: {"user_id": ...} as before, or with the hash pin
         {"user_id_sha256_prefix": <the first PREFIX_CHARS hex digits of its digest>}. Something other than a string
         (a Kite answer passed on as it came) gives None there rather than an error."""
