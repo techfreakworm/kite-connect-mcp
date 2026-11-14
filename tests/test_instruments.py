@@ -156,16 +156,16 @@ DUMP_ROWS = [
         lot="1000",
     ),
 ]
-MF_ROWS = [
-    "INF846K01DP8,AXISMUTUALFUND_MF,Axis Bluechip Fund - Direct Plan - Growth,1,1,5000.0,1.0,100.0,1.0,0.001,"
+MF_ROWS = [  # made-up funds, fund houses and ISINs
+    "INF000B01DP1,ACMEMF,Acme Bluechip Fund - Direct Plan - Growth,1,1,5000.0,1.0,100.0,1.0,0.001,"
     "growth,equity,direct,T3,57.1234,2026-11-03",
-    "INF846K01EW2,AXISMUTUALFUND_MF,Axis Long Term Equity Fund - Direct Growth,1,0,500.0,500.0,500.0,1.0,0.001,"
+    "INF000B01EL2,ACMEMF,Acme ELSS Fund - Direct Growth,1,0,500.0,500.0,500.0,1.0,0.001,"
     "growth,elss,direct,T3,98.5,2026-11-03",
-    "INF846K01131,AXISMUTUALFUND_MF,Axis Bluechip Fund - Regular Plan - Growth,1,1,5000.0,1.0,100.0,1.0,0.001,"
+    "INF000B01RG3,ACMEMF,Acme Bluechip Fund - Regular Plan - Growth,1,1,5000.0,1.0,100.0,1.0,0.001,"
     "growth,equity,regular,T3,52.0,2026-11-03",
-    "INF174K01LS2,KOTAKMAHINDRAMF,Kotak Select Focus Fund - Direct Plan - Growth,1,1,5000.0,1.0,1000.0,0.001,0.001,"
+    "INF000B01FC4,ZETAMF,Zeta Focus Fund - Direct Plan - Growth,1,1,5000.0,1.0,1000.0,0.001,0.001,"
     "growth,equity,direct,T3,26.549,2026-11-03",
-    "INF179K01XQ0,HDFCMUTUALFUND_MF,HDFC Liquid Fund - Direct Plan - Growth,0,1,5000.0,1.0,1000.0,0.001,0.001,"
+    "INF000B01LQ5,EXAMPLEMF,Example Liquid Fund - Direct Plan - Growth,0,1,5000.0,1.0,1000.0,0.001,0.001,"
     "growth,debt,direct,T1,4987.5,",
 ]
 
@@ -773,7 +773,7 @@ async def test_a_damaged_second_dump_in_the_old_file_is_dropped_and_fetched_agai
     assert await store.lookup("NSE", "INFY") is not None  # building the new file cannot carry the MF list across ...
     assert (await store.status())["mf_instruments"] == {"loaded": False}
     assert downloads(fake_kite, "/mf/instruments") == 0
-    assert await store.lookup_mf("INF846K01DP8") is not None  # ... so it is simply downloaded when asked for
+    assert await store.lookup_mf("INF000B01DP1") is not None  # ... so it is simply downloaded when asked for
     assert downloads(fake_kite, "/mf/instruments") == 1 and downloads(fake_kite) == 1
 
 
@@ -782,14 +782,14 @@ async def test_a_failing_mf_dump_does_not_block_the_instrument_list(store, fake_
     fake_kite.on("GET", "/mf/instruments", status=500, error_type="GeneralException", message="mf down")
     assert await store.lookup("NSE", "INFY") is not None
     with pytest.raises(InstrumentsUnavailable, match="mutual fund list"):
-        await store.lookup_mf("INF846K01DP8")
+        await store.lookup_mf("INF000B01DP1")
     status = await store.status()
     assert status["loaded"] is True
     assert status["mf_instruments"]["loaded"] is False and "mf down" in status["mf_instruments"]["last_error"]
 
     serve_dumps(fake_kite)
     clock.now = FIXED_NOW + dt.timedelta(minutes=6)
-    assert await store.lookup_mf("INF846K01DP8") is not None
+    assert await store.lookup_mf("INF000B01DP1") is not None
     assert downloads(fake_kite) == 1  # the instrument list was not downloaded again
     assert await store.lookup("NSE", "INFY") is not None  # ... and survived the rebuild of the cache file
     status = await store.status()
@@ -798,7 +798,7 @@ async def test_a_failing_mf_dump_does_not_block_the_instrument_list(store, fake_
 
 async def test_refreshing_one_dump_carries_the_other_across(store, fake_kite, clock):
     serve_dumps(fake_kite)
-    await store.lookup_mf("INF846K01DP8")
+    await store.lookup_mf("INF000B01DP1")
     await store.lookup("NSE", "INFY")
     mf_loaded = (await store.status())["mf_instruments"]["loaded_at"]
     clock.now = ist(5, 9)
@@ -910,9 +910,9 @@ async def test_refresh_reports_a_failed_dump_and_raises_only_without_any_instrum
 
 async def test_mf_lookup_and_types(store, fake_kite):
     serve_dumps(fake_kite)
-    fund = await store.lookup_mf("inf846k01ew2")
+    fund = await store.lookup_mf("inf000b01el2")
     assert fund is not None
-    assert fund.name == "Axis Long Term Equity Fund - Direct Growth" and fund.amc == "AXISMUTUALFUND_MF"
+    assert fund.name == "Acme ELSS Fund - Direct Growth" and fund.amc == "ACMEMF"
     assert fund.purchase_allowed is True and fund.redemption_allowed is False
     assert fund.minimum_purchase_amount == Decimal("500.0") and fund.purchase_amount_multiplier == Decimal("500.0")
     assert fund.redemption_quantity_multiplier == Decimal("0.001")
@@ -920,19 +920,19 @@ async def test_mf_lookup_and_types(store, fake_kite):
     assert fund.last_price == Decimal("98.5") and fund.last_price_date == dt.date(2026, 11, 3)
     assert fund.as_dict()["last_price_date"] == "2026-11-03" and fund.as_dict()["minimum_purchase_amount"] == 500.0
     assert await store.lookup_mf("INF000000000") is None
-    liquid = await store.lookup_mf("INF179K01XQ0")
+    liquid = await store.lookup_mf("INF000B01LQ5")
     assert liquid is not None and liquid.purchase_allowed is False and liquid.last_price_date is None
 
 
 async def test_mf_search(store, fake_kite):
     serve_dumps(fake_kite)
-    names = [f.tradingsymbol for f in await store.search_mf("axis")]
-    assert sorted(names) == ["INF846K01131", "INF846K01DP8", "INF846K01EW2"]
-    assert [f.tradingsymbol for f in await store.search_mf("INF846K01DP8")] == ["INF846K01DP8"]  # the ISIN
-    assert [f.tradingsymbol for f in await store.search_mf("bluechip axis", plan="direct")] == ["INF846K01DP8"]
-    assert [f.tradingsymbol for f in await store.search_mf("", scheme_type="ELSS")] == ["INF846K01EW2"]
-    assert [f.tradingsymbol for f in await store.search_mf("", amc="kotak")] == ["INF174K01LS2"]
-    assert [f.tradingsymbol for f in await store.search_mf("", plan="regular")] == ["INF846K01131"]
+    names = [f.tradingsymbol for f in await store.search_mf("acme")]
+    assert sorted(names) == ["INF000B01DP1", "INF000B01EL2", "INF000B01RG3"]
+    assert [f.tradingsymbol for f in await store.search_mf("INF000B01DP1")] == ["INF000B01DP1"]  # the ISIN
+    assert [f.tradingsymbol for f in await store.search_mf("bluechip acme", plan="direct")] == ["INF000B01DP1"]
+    assert [f.tradingsymbol for f in await store.search_mf("", scheme_type="ELSS")] == ["INF000B01EL2"]
+    assert [f.tradingsymbol for f in await store.search_mf("", amc="zeta")] == ["INF000B01FC4"]
+    assert [f.tradingsymbol for f in await store.search_mf("", plan="regular")] == ["INF000B01RG3"]
     assert len(await store.search_mf("fund", limit=2)) == 2
     assert await store.search_mf("zzz") == []
     with pytest.raises(ToolInputError):

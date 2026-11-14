@@ -634,13 +634,13 @@ async def test_search_mf_instruments_tool(make_server, fake_kite):
     serve_dumps(fake_kite)
     server, _, _ = make_server()
     found = tool_json(await call(server, "search_mf_instruments", {"query": "bluechip", "plan": "direct"}))
-    assert [fund["tradingsymbol"] for fund in found] == ["INF846K01DP8"]
+    assert [fund["tradingsymbol"] for fund in found] == ["INF000B01DP1"]
     fund = found[0]
-    assert fund["amc"] == "AXISMUTUALFUND_MF" and fund["purchase_allowed"] is True
+    assert fund["amc"] == "ACMEMF" and fund["purchase_allowed"] is True
     assert fund["minimum_purchase_amount"] == 5000.0 and fund["last_price"] == 57.1234
     assert fund["last_price_date"] == "2026-11-03" and fund["scheme_type"] == "equity"
-    by_filter = tool_json(await call(server, "search_mf_instruments", {"amc": "kotak"}))
-    assert [f["tradingsymbol"] for f in by_filter] == ["INF174K01LS2"]
+    by_filter = tool_json(await call(server, "search_mf_instruments", {"amc": "zeta"}))
+    assert [f["tradingsymbol"] for f in by_filter] == ["INF000B01FC4"]
     assert (await call(server, "search_mf_instruments", {})).is_error
     assert fake_kite.calls("GET", "/instruments") == []  # the MF list does not pull the instrument list
 

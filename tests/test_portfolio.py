@@ -38,7 +38,7 @@ def holding(symbol: str, quantity: int, avg: float, last: float, close: float, p
 HOLDINGS = [
     holding("ITC", 10, 400, 410, 405, 100, 5, isin="INE154A01025"),
     holding("INFY", 3, 1500, 1480, 1490, -100, -10, isin="INE009A01021", t1_quantity=2),  # 3 settled + 2 on T+1
-    holding("GOLDBEES", 20, 50, 55, 54, 100, 1, isin="INF204KB17I5", discrepancy=True),
+    holding("GOLDBEES", 20, 50, 55, 54, 100, 1, isin="INF000B01GB6", discrepancy=True),
 ]
 # the two holdings of the docs' sample, with its float noise
 DOCS_HOLDINGS = [

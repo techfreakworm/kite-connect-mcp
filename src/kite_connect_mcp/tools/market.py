@@ -459,12 +459,12 @@ def register(reg: Registrar) -> None:
             Field(
                 max_length=100,
                 description="part of the fund name or its ISIN, case-insensitive; every word must match "
-                '(e.g. "axis bluechip", "INF846K01DP8"). May be empty when a filter is given',
+                '(e.g. "acme bluechip", "INF000A01AA0"). May be empty when a filter is given',
             ),
         ] = "",
         amc: Annotated[
             str | None,
-            Field(description='part of the fund house code, e.g. "AXIS" (codes look like AXISMUTUALFUND_MF)'),
+            Field(description='part of the fund house code, e.g. "ACME" (codes look like ACMEMUTUALFUND_MF)'),
         ] = None,
         plan: Annotated[str | None, Field(description="direct or regular")] = None,
         scheme_type: Annotated[str | None, Field(description="equity, debt, elss ...")] = None,

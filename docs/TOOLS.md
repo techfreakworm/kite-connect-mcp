@@ -689,8 +689,8 @@ NAV, INR) and last_price_date.
 
 | Argument | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `query` | string |  | `""` | part of the fund name or its ISIN, case-insensitive; every word must match (e.g. "axis bluechip", "INF846K01DP8"). May be empty when a filter is given |
-| `amc` | string (optional) |  | `null` | part of the fund house code, e.g. "AXIS" (codes look like AXISMUTUALFUND_MF) |
+| `query` | string |  | `""` | part of the fund name or its ISIN, case-insensitive; every word must match (e.g. "acme bluechip", "INF000A01AA0"). May be empty when a filter is given |
+| `amc` | string (optional) |  | `null` | part of the fund house code, e.g. "ACME" (codes look like ACMEMUTUALFUND_MF) |
 | `plan` | string (optional) |  | `null` | direct or regular |
 | `scheme_type` | string (optional) |  | `null` | equity, debt, elss ... |
 | `limit` | integer |  | `20` | most results to return |

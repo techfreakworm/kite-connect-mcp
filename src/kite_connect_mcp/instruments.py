@@ -111,7 +111,7 @@ class Instrument:
 
 @dataclass(frozen=True)
 class MFInstrument:
-    tradingsymbol: str  # the ISIN, e.g. INF846K01EW2
+    tradingsymbol: str  # the ISIN, e.g. INF000X01AB1
     amc: str
     name: str
     purchase_allowed: bool
