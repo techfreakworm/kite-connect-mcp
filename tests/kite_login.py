@@ -46,6 +46,7 @@ class KiteSession:
         self.delay = delay
         self.spent = False
         self.fail_next = False
+        self.no_answer_next = False  # the next exchange gets no answer (a read timeout); its request token stays unused
         self.logout_error: tuple[int, str] | None = None  # (HTTP status, Kite error_type) for DELETE
         self.exchanges: list[dict[str, str]] = []
         self.logouts: list[dict[str, str]] = []
@@ -57,6 +58,9 @@ class KiteSession:
             await asyncio.sleep(self.delay)
         form = dict(FakeKite.form(request))
         self.exchanges.append(form)
+        if self.no_answer_next:
+            self.no_answer_next = False
+            raise httpx2.ReadTimeout("no answer")
         good = (
             not self.spent
             and not self.fail_next

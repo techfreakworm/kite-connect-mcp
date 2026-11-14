@@ -39,7 +39,7 @@ TRANSACTION_TYPES = ("BUY", "SELL")
 SESSION_TEXT = {  # the session events built by session_event; the login's three have builders of their own
     "token_rejected": "Kite rejected the stored access token: log in again to resume the order events.",
 }
-SESSIONS = ("token_rejected", "login", "login_refused", "login_failed")  # every session event's name
+SESSIONS = ("token_rejected", "login", "login_refused", "login_failed")  # every session event's name: _session checks
 LOGIN_REFUSED_TEXT = "A Kite login by another account was refused, and the session it opened was ended."
 LOGIN_REFUSED_OPEN_TEXT = (
     "A Kite login by another account was refused; ending the session it opened failed, so it lapses at 06:00 IST."
@@ -371,6 +371,10 @@ def token_fingerprint(access_token: str) -> str:
 
 
 def _session(name: str, seed: str, received_at: dt.datetime, text: str) -> dict[str, Any]:
+    """Every session event is built here: `name` must be one of SESSIONS (ValueError for any other), so a new one is
+    added there first."""
+    if name not in SESSIONS:
+        raise ValueError(f"unknown session event {name!r}")
     return {
         "kind": "session",
         "event_id": digest("session", name, seed),
@@ -394,7 +398,7 @@ def login_event(
     """A login stored a new token. `seed` (a fingerprint of that token) makes the id: once per token."""
     start, end = to_ist(logged_in_at), to_ist(expires_at)
     days = (end.date() - start.date()).days
-    when = "today" if days == 0 else "tomorrow" if days == 1 else f"on {end:%a %d %b}"
+    when = "today" if days == 0 else "tomorrow" if days == 1 else f"on {end.date().isoformat()}"  # no locale names
     text = f"Kite login completed: the session is valid until {end:%H:%M} IST {when}."
     body = _session("login", seed, received_at, text)
     body["logged_in_at"] = start.isoformat(timespec="seconds")

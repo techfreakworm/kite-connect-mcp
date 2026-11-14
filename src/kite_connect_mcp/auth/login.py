@@ -354,12 +354,13 @@ class LoginManager:
             if result.ok:
                 await self._commit(reservation)
             else:
-                await self._release(reservation)
                 if reservation is not None and state is not None and result.reason in LOGIN_FAILURES:
                     # a real login on a link of ours did not complete: one event per link (the noise never gets here:
-                    # it has no reserved state, and a pasted request token without a state has none either)
+                    # it has no reserved state, and a pasted request token without a state has none either). Told
+                    # before the release is awaited, so a task cancelled during the release still raises it.
                     seed, reason = digest_of(state), result.reason
                     self._tell_events("login_failed", lambda notes: notes.note_login_failed(seed, reason=reason))
+                await self._release(reservation)
             return result
 
     async def _exchange_and_store(self, request_token: str, state: str | None, source: str) -> LoginResult:
@@ -414,8 +415,7 @@ class LoginManager:
                 session_ended=ended,
             )
 
-        logged_in_at = to_ist(self.clock())
-        record = TokenRecord.new(access_token, logged_in_at)
+        record = TokenRecord.new(access_token, to_ist(self.clock()))
         try:
             await asyncio.to_thread(self.tokens.file.write, record)
         except (OSError, ConfigError) as exc:
@@ -430,11 +430,11 @@ class LoginManager:
             )
         self.tokens.accept(access_token)
         self._audit("login_ok", source=source, **self.pin.label(user_id), expires_at=record.expires_at)
+        logged_in_at, expires_at = record.logged_in_at, record.expires_at  # the stored times, as in the audit line
+        assert logged_in_at is not None  # TokenRecord.new sets both
+        assert expires_at is not None
         self._tell_events(
-            "login",
-            lambda notes: notes.note_login(
-                access_token, logged_in_at=logged_in_at, expires_at=next_token_reset(logged_in_at)
-            ),
+            "login", lambda notes: notes.note_login(access_token, logged_in_at=logged_in_at, expires_at=expires_at)
         )
         log.info("Kite login completed (%s)", source)
         return LoginResult(True, "ok", "logged in", user_id=user_id, expires_at=record.expires_at)
