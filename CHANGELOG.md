@@ -3,7 +3,7 @@
 All notable changes are listed here. Versions follow [semantic versioning](https://semver.org); while the version
 is 0.x, minor releases may change tool arguments.
 
-## Unreleased
+## 0.2.0 (2026-11-14)
 
 ### Added
 
