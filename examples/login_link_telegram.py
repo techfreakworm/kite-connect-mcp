@@ -2,8 +2,8 @@
 """Example login link command: send a Kite login link to a Telegram chat through the Bot API.
 
 Point KITE_MCP_LOGIN_LINK_COMMAND at this file. The server runs it, with no arguments, at each reminder time when no
-valid token is stored, after Kite rejected the stored token, and on login(deliver=true). Its input on stdin is one
-JSON object and a newline:
+valid token is stored, after Kite rejected the stored token (with KITE_MCP_EVENTS=true; at most one such link every
+two hours), and on login(deliver=true). Its input on stdin is one JSON object and a newline:
 
     {"url": "https://kite.zerodha.com/connect/login?v=3&api_key=...", "expires_at": "2026-11-17T05:59:00+05:30",
      "reason": "scheduled"}
@@ -58,19 +58,20 @@ def login_link(url: object) -> str | None:
 
 
 def until(expires_at: object) -> str | None:
-    """HH:MM in IST of the link's expiry, or None when it does not parse."""
+    """HH:MM in IST of the link's expiry, or None when it does not parse or has no offset (the server always gives
+    one: a time without it is not guessed at)."""
     if not isinstance(expires_at, str):
         return None
     try:
         moment = dt.datetime.fromisoformat(expires_at)
-        if moment.tzinfo is None:  # the server gives an offset; a moment without one is taken as IST
-            moment = moment.replace(tzinfo=IST)
+        if moment.tzinfo is None:
+            return None
         return moment.astimezone(IST).strftime("%H:%M")
     except (ValueError, OverflowError):
         return None
 
 
-def message(url: str, data: dict) -> str:
+def message(url: str, data: dict[str, object]) -> str:
     lines = [FIRST_LINES.get(str(data.get("reason")), "Kite login link.")]
     expiry = until(data.get("expires_at"))
     if expiry is not None:
@@ -89,7 +90,7 @@ def main() -> int:
         return fail("TELEGRAM_API_BASE must start with https:// or http://")
     try:
         data = json.load(sys.stdin.buffer)  # the input is UTF-8 whatever the locale (LANG) says
-    except ValueError:  # not JSON, or not UTF-8
+    except (ValueError, RecursionError):  # not JSON, not UTF-8, or nested deeper than the parser goes
         data = None
     if not isinstance(data, dict) or (url := login_link(data.get("url"))) is None:
         return fail("the input holds no login link")

@@ -297,7 +297,8 @@ def test_the_link_command_sends_the_link_to_the_chat(telegram):
 
 def test_the_message_has_the_reason_the_expiry_and_the_link_on_its_own_line(telegram):
     base, fake = telegram
-    assert run(LINK_CMD, LINK_INPUT, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 0
+    result = run(LINK_CMD, LINK_INPUT, {**TG_ENV, "TELEGRAM_API_BASE": base})
+    assert result.returncode == 0, result.stderr
     assert fake.received[0]["body"]["text"].splitlines() == [
         "Time to log in to Kite.",
         "It works once, until 05:59 IST.",
@@ -308,17 +309,27 @@ def test_the_message_has_the_reason_the_expiry_and_the_link_on_its_own_line(tele
 def test_the_expiry_is_given_in_ist(telegram):
     base, fake = telegram
     expires_at = "2026-11-17T00:29:00+00:00"  # 05:59 IST
-    assert (
-        run(LINK_CMD, {**LINK_INPUT, "expires_at": expires_at}, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 0
-    )
+    result = run(LINK_CMD, {**LINK_INPUT, "expires_at": expires_at}, {**TG_ENV, "TELEGRAM_API_BASE": base})
+    assert result.returncode == 0, result.stderr
     assert "It works once, until 05:59 IST." in fake.received[0]["body"]["text"]
 
 
-@pytest.mark.parametrize("expires_at", [None, "", "tomorrow", 5])
-def test_an_expiry_that_does_not_parse_is_left_out(telegram, expires_at):
+@pytest.mark.parametrize(
+    "expires_at",
+    [
+        None,
+        "",
+        "tomorrow",
+        5,
+        "2026-11-17",  # no offset: the server always gives one, so the time is not guessed
+        "2026-11-17T05:59:00",
+    ],
+)
+def test_an_expiry_that_does_not_parse_or_has_no_offset_is_left_out(telegram, expires_at):
     base, fake = telegram
     link_input = {**LINK_INPUT, "expires_at": expires_at}
-    assert run(LINK_CMD, link_input, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 0
+    result = run(LINK_CMD, link_input, {**TG_ENV, "TELEGRAM_API_BASE": base})
+    assert result.returncode == 0, result.stderr
     assert fake.received[0]["body"]["text"].splitlines() == ["Time to log in to Kite.", LINK]
 
 
@@ -336,7 +347,8 @@ def test_the_message_says_why(telegram, reason, words):
 def test_a_reason_it_does_not_know_still_sends_the_link(telegram, reason):
     base, fake = telegram
     link_input = {**LINK_INPUT, "reason": reason}
-    assert run(LINK_CMD, link_input, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 0
+    result = run(LINK_CMD, link_input, {**TG_ENV, "TELEGRAM_API_BASE": base})
+    assert result.returncode == 0, result.stderr
     assert fake.received[0]["body"]["text"].splitlines()[0] == "Kite login link."
 
 
@@ -344,9 +356,8 @@ def test_a_reason_it_does_not_know_still_sends_the_link(telegram, reason):
 def test_any_refusal_is_a_failure_without_retry(telegram, status):
     base, fake = telegram
     fake.status = status
-    assert (
-        run(LINK_CMD, LINK_INPUT, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 1
-    )  # the next time is the retry
+    # the next time is the retry
+    assert run(LINK_CMD, LINK_INPUT, {**TG_ENV, "TELEGRAM_API_BASE": base}).returncode == 1
 
 
 @pytest.mark.parametrize("bad", [{}, {"url": "ftp://x"}, {"url": "https://kite.example.com/x y"}])
@@ -364,6 +375,7 @@ def test_input_without_a_link_is_refused(telegram, bad):
         b'{"url": 5}\n',
         b'{"url": "https://kite.example.com/x\\ny"}\n',  # a line break in the link
         b'{"url": "https://"}\n',
+        b"[" * 100_000 + b"]" * 100_000 + b"\n",  # nested deeper than the parser goes
     ],
 )
 def test_input_that_is_not_a_link_object_is_refused_in_one_line(telegram, payload):
@@ -421,3 +433,11 @@ def test_the_link_command_never_prints_the_token_or_the_link(telegram, base, bot
 def test_the_link_command_is_one_executable_program():
     path = EXAMPLES / "login_link_telegram.py"
     assert os.access(path, os.X_OK) and path.read_text().startswith("#!/usr/bin/env python3\n")
+
+
+def test_the_docs_say_the_rejected_token_link_needs_the_events():
+    """The server wires the link after a rejected token to the event service only, which is off by default."""
+    words = "after Kite rejected the stored token (with KITE_MCP_EVENTS=true; at most one such link every two hours)"
+    for path in (EXAMPLES / "README.md", EXAMPLES / "login_link_telegram.py"):
+        text = " ".join(path.read_text().replace("`", "").split())
+        assert words in text, path.name

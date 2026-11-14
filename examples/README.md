@@ -61,9 +61,10 @@ kite-connect-mcp events tail --limit 1 | python3 examples/consumers/log_to_file.
 ## A login link command
 
 With `KITE_MCP_LOGIN_LINK_COMMAND` set (in managed mode, with `KITE_MCP_PUBLIC_URL`, on the HTTP transport), the
-server hands a fresh Kite login link to a program of yours: at each reminder time (`KITE_MCP_LOGIN_REMINDER_TIMES`) when no valid token is stored,
-after Kite rejected the stored token, and when you call `login(deliver=true)`. You tap the link, log in to Kite, and
-Kite sends you back to the server, which stores the new token.
+server hands a fresh Kite login link to a program of yours: at each reminder time (`KITE_MCP_LOGIN_REMINDER_TIMES`)
+when no valid token is stored, after Kite rejected the stored token (with `KITE_MCP_EVENTS=true`; at most one such
+link every two hours), and when you call `login(deliver=true)`. You tap the link, log in to Kite, and Kite sends you
+back to the server, which stores the new token.
 
 | File | Input (stdin) | Exit | Settings (environment) |
 |---|---|---|---|
@@ -77,12 +78,17 @@ output nowhere and notes only how it ended (`exit 1`), so run the command by han
 
 ### Installing it
 
-1. Copy it somewhere only the server's user (or root) can change, for example `/usr/local/bin/send-kite-link`, and
-   make it executable: `chmod 755 /usr/local/bin/send-kite-link`. It must be owned by the server's user or root and
-   writable by no one else, and so must the folders on the way to it: the server checks it when it starts and before
-   each run. The server runs it with no arguments, through its first line (`#!/usr/bin/env python3`), so `python3`
-   must be on the server's `PATH`. Under systemd, as in [SELF_HOSTING.md](../docs/SELF_HOSTING.md), keep it out of
-   `/home`, which `ProtectHome=true` hides.
+1. Install it, executable, somewhere only root (or the server's user) can change, for example
+   `/usr/local/bin/send-kite-link`. From a checkout of this repository:
+
+   ```bash
+   sudo install -m 0755 examples/login_link_telegram.py /usr/local/bin/send-kite-link
+   ```
+
+   It must be owned by the server's user or root and writable by no one else, and so must the folders on the way to
+   it: the server checks it when it starts and before each run. The server runs it with no arguments, through its
+   first line (`#!/usr/bin/env python3`), so `python3` must be on the server's `PATH`. Under systemd, as in
+   [SELF_HOSTING.md](../docs/SELF_HOSTING.md), keep it out of `/home`, which `ProtectHome=true` hides.
 2. Put the Telegram variables in the server's settings file, with your own values, and name them in
    `KITE_MCP_LOGIN_LINK_ENV_PASS`: the command gets only `PATH`, `HOME`, `LANG` and the variables named there,
    never the server's `KITE_*` settings.
@@ -96,10 +102,13 @@ output nowhere and notes only how it ended (`exit 1`), so run the command by han
    ```
 
 3. Restart the server. `kite-connect-mcp status` then shows `login_links`: the times, the next one and how the last
-   link went. To try the command, ask your AI client for `login(deliver=true)`, or feed it a made-up link by hand,
-   with `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in your environment:
+   link went. To try the command, ask your AI client for `login(deliver=true)`, or feed it a made-up link by hand.
+   Paste the bot token at `read`'s silent prompt, not on the command line, so that it lands neither on the screen nor
+   in your shell history:
 
    ```bash
+   read -rs TELEGRAM_BOT_TOKEN && export TELEGRAM_BOT_TOKEN    # paste the token, then Enter
+   export TELEGRAM_CHAT_ID=123456789
    echo '{"url": "https://kite.zerodha.com/connect/login?v=3&api_key=...", "reason": "requested"}' \
        | /usr/local/bin/send-kite-link; echo "exit $?"
    ```
