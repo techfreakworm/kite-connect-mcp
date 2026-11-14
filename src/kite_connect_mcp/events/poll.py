@@ -13,13 +13,15 @@ token it skips quietly, as it does when the doorbells it ran found the token rej
 sent again. If Kite refuses the token, the token is marked rejected and `token_rejected` is raised once. An answer that
 is not a list of orders is a failed poll (poll_failed), so it never stands in for the day's last poll.
 
-Every failed poll is counted in poll_failed, but logged only when the polls start failing and when one works again, so
-an outage logs two lines, not one a minute. Nothing that fails stops run(): it logs, and the next tick tries again.
+Every failed poll is counted in poll_failed (one that raises, under the kind of error, when the store can still count
+it), but logged only when the polls start failing and when one works again, so an outage logs two lines, not one a
+minute. Nothing that fails stops run(): it logs, and the next tick tries again.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import logging
 from collections.abc import Mapping
@@ -210,11 +212,16 @@ class Poller:
             await self._safe_poll(reason)
 
     async def _safe_poll(self, reason: Reason) -> bool:
-        """poll(), with an error logged instead of raised: its traceback when the polls start failing."""
+        """poll(), with an error logged instead of raised: its traceback when the polls start failing. It is counted in
+        poll_failed too (by the kind of error only: its text may hold a field of an order), if the store can count it,
+        so a bug that breaks the poll shows in the status instead of only leaving poll_ok to go stale."""
         try:
             return await self.poll(reason)
-        except Exception:
+        except Exception as exc:
             if not self._failing:
                 self._failing = True
                 log.exception("order events: the order-book poll failed (not logged again until a poll works)")
+            note = f"an unexpected error: {type(exc).__name__} (see the log)"
+            with contextlib.suppress(Exception):  # a store that cannot write is what may have failed the poll
+                self.service.store.bump("poll_failed", self.service.clock(), note)
             return False

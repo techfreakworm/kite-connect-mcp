@@ -310,6 +310,34 @@ async def test_a_poll_that_raises_is_logged_once_until_it_recovers(setup, caplog
     assert "works again" in recovered.getMessage()
 
 
+async def test_a_poll_that_raises_is_counted_as_failed_with_only_the_kind_of_error(setup, monkeypatch):
+    """A bug that breaks the ingest on some row must show in the status, not only leave poll_ok going stale."""
+    svc, poller, kite, _, _ = setup
+    kite.on("GET", "/orders", [order_row()])
+
+    def broken(*args, **kwargs):
+        raise KeyError("a field of the row: 250101000000001")
+
+    monkeypatch.setattr(svc, "ingest_order", broken)
+    for _ in range(2):
+        assert await poller._safe_poll("window") is False
+    failed = svc.store.counters()["poll_failed"]
+    assert failed["count"] == 2 and failed["note"] == "an unexpected error: KeyError (see the log)"
+    assert "poll_ok" not in svc.store.counters()
+    assert kite.writes() == []
+
+
+async def test_a_poll_whose_failure_cannot_be_counted_still_returns(setup, monkeypatch):
+    svc, poller, kite, _, _ = setup
+    kite.on("GET", "/orders", [])
+
+    def broken(*args, **kwargs):
+        raise StoreError("cannot write the event store: disk I/O error")
+
+    monkeypatch.setattr(svc.store, "bump", broken)
+    assert await poller._safe_poll("window") is False  # the count is lost, the poll loop is not
+
+
 async def test_a_failing_check_logs_its_traceback_once_then_a_short_line_a_minute_at_most(setup, caplog, monkeypatch):
     svc, poller, kite, clock, _ = setup
     caplog.set_level(logging.INFO, logger="kite_connect_mcp.events.poll")

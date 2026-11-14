@@ -172,16 +172,17 @@ class TokenFile:
                 self.path,
                 stat.S_IMODE(st.st_mode),
             )
+        why = ""  # what to check, when the file says why it holds no token
         try:
             text = self.path.read_text(encoding="utf-8")
         except OSError as exc:
             log.warning("cannot read the token file %s: %s", self.path, exc.strerror)
             return None
         except UnicodeDecodeError:  # not UTF-8 (a UTF-16 file, say): no usable token, cached like any other such file
-            text = ""
+            text, why = "", " (it is not UTF-8 text)"
         record = parse_token_file(text, dt.datetime.fromtimestamp(st.st_mtime, IST))
         if record is None:
-            log.warning("the token file %s does not hold a usable token", self.path)
+            log.warning("the token file %s does not hold a usable token%s", self.path, why)
         with self._lock:
             self._cached_key, self._cached = key, record
         return record

@@ -361,8 +361,17 @@ def test_a_token_file_that_is_not_utf8_holds_no_token(tmp_path, caplog):
     assert provider.current() is None
     assert provider.status()["logged_in"] is False
     (line,) = [r.getMessage() for r in caplog.records if "token file" in r.getMessage()]  # read once, then cached
-    assert "does not hold a usable token" in line
+    assert line.endswith("does not hold a usable token (it is not UTF-8 text)")  # the encoding to check, not the token
     assert FAKE_TOKEN not in caplog.text
+
+
+def test_a_utf8_token_file_without_a_token_does_not_blame_the_encoding(tmp_path, caplog):
+    path = tmp_path / "t.json"
+    path.write_text(json.dumps({"access_token": "not a token!"}), encoding="utf-8")
+    path.chmod(0o600)
+    assert TokenFile(path, writable=False).read() is None
+    (line,) = [r.getMessage() for r in caplog.records if "token file" in r.getMessage()]
+    assert line.endswith("does not hold a usable token")
 
 
 def test_expired_token_is_not_used(tmp_path):
