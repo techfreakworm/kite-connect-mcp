@@ -403,6 +403,16 @@ def test_a_token_file_that_cannot_be_read_is_logged_once_per_error(tmp_path, cap
         os.utime(path, ns=(1, 1))  # (another file: not the cached one)
         assert token_file.read() is None
         assert len(lines()) == 3  # ...so the same error is news again
+        path.chmod(0o600)
+        assert token_file.read() is not None  # read and cached
+        folder.chmod(0o000)
+        assert token_file.read() is None
+        assert len(lines()) == 4 and lines()[3].startswith("cannot stat the token file")
+        folder.chmod(0o700)
+        assert token_file.read() is not None  # it works again, from the cache (the file did not change)...
+        folder.chmod(0o000)
+        assert token_file.read() is None
+        assert len(lines()) == 5  # ...so the same error is news again
     finally:
         folder.chmod(0o700)
         path.chmod(0o600)

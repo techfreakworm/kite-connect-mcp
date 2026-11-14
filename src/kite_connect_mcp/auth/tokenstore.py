@@ -179,6 +179,7 @@ class TokenFile:
         key = (st.st_mtime_ns, st.st_size, st.st_ino)
         with self._lock:
             if key == self._cached_key:
+                self._error = None  # a read that works, from the cache: the next error is news again
                 return self._cached
         why = ""  # what to check, when the file says why it holds no token
         try:

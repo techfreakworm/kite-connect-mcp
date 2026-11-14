@@ -224,6 +224,26 @@ async def test_the_postback_writes_remembered_are_bounded(svc):
     assert svc.store.counters()["postback_accepted"]["count"] == 6
 
 
+async def test_a_ring_the_store_cannot_write_now_leaves_the_held_rings_held(svc, monkeypatch):
+    clock = svc.clock = Clock()
+    svc.RING_EVERY_S = 0.05
+    assert svc.accept_postback(ORDER_ID) is True
+    assert svc.accept_postback(ORDER_ID) is False  # held
+    clock.advance(-60)  # a clock that went back holds nothing: the next ring is written at once...
+
+    def broken(*args, **kwargs):
+        raise StoreError("the disk is full")
+
+    monkeypatch.setattr(svc.store, "ring", broken)
+    with pytest.raises(StoreError):
+        svc.accept_postback(ORDER_ID)
+    assert svc._held == {ORDER_ID: 1} and ORDER_ID in svc._held_timers  # ...but it failed: the held ring stays held
+    monkeypatch.undo()
+    await asyncio.sleep(0.2)  # its timer writes it
+    assert svc._held == {} and svc.store.counters()["postback_accepted"]["count"] == 2
+    assert svc.store.doorbells() == [(ORDER_ID, 0)]
+
+
 async def test_a_selftest_is_written_at_most_once_every_ring_interval(svc):
     clock = svc.clock = Clock()
     order_id = "selftest-0a1b2c3d4e5f"

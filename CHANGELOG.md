@@ -30,8 +30,10 @@ is 0.x, minor releases may change tool arguments.
 
 - The postback route: with `KITE_MCP_EVENTS=true` it exists whenever `KITE_MCP_POSTBACK_PATH` is set (the ticker on or
   off), feeds the order events, refuses a postback for any account other than `KITE_MCP_ALLOWED_USER_ID`, answers 200
-  once the postback is on disk and 503 when the store cannot write, and counts its refusals. With `KITE_MCP_EVENTS`
-  off it works as before, except that a signed selftest is answered 404 and never reaches the ticker's buffer.
+  once the postback is on disk (a postback within 2 s of its order's last write is answered at once, and its ring is
+  written when those 2 s are over) and 503 when the store cannot write, and counts its refusals. With
+  `KITE_MCP_EVENTS` off it works as before, except that a signed selftest is answered 404 and never reaches the
+  ticker's buffer.
 - The postback route's log lines, with the events on or off: a refusal is logged at most once a minute per reason, and
   so is the line for an accepted postback; the next line says how many were not logged.
 - `kite-connect-mcp serve` runs uvicorn with `lifespan="on"`: a server whose start-up fails (the event service, say)
