@@ -378,7 +378,9 @@ class EventService:
         """Stop the tasks (a part still busy after STOP_TIMEOUT_S is cancelled; a consumer command still running is
         killed, and its delivery stays pending for the next server), then close the store and release the lock. A
         stop() that is itself cancelled still cancels the parts, closes the store and releases the lock. Calling it
-        again, or without start(), is harmless; start() refuses afterwards."""
+        again, or without start(), is harmless: only the first call writes and closes (a refusal counted after it stays
+        unwritten); start() refuses afterwards."""
+        first = not self._stopped
         self._stopped = True
         tasks = self._tasks
         try:
@@ -392,15 +394,16 @@ class EventService:
                 await asyncio.gather(*tasks, return_exceptions=True)
             finally:
                 self._tasks = []
-                try:
-                    self.flush_refusals()
-                finally:
-                    # the store first, so that the lock covers this process's last use of the file (SQLite
-                    # tidies its WAL on close); both even when the flush fails
-                    self.store.close()
-                    self._release_lock()
-                    if tasks:
-                        log.info("order events: stopped")
+                if first:
+                    try:
+                        self.flush_refusals()
+                    finally:
+                        # the store first, so that the lock covers this process's last use of the file (SQLite
+                        # tidies its WAL on close); both even when the flush fails
+                        self.store.close()
+                        self._release_lock()
+                        if tasks:
+                            log.info("order events: stopped")
 
     def _part_ended(self, task: asyncio.Task[None]) -> None:
         """Each part's done-callback: a part that ends while the service runs (its loop crashed, or something cancelled

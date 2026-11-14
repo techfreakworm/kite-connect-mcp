@@ -424,6 +424,10 @@ def test_a_link_is_removed_before_the_error_is_clipped():
         ("stream wss://feed.example.com/live?token=SECRET closed", "stream [link] closed"),
         ("cannot reach postgres://user:SECRET@db.example.com/events", "cannot reach [link]"),
         ("open WWW.EXAMPLE.COM/SECRET now", "open [link] now"),
+        # an API's error body as some JSON encoders write it (slashes escaped), and a percent-encoded redirect
+        ('error {"url":"https:\\/\\/example.com\\/hook?token=SECRET"} end', "error [link] end"),
+        ("bad redirect=https%3A%2F%2Fexample.com%2F%3Ftoken%3DSECRET here", "bad [link] here"),
+        ("bad redirect=HTTPS%3a%2f%2fexample.com%2fSECRET here", "bad [link] here"),
         # an OSC 8 hyperlink: its target goes with the sequence, its text stays
         ("\x1b]8;;https://example.com/SECRET\x1b\\click here\x1b]8;;\x1b\\ now", "click here now"),
         ("\x1b]0;title SECRET\x07ok", "ok"),  # a window title

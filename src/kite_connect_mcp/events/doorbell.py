@@ -79,9 +79,10 @@ class DoorbellWorker:
             await wait_any(self.IDLE_S, self._wake, stop)
 
     async def process(self) -> int:
-        """Re-read every waiting doorbell, oldest first. Returns how many were settled: stored, or dropped (unknown to
-        Kite, answered for another order, given up, on a rejected token too). A rejected token ends the round; so does
-        StoreError, with the doorbell it was at left as it is."""
+        """Re-read every waiting doorbell, oldest first. Returns how many were settled (their doorbells removed):
+        stored, or dropped (unknown to Kite, answered for another order, given up, on a rejected token too). An order
+        stored while its doorbell rang again is not counted: the doorbell stays for another read. A rejected token ends
+        the round; so does StoreError, with the doorbell it was at left as it is."""
         svc = self.service
         settled = 0
         async with self._lock:

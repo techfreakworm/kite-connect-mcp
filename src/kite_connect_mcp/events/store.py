@@ -38,6 +38,8 @@ from .model import OrderView, Previous
 
 SCHEMA_VERSION = 1
 MAX_EVENTS_LIMIT = 1000  # the most events() returns at once
+# The tables, one statement per `;`: _open splits SCHEMA at each `;` to create them in one transaction, so no
+# statement may hold a `;` of its own (a trigger's BEGIN ... END, a default value or a comment with one would be cut).
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (

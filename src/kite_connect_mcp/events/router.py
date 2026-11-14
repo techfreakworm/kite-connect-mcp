@@ -10,7 +10,9 @@ The consumer contract:
   stdout   discarded
   stderr   its end becomes the delivery's error: one line, control characters dropped, links as "[link]", clipped.
            It reaches the service's log, `events status` and the other consumers' delivery_failed events, so never
-           print a secret to it (a token in a path is not recognised as a link)
+           print a secret to it. A token in a path is not recognised as a link, and an HTTP client's exception may
+           print one (urllib3's "Max retries exceeded with url: /bot<token>/sendMessage" has no scheme or host):
+           catch your HTTP client's exceptions and print a message of your own
   exit 0   handled (including a refusal the consumer reported itself): done
   exit 75  temporary failure: retried (10 s, 30 s, 1 min, 2 min, 5 min, then every 5 min, for 30 min in all)
   signal   killed by a signal (a service stop, the OOM killer): like 75. Only the command itself counts: a shell

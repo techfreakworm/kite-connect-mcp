@@ -373,8 +373,11 @@ def session_event(name: str, *, seed: str, received_at: dt.datetime) -> dict[str
 
 
 def _is_link(word: str) -> bool:
-    """A word that holds a scheme (`https://`, `wss://`, `postgres://`, glued to anything before it) or a `www.`."""
-    return "://" in word or _WWW_RE.search(word) is not None
+    """A word that holds a scheme (`https://`, `wss://`, `postgres://`, glued to anything before it) or a `www.`. The
+    scheme is found also with its slashes escaped, as some JSON encoders write them in an API's error body, and
+    percent-encoded, as in a redirect parameter (`https%3A%2F%2F`), or any mix of these."""
+    plain = word.lower().replace("\\/", "/").replace("%3a", ":").replace("%2f", "/")
+    return "://" in plain or _WWW_RE.search(word) is not None
 
 
 def clean_error_text(text: str) -> str:

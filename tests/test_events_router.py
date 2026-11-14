@@ -191,13 +191,15 @@ async def test_a_timeout_kills_what_the_command_started_too(build, tmp_path):
 
 async def test_a_background_child_that_keeps_stderr_open_times_out(build, tmp_path):
     code = "import subprocess\nsubprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\nsys.exit(0)"
-    spec, _ = consumer("notify", code, tmp_path, timeout_s=1)
+    # the command must start its child and exit before the timeout, or the error loses its reason: 3 s, so a slow
+    # machine still gets there
+    spec, _ = consumer("notify", code, tmp_path, timeout_s=3)
     svc, router, clock = build(spec)
     svc.ingest_order(order_row(), source="poll")
     await asyncio.wait_for(router.step(router.config.get("notify")), 10)
     assert svc.store.summary()["consumers"]["notify"]["retrying"] == 1
     assert (
-        last_error(svc, clock) == "timed out after 1 s: the command exited 0, but a process it started kept stderr open"
+        last_error(svc, clock) == "timed out after 3 s: the command exited 0, but a process it started kept stderr open"
     )
 
 
@@ -207,12 +209,12 @@ async def test_a_timeout_after_the_command_died_of_a_signal_names_the_signal(bui
         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
         "os.kill(os.getpid(), signal.SIGTERM)"
     )
-    spec, _ = consumer("notify", code, tmp_path, timeout_s=1)
+    spec, _ = consumer("notify", code, tmp_path, timeout_s=3)  # 3 s, as above: it must have died before the timeout
     svc, router, clock = build(spec)
     svc.ingest_order(order_row(), source="poll")
     await asyncio.wait_for(router.step(router.config.get("notify")), 10)
     assert last_error(svc, clock) == (
-        "timed out after 1 s: the command was killed by SIGTERM, but a process it started kept stderr open"
+        "timed out after 3 s: the command was killed by SIGTERM, but a process it started kept stderr open"
     )
 
 

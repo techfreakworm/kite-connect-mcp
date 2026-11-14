@@ -522,6 +522,19 @@ async def test_a_refusal_after_stop_is_not_written_to_the_closed_store(service_f
         store.close()
 
 
+async def test_a_second_stop_after_a_late_refusal_is_quiet(service_factory, caplog):
+    svc, _ = service_factory()
+    await svc.stop()
+    svc.refused("bad checksum")  # a request still in flight as the server shuts down
+    await svc.stop()  # again: the first closed the store, so this one writes nothing and says nothing
+    assert "could not count" not in caplog.text
+    store = EventStore(svc.store.path, readonly=True)
+    try:
+        assert store.counters().get("postback_refused") is None
+    finally:
+        store.close()
+
+
 def test_refusals_the_store_could_not_take_wait_for_the_next_write(service_factory, monkeypatch, caplog):
     clock = Clock()
     svc, _ = service_factory(clock=clock)
