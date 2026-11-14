@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import socket
 from pathlib import Path
 
 import httpx2
@@ -357,6 +359,95 @@ def test_the_selftest_needs_the_api_secret(capsys, monkeypatch, base_env):
     monkeypatch.delenv("KITE_API_SECRET")
     code, out = run(capsys, "selftest", "--url", "https://kite.example.com/postback")
     assert code == 2 and "KITE_API_SECRET" in out.err
+    assert "it is needed to sign the selftest" in out.err and "log in" not in out.err
+
+
+class Listener:
+    """A tiny HTTP/1.1 server on loopback that answers 200 and keeps each request's first line: posted to directly it
+    reads "POST /postback HTTP/1.1"; through a proxy, "POST http://host/postback HTTP/1.1"."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.server: asyncio.Server | None = None
+
+    async def __aenter__(self) -> Listener:
+        self.server = await asyncio.start_server(self._answer, "127.0.0.1", 0)
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        assert self.server is not None
+        self.server.close()
+        await self.server.wait_closed()
+
+    @property
+    def port(self) -> int:
+        assert self.server is not None
+        return self.server.sockets[0].getsockname()[1]
+
+    async def _answer(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        head = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1")
+        self.lines.append(head.split("\r\n", 1)[0])
+        length = next(
+            (int(h.split(":", 1)[1]) for h in head.split("\r\n") if h.lower().startswith("content-length:")), 0
+        )
+        await reader.readexactly(length)
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+
+def _closed_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]  # nothing listens there once the socket is closed
+
+
+@pytest.fixture
+def proxy_env(monkeypatch):
+    """No proxy settings but the ones a test sets (urllib reads both cases; the lower-case one wins)."""
+    for name in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
+    return monkeypatch
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+async def test_a_loopback_selftest_goes_past_the_proxy_settings(proxy_env, host):
+    """The default URL is this server on loopback: a proxy in the environment (with no NO_PROXY for loopback) must not
+    take the request, as it cannot reach this host's loopback."""
+    proxy_env.setenv("HTTP_PROXY", f"http://127.0.0.1:{_closed_port()}")
+    proxy_env.setenv("ALL_PROXY", f"http://127.0.0.1:{_closed_port()}")
+    async with Listener() as server:
+        status = await selftest.send(f"http://{host}:{server.port}/postback", selftest.build_payload(API_SECRET))
+    assert status == 200 and server.lines == ["POST /postback HTTP/1.1"]
+
+
+async def test_another_selftest_url_still_goes_through_the_proxy(proxy_env):
+    async with Listener() as proxy:
+        proxy_env.setenv("HTTP_PROXY", f"http://127.0.0.1:{proxy.port}")
+        status = await selftest.send("http://kite.example.com/postback", selftest.build_payload(API_SECRET))
+    assert status == 200 and proxy.lines == ["POST http://kite.example.com/postback HTTP/1.1"]
+
+
+@pytest.mark.parametrize(
+    ("url", "loopback"),
+    [
+        ("http://127.0.0.1:8765/postback", True),
+        ("http://127.1.2.3:8765/postback", True),
+        ("http://localhost:8765/postback", True),
+        ("http://LOCALHOST/postback", True),
+        ("http://[::1]:8765/postback", True),
+        ("http://a:b@127.0.0.1/postback", True),
+        ("https://kite.example.com/postback", False),
+        ("http://10.0.0.1/postback", False),
+        ("http://localhost.example.com/postback", False),
+        ("kite.example.com/postback", False),
+        ("http://[::1/postback", False),  # not a URL: httpx2 says so
+    ],
+)
+def test_which_urls_are_loopback(url, loopback):
+    assert selftest.is_loopback(url) is loopback
 
 
 @pytest.mark.parametrize(

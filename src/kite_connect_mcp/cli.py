@@ -278,7 +278,8 @@ def cmd_events(args: argparse.Namespace) -> int:
                 "nothing to test: turn it on, or give --url of a server that has it"
             )
         url = args.url or selftest.default_url(settings)
-        status = asyncio.run(selftest.send(url, selftest.build_payload(settings.require_api_secret())))
+        payload = selftest.build_payload(settings.require_api_secret("sign the selftest"))
+        status = asyncio.run(selftest.send(url, payload))
         print(f"selftest: POST {selftest.shown_url(url)} -> HTTP {status}{selftest.explain(status)}")
         return 0 if status == 200 else 1
     from .events.service import describe_status

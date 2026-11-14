@@ -12,10 +12,12 @@ the user name and password it may hold."""
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import secrets
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx2
 
@@ -56,11 +58,30 @@ def shown_url(url: str) -> str:
     return _USERINFO.sub(lambda m: f"{m['scheme'] or ''}[redacted]@", url, count=1)
 
 
+def is_loopback(url: str) -> bool:
+    """Whether `url` names this host's loopback (localhost, 127.0.0.0/8, ::1): a proxy could not reach it."""
+    try:
+        host = urlsplit(url).hostname  # lower case, without brackets
+    except ValueError:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return host is not None and ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 async def send(url: str, payload: dict[str, Any], *, transport: httpx2.AsyncBaseTransport | None = None) -> int:
     """POST the payload to `url` and return the HTTP status. A URL that cannot be reached is a KiteMCPError that names
-    it (shown_url) and what went wrong (no payload, no response body)."""
+    it (shown_url) and what went wrong (no payload, no response body).
+
+    The proxy settings of the environment (HTTPS_PROXY, ALL_PROXY, ...) are used, except for a loopback URL (the
+    default one): a proxy cannot reach this host's loopback, and a NO_PROXY entry for it is easy to miss."""
     try:
-        async with httpx2.AsyncClient(transport=transport, timeout=15.0, follow_redirects=False) as client:
+        async with httpx2.AsyncClient(
+            transport=transport, timeout=15.0, follow_redirects=False, trust_env=not is_loopback(url)
+        ) as client:
             response = await client.post(
                 url, content=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
             )

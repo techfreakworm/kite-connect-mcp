@@ -464,9 +464,10 @@ class Settings:
             raise ConfigError("KITE_API_KEY (or KITE_API_KEY_FILE) is not set")
         return self.api_key
 
-    def require_api_secret(self) -> str:
+    def require_api_secret(self, needed_to: str = "log in") -> str:
+        """The API secret, or a ConfigError that says what it is `needed_to` do."""
         if not self.api_secret:
-            raise ConfigError("KITE_API_SECRET (or KITE_API_SECRET_FILE) is not set; it is needed to log in")
+            raise ConfigError(f"KITE_API_SECRET (or KITE_API_SECRET_FILE) is not set; it is needed to {needed_to}")
         return self.api_secret
 
 
