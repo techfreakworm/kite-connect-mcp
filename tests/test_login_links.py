@@ -147,6 +147,7 @@ async def test_a_state_file_that_cannot_be_written_still_holds_the_slot(links, m
         '{"last": {"at": "2026-11-02T07:30:00", "reason": "scheduled", "outcome": "sent"}, '
         '"token_rejected_link_at": 7}',
         '{"last": {"at": "2026-11-02T07:30:00+05:30", "reason": "other", "outcome": "sent"}}',  # an unknown reason
+        "[" * 100_000,  # nested too deep for the JSON parser (RecursionError)
     ],
 )
 async def test_a_damaged_state_file_reads_as_nothing_and_is_replaced(links, damaged):
@@ -185,23 +186,27 @@ async def test_no_link_while_forcing_is_off_and_a_token_is_valid(links):
     rt = make(Clock(SLOT), KITE_MCP_LOGIN_ALLOW_FORCE="false")
     with pytest.raises(ConfigError, match="KITE_MCP_LOGIN_ALLOW_FORCE"):
         await rt.links.send("scheduled", slot=SLOT)
-    assert (
-        not out.exists() and not (rt.settings.state_dir / STATE_FILE).exists()
-    )  # nothing recorded: the caller decides
+    # nothing recorded: the caller decides
+    assert not out.exists() and not (rt.settings.state_dir / STATE_FILE).exists()
     assert rt.links.handled_slot() is None and issued(rt) == []
     assert [e["source"] for e in rt.audit.read() if e["event"] == "login_link_refused"] == ["scheduled"]
 
 
-async def test_a_link_that_cannot_be_issued_is_a_failed_attempt_with_a_clipped_error(links, monkeypatch):
+async def test_a_link_that_cannot_be_issued_is_logged_and_failed_with_a_clean_short_error(links, monkeypatch, caplog):
     make, out = links
     rt = logged_out(make(Clock(SLOT)))
 
     async def broken(**_):
-        raise KiteMCPError("x" * 300)
+        raise KiteMCPError("the login state\nfile is \x1b[31mlocked " + "again " * 100)
 
     monkeypatch.setattr(rt.login, "issue_link", broken)
-    attempt = await rt.links.send("scheduled", slot=SLOT)
-    assert attempt.outcome == "failed" and attempt.error == "x" * 197 + "..."
+    with caplog.at_level(logging.WARNING):
+        attempt = await rt.links.send("scheduled", slot=SLOT)
+    assert attempt.outcome == "failed" and attempt.error.startswith("the login state file is locked again again")
+    assert len(attempt.error) <= 200 and attempt.error.endswith(" again")  # cut at a whole word
+    # the journal says why too, in the same clean words: the unattended loop logs nothing more
+    assert f"login links: no scheduled link could be issued ({attempt.error})" in caplog.text
+    assert "\x1b" not in caplog.text and "state\nfile" not in caplog.text
     assert not out.exists() and rt.links.handled_slot() == SLOT
 
 
@@ -209,15 +214,120 @@ async def test_one_attempt_at_a_time(links, monkeypatch):
     make, _ = links
     rt = logged_out(make(Clock(SLOT)))
     running, most = 0, 0
+    other_started = asyncio.Event()  # the second attempt waits for the lock or, were there none, runs alongside
+
+    class WatchedLock(asyncio.Lock):
+        async def acquire(self):
+            if self.locked():
+                other_started.set()
+            return await super().acquire()
 
     async def run(*_, **__):
         nonlocal running, most
         running += 1
         most = max(most, running)
-        await asyncio.sleep(0.01)
+        if running > 1:
+            other_started.set()
+        await other_started.wait()  # no run ends before the other attempt has started: no timing involved
         running -= 1
         return None
 
+    monkeypatch.setattr(rt.links, "_lock", WatchedLock())
     monkeypatch.setattr(reminders, "run_link_command", run)
-    attempts = await asyncio.gather(rt.links.send("requested"), rt.links.send("requested"))
-    assert most == 1 and [a.outcome for a in attempts] == ["sent", "sent"] and issued(rt) == ["tool", "tool"]
+    attempts = await asyncio.wait_for(asyncio.gather(rt.links.send("requested"), rt.links.send("requested")), 10)
+    assert other_started.is_set() and most == 1
+    assert [a.outcome for a in attempts] == ["sent", "sent"] and issued(rt) == ["tool", "tool"]
+
+
+def _cannot_write(path, state):
+    raise PermissionError(13, "Permission denied")
+
+
+async def test_a_scheduled_attempt_needs_its_slot(links):
+    make, out = links
+    rt = logged_out(make(Clock(SLOT)))
+    with pytest.raises(ValueError):
+        await rt.links.send("scheduled")  # every scheduled attempt records its slot
+    assert not out.exists() and issued(rt) == [] and not (rt.settings.state_dir / STATE_FILE).exists()
+
+
+async def test_a_naive_slot_is_taken_as_ist(links):
+    make, _ = links
+    clock = Clock(SLOT)
+    rt = logged_out(make(clock))
+    await rt.links.send("scheduled", slot=SLOT)
+    clock.now = at(2, 8, 30)
+    attempt = await rt.links.send("scheduled", slot=at(2, 8, 30).replace(tzinfo=None))
+    assert attempt.outcome == "sent" and rt.links.handled_slot() == at(2, 8, 30)
+    data = json.loads((rt.settings.state_dir / STATE_FILE).read_text())
+    assert data["last_scheduled_for"] == "2026-11-02T08:30:00+05:30"
+
+
+async def test_a_later_attempt_keeps_the_time_of_the_last_token_rejected_link(links):
+    make, _ = links
+    clock = Clock(at(2, 7, 0))
+    rt = logged_out(make(clock))
+    await rt.links.send("token_rejected")
+    clock.now = SLOT
+    await rt.links.send("scheduled", slot=SLOT)
+    clock.now = at(2, 8, 0)
+    await rt.links.send("requested")
+    data = json.loads((rt.settings.state_dir / STATE_FILE).read_text())
+    assert (data["last"]["reason"], data["token_rejected_link_at"], data["last_scheduled_for"]) == (
+        "requested", "2026-11-02T07:00:00+05:30", "2026-11-02T07:30:00+05:30",
+    )  # fmt: skip
+    assert rt.links.token_rejected_link_at() == at(2, 7, 0)
+    assert make(clock).links.token_rejected_link_at() == at(2, 7, 0)  # a new process knows it too
+
+
+async def test_what_memory_held_while_the_file_could_not_be_written_reaches_it_later(links, monkeypatch):
+    make, _ = links
+    clock = Clock(SLOT)
+    rt = logged_out(make(clock))
+    path = rt.settings.state_dir / STATE_FILE
+    with monkeypatch.context() as m:
+        m.setattr(reminders, "write_state", _cannot_write)
+        await rt.links.send("scheduled", slot=SLOT)
+        clock.now = at(2, 7, 45)
+        await rt.links.send("token_rejected")
+        assert not path.exists()
+        # held in memory: the slot never runs twice, and the two hours start at 07:45
+        assert (rt.links.handled_slot(), rt.links.token_rejected_link_at()) == (SLOT, at(2, 7, 45))
+    clock.now = at(2, 8, 0)
+    await rt.links.send("requested")  # the file can be written again
+    data = json.loads(path.read_text())
+    assert (data["last"]["reason"], data["token_rejected_link_at"], data["last_scheduled_for"]) == (
+        "requested", "2026-11-02T07:45:00+05:30", "2026-11-02T07:30:00+05:30",
+    )  # fmt: skip
+    restarted = make(clock).links
+    assert (restarted.handled_slot(), restarted.token_rejected_link_at()) == (SLOT, at(2, 7, 45))
+
+
+async def test_a_slot_in_the_future_is_ignored_with_one_warning_and_replaced(links, caplog):
+    make, _ = links
+    clock = Clock(SLOT)
+    rt = logged_out(make(clock))
+    path = rt.settings.state_dir / STATE_FILE
+    ahead = {"last": None, "token_rejected_link_at": "2026-11-09T07:00:00+05:30"}
+    path.write_text(json.dumps({**ahead, "last_scheduled_for": "2026-11-09T07:30:00+05:30"}))  # a clock a week ahead
+    with caplog.at_level(logging.WARNING):
+        # kept, they would hold back every slot, and the two hours, until then
+        assert rt.links.handled_slot() is None and rt.links.handled_slot() is None
+        assert rt.links.token_rejected_link_at() is None
+    assert caplog.text.count("the login links' state file holds a slot in the future; ignoring it") == 1
+    await rt.links.send("scheduled", slot=SLOT)
+    data = json.loads(path.read_text())
+    assert (data["last_scheduled_for"], data["token_rejected_link_at"]) == ("2026-11-02T07:30:00+05:30", None)
+    assert make(clock).links.handled_slot() == SLOT  # a restart knows the real slot
+
+
+def test_an_error_read_back_from_the_state_file_is_clean_and_short(links):
+    make, _ = links
+    rt = make(Clock(SLOT))
+    last = {"at": "2026-11-02T07:30:00+05:30", "reason": "scheduled", "outcome": "failed"}
+    path = rt.settings.state_dir / STATE_FILE
+    path.write_text(json.dumps({"last": {**last, "error": "line1\nline2\x1b[31m " + "word " * 1000}}))
+    error = rt.links.status()["last"]["error"]
+    assert error.startswith("line1 line2 word word") and len(error) <= 200 and "\x1b" not in error
+    path.write_text(json.dumps({"last": {**last, "error": "\x1b[31m\n"}}))
+    assert rt.links.status()["last"]["error"] is None  # nothing left of it

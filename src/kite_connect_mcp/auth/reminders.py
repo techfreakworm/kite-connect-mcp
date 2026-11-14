@@ -15,7 +15,8 @@ login links".
     <state_dir>/login_links.json    mode 600, never a link: the last attempt (`last`), the last slot handled
                                     (`last_scheduled_for`, so neither the loop nor a restart runs a slot twice) and the
                                     last link after a rejected token (`token_rejected_link_at`: the two hours start
-                                    there). A missing or damaged file reads as nothing.
+                                    there). A missing or damaged file reads as nothing, a time in it later than now
+                                    is ignored, and what a file that cannot be written misses is held in memory.
 
 The link is a bearer credential for one Kite login until it expires. It is never stored (auth/loginstate.py keeps only
 its state's digest), never logged, never put in an event, a status or an error. The command's stdout and stderr go to
@@ -39,6 +40,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from ..errors import ConfigError, KiteMCPError
+from ..events.model import MAX_ERROR_CHARS, clean_error_text, clip_words
 from ..events.trust import check_owned_file
 from ..timeutil import IST, now_ist, to_ist
 from .tokenstore import write_private_file
@@ -61,10 +63,10 @@ Spawn = Callable[..., Awaitable[asyncio.subprocess.Process]]
 
 STATE_FILE = "login_links.json"  # under the state folder: the last attempt, the last slot, the last rejected-token link
 REJECTED_EVERY = dt.timedelta(hours=2)  # at most one token_rejected link this often
-MAX_ERROR_CHARS = 200  # an attempt's error, as kept and shown
 SOURCES: dict[Reason, str] = {"scheduled": "scheduled", "token_rejected": "token_rejected", "requested": "tool"}
 
 Outcome = Literal["sent", "skipped", "failed"]
+OUTCOMES: tuple[Outcome, ...] = get_args(Outcome)
 
 
 class SkipDates:
@@ -251,8 +253,10 @@ async def run_link_command(
 # --- the service ------------------------------------------------------------------------------------------------------
 
 
-def _clip(text: str) -> str:
-    return text if len(text) <= MAX_ERROR_CHARS else text[: MAX_ERROR_CHARS - 3] + "..."
+def _short(error: str) -> str:
+    """An attempt's error as it is kept, logged and shown: one clean line, without control characters or links, of
+    at most MAX_ERROR_CHARS (events/model.py, as a consumer's error)."""
+    return clip_words(clean_error_text(error), MAX_ERROR_CHARS)
 
 
 def _iso(moment: dt.datetime | None) -> str | None:
@@ -274,6 +278,11 @@ def _later(*moments: dt.datetime | None) -> dt.datetime | None:
     return max((m for m in moments if m is not None), default=None)
 
 
+def _past(moment: dt.datetime | None, now: dt.datetime) -> dt.datetime | None:
+    """`moment`, or None when it is later than `now`."""
+    return moment if moment is not None and moment <= now else None
+
+
 @dataclass(frozen=True)
 class Attempt:
     """One link attempt: when, why, how it went, a short error when it failed and when its link expires (never the
@@ -286,20 +295,25 @@ class Attempt:
     link_expires_at: dt.datetime | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {"at": _iso(self.at), "reason": self.reason, "outcome": self.outcome, "error": self.error,
-                "link_expires_at": _iso(self.link_expires_at)}  # fmt: skip
+        return {
+            "at": _iso(self.at),
+            "reason": self.reason,
+            "outcome": self.outcome,
+            "error": self.error,
+            "link_expires_at": _iso(self.link_expires_at),
+        }
 
     @classmethod
     def from_dict(cls, data: Any) -> Attempt | None:
-        """The attempt the state file holds, or None when it is missing or damaged."""
+        """The attempt the state file holds, or None when it is missing or damaged. Its error is cleaned and clipped
+        again, as it is shown: a file edited by hand holds any text."""
         try:
             reason, outcome, at = data["reason"], data["outcome"], _when(data["at"])
-            if reason not in REASONS or outcome not in ("sent", "skipped", "failed") or at is None:
+            if reason not in REASONS or outcome not in OUTCOMES or at is None:
                 return None
             error = data.get("error")
-            return cls(
-                at, reason, outcome, error if isinstance(error, str) else None, _when(data.get("link_expires_at"))
-            )
+            error = (_short(error) or None) if isinstance(error, str) else None
+            return cls(at, reason, outcome, error, _when(data.get("link_expires_at")))
         except (KeyError, TypeError, AttributeError):
             return None
 
@@ -317,7 +331,7 @@ def read_state(path: Path) -> LinkState:
     """What the state file holds; a missing or damaged file reads as nothing, a damaged field as None."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):  # RecursionError: nested too deep for the parser
         return LinkState()
     if not isinstance(data, dict):
         return LinkState()
@@ -379,7 +393,12 @@ class LoginLinks:
         self._spawn = spawn
         self._state_path = settings.state_dir / STATE_FILE
         self._lock = asyncio.Lock()
-        self._last_slot: dt.datetime | None = None  # the last slot handled by this process, should the file fail
+        # What this process handled, should the state file fail to keep it: the last slot, the last token_rejected
+        # attempt. Each is read back as the later of the file's and the memory's (handled_slot, token_rejected_link_at)
+        # and written with the next attempt that can be.
+        self._last_slot: dt.datetime | None = None
+        self._rejected_at: dt.datetime | None = None
+        self._warned_future_slot = False
 
     def valid_token(self) -> bool:
         return self.login.tokens.current() is not None
@@ -389,51 +408,80 @@ class LoginLinks:
 
     def handled_slot(self) -> dt.datetime | None:
         """The latest slot that had an attempt: the later of the state file's and this process's own memory (which
-        holds it when the file cannot be written), so no slot runs twice."""
-        return _later(read_state(self._state_path).last_scheduled_for, self._last_slot)
+        holds it when the file cannot be written), so no slot runs twice. A slot in the file later than now (a clock
+        that ran ahead) is ignored, with a warning once: kept, it would hold back every slot until then. The next
+        attempt writes over it."""
+        return self._handled_slot(read_state(self._state_path), self.clock())
+
+    def token_rejected_link_at(self) -> dt.datetime | None:
+        """When the last token_rejected attempt was, where the two hours start: the later of the state file's and this
+        process's own memory. A time in the file later than now is ignored, as a slot is."""
+        return self._rejected_link_at(read_state(self._state_path), self.clock())
+
+    def _handled_slot(self, state: LinkState, now: dt.datetime) -> dt.datetime | None:
+        stored = _past(state.last_scheduled_for, now)
+        if stored is None and state.last_scheduled_for is not None and not self._warned_future_slot:
+            self._warned_future_slot = True
+            log.warning("the login links' state file holds a slot in the future; ignoring it")
+        return _later(stored, self._last_slot)
+
+    def _rejected_link_at(self, state: LinkState, now: dt.datetime) -> dt.datetime | None:
+        return _later(_past(state.token_rejected_link_at, now), self._rejected_at)
 
     async def send(self, reason: Reason, *, slot: dt.datetime | None = None) -> Attempt:
-        """Issue a link and give it to the link command, once, and record the attempt (a scheduled one with its slot).
-        ConfigError when no link may be issued now (LoginManager.issue_link: forcing off with a valid token): nothing
-        is recorded, the caller decides. Any other problem is a failed Attempt. ValueError for a slot on another
-        reason."""
-        if slot is not None and reason != "scheduled":
-            raise ValueError("only a scheduled attempt has a slot")
+        """Issue a link and give it to the link command, once, and record the attempt: a scheduled one with its slot (a
+        naive slot is taken as IST).
+
+        A failed Attempt, logged with its short error, when the command may not be run (program_problem), when
+        LoginManager.issue_link raises a KiteMCPError other than ConfigError (the login state file is locked, say) or
+        when the command fails (run_link_command: an exit code, a signal, the timeout). A ConfigError from issue_link,
+        when no link may be issued now (forcing off with a valid token), propagates and nothing is recorded: the
+        caller decides. So does any other exception. ValueError for a scheduled attempt without a slot, or another
+        attempt with one."""
+        if (slot is None) == (reason == "scheduled"):
+            raise ValueError("a scheduled attempt needs its slot, and no other attempt has one")
+        slot = to_ist(slot) if slot is not None else None
         async with self._lock:
             now = self.clock()
             problem = await asyncio.to_thread(program_problem, self.command)
             if problem is not None:
-                log.warning("login links: the link command is not run: %s", problem)
-                return self._record(Attempt(now, reason, "failed", _clip(problem)), slot)
+                error = _short(problem)
+                log.warning("login links: the link command is not run: %s", error)
+                return self._record(Attempt(now, reason, "failed", error), slot)
             try:
                 url, expires_at = await self.login.issue_link(source=SOURCES[reason])
             except ConfigError:
                 raise
-            except KiteMCPError as exc:
-                return self._record(Attempt(now, reason, "failed", _clip(str(exc))), slot)
+            except KiteMCPError as exc:  # raised before the link is built: its text never holds one
+                error = _short(str(exc)) or type(exc).__name__
+                log.warning("login links: no %s link could be issued (%s)", reason, error)
+                return self._record(Attempt(now, reason, "failed", error), slot)
             body = {"url": url, "expires_at": to_ist(expires_at).isoformat(timespec="seconds"), "reason": reason}
-            error = await run_link_command(
+            failure = await run_link_command(
                 self.command,
                 (json.dumps(body) + "\n").encode(),
                 env=link_env(self.settings.login_link_env_pass, self._environ),
                 timeout_s=self.settings.login_link_timeout_s,
                 spawn=self._spawn,
             )
-            if error is None:
+            if failure is None:
                 log.info("login links: a %s link was sent through the link command", reason)
             else:
-                log.warning("login links: the link command failed for a %s link (%s)", reason, error)
-            return self._record(Attempt(now, reason, "sent" if error is None else "failed", error, expires_at), slot)
+                log.warning("login links: the link command failed for a %s link (%s)", reason, failure)
+            outcome: Outcome = "sent" if failure is None else "failed"
+            return self._record(Attempt(now, reason, outcome, failure, expires_at), slot)
 
     def _record(self, attempt: Attempt, slot: dt.datetime | None = None) -> Attempt:
         """Keep `attempt` as the last one in the state file (never a link). A scheduled attempt also keeps its slot, so
-        neither the loop nor a restart runs that slot again; a token_rejected attempt starts the two hours. A file
-        that cannot be written is logged, and the slot is still held in memory (handled_slot)."""
+        neither the loop nor a restart runs that slot again; a token_rejected attempt starts the two hours. Both are
+        held in memory too: a file that cannot be written is logged, and what it missed is written with the next
+        attempt that can be (the later of the file's and the memory's, a time in the future dropped)."""
         if slot is not None:
             self._last_slot = _later(self._last_slot, slot)
-        before = read_state(self._state_path)
-        rejected_at = attempt.at if attempt.reason == "token_rejected" else before.token_rejected_link_at
-        state = LinkState(attempt, rejected_at, _later(before.last_scheduled_for, slot))
+        if attempt.reason == "token_rejected":
+            self._rejected_at = attempt.at
+        before, now = read_state(self._state_path), self.clock()
+        state = LinkState(attempt, self._rejected_link_at(before, now), self._handled_slot(before, now))
         try:
             write_state(self._state_path, state)
         except OSError as exc:
