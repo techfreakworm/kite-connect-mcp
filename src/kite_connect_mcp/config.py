@@ -185,6 +185,50 @@ def _list(env: Mapping[str, str], name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+_TIME_RE = re.compile(r"\s*(\d{1,2}):(\d{2})\s*")
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _times(env: Mapping[str, str], name: str, problems: list[str]) -> tuple[dt.time, ...]:
+    """'HH:MM' times (IST), comma-separated; sorted, without repeats."""
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return ()
+    found: set[dt.time] = set()
+    for part in raw.split(","):
+        match = _TIME_RE.fullmatch(part)
+        try:
+            if not match:
+                raise ValueError
+            found.add(dt.time(int(match[1]), int(match[2])))
+        except ValueError:
+            problems.append(f"{name} must be a comma list of HH:MM times, such as 07:30,08:30, not {raw!r}")
+            return ()
+    return tuple(sorted(found))
+
+
+def _env_names(env: Mapping[str, str], name: str, problems: list[str]) -> tuple[str, ...]:
+    """Names of environment variables, comma-separated. An entry that is not a name is told by its place, never
+    shown: it may be a NAME=value pasted by mistake. A KITE_* name is refused: the command never gets the server's
+    settings."""
+    names = _list(env, name)
+    bad = [str(place) for place, n in enumerate(names, 1) if not _ENV_NAME_RE.fullmatch(n)]
+    kite = [n for n in names if _ENV_NAME_RE.fullmatch(n) and n.upper().startswith("KITE_")]
+    if bad:
+        which = f"entries {', '.join(bad)} are not names" if len(bad) > 1 else f"entry {bad[0]} is not a name"
+        problems.append(f"{name} must list environment variable names, separated by commas: {which}")
+    if kite:
+        problems.append(
+            f"{name} must not pass KITE_* variables ({', '.join(kite)}): the command never gets the server's settings"
+        )
+    return tuple(n for n in names if _ENV_NAME_RE.fullmatch(n) and n not in kite)
+
+
+def _path(env: Mapping[str, str], name: str) -> Path | None:
+    raw = env.get(name, "").strip()
+    return Path(raw).expanduser() if raw else None
+
+
 def _upper_set(env: Mapping[str, str], name: str) -> frozenset[str] | None:
     """A comma-separated allow-list. Unset, empty or '*' means "anything" (None)."""
     items = _list(env, name)
@@ -315,6 +359,14 @@ class Settings:
     order_poll_days: frozenset[int] = DEFAULT_ORDER_POLL_DAYS
     events_keep_days: int = 30
 
+    # --- login links (auth/reminders.py, docs/EVENTS.md "Scheduled login links") ---
+    login_reminder_times: tuple[dt.time, ...] = ()  # IST
+    login_reminder_days: frozenset[int] = DEFAULT_ORDER_POLL_DAYS
+    login_reminder_skip_dates_file: Path | None = None
+    login_link_command: Path | None = None  # one program, no arguments
+    login_link_env_pass: tuple[str, ...] = ()
+    login_link_timeout_s: int = 30
+
     log_level: str = "INFO"
 
     @property
@@ -338,6 +390,8 @@ class Settings:
                 out[f.name] = str(value)
             elif f.name == "order_poll_window":
                 out[f.name] = "-".join(t.strftime("%H:%M") for t in value)
+            elif f.name == "login_reminder_times":
+                out[f.name] = [t.strftime("%H:%M") for t in value]
             else:
                 out[f.name] = value
         return out
@@ -444,6 +498,12 @@ class Settings:
             order_poll_window=_window(env, "KITE_MCP_ORDER_POLL_WINDOW", DEFAULT_ORDER_POLL_WINDOW, problems),
             order_poll_days=_days(env, "KITE_MCP_ORDER_POLL_DAYS", DEFAULT_ORDER_POLL_DAYS, problems),
             events_keep_days=_int(env, "KITE_MCP_EVENTS_KEEP_DAYS", 30, problems, minimum=1),
+            login_reminder_times=_times(env, "KITE_MCP_LOGIN_REMINDER_TIMES", problems),
+            login_reminder_days=_days(env, "KITE_MCP_LOGIN_REMINDER_DAYS", DEFAULT_ORDER_POLL_DAYS, problems),
+            login_reminder_skip_dates_file=_path(env, "KITE_MCP_LOGIN_REMINDER_SKIP_DATES_FILE"),
+            login_link_command=_path(env, "KITE_MCP_LOGIN_LINK_COMMAND"),
+            login_link_env_pass=_env_names(env, "KITE_MCP_LOGIN_LINK_ENV_PASS", problems),
+            login_link_timeout_s=_int(env, "KITE_MCP_LOGIN_LINK_TIMEOUT_S", 30, problems, minimum=1),
             log_level=(env.get("KITE_MCP_LOG_LEVEL", "INFO").strip().upper() or "INFO"),
         )
         problems.extend(settings._consistency_problems())
@@ -488,6 +548,32 @@ class Settings:
                 "KITE_MCP_EVENTS=true needs KITE_MCP_TRANSPORT=http: the event service is one long-lived process "
                 "(another process reads its store with KITE_MCP_EVENTS_DB)"
             )
+        # the login links (auth/reminders.py). Their HTTP transport is checked where the server starts
+        # (reminders.serving_problem), not here: `serve --transport http` may give it on the command line, and the
+        # other commands, which read the same settings, must not fail for want of it
+        links = bool(self.login_reminder_times) or self.login_link_command is not None
+        if self.login_reminder_times and self.login_link_command is None:
+            problems.append(
+                "KITE_MCP_LOGIN_REMINDER_TIMES needs KITE_MCP_LOGIN_LINK_COMMAND: the scheduled links are sent "
+                "through it"
+            )
+        if links and self.auth_mode != "managed":
+            problems.append(
+                "KITE_MCP_LOGIN_REMINDER_TIMES and KITE_MCP_LOGIN_LINK_COMMAND need KITE_MCP_AUTH_MODE=managed: only a "
+                "server that owns the login issues links"
+            )
+        if links and not self.public_url:
+            problems.append(
+                "KITE_MCP_LOGIN_REMINDER_TIMES and KITE_MCP_LOGIN_LINK_COMMAND need KITE_MCP_PUBLIC_URL: a link is "
+                "only of use when Kite's redirect reaches this server's callback"
+            )
+        if self.login_link_command is not None and not self.login_link_command.is_absolute():
+            problems.append(
+                "KITE_MCP_LOGIN_LINK_COMMAND must be an absolute path to one program (no arguments: wrap them in a "
+                "script)"
+            )
+        if self.login_link_timeout_s > 600:
+            problems.append("KITE_MCP_LOGIN_LINK_TIMEOUT_S cannot exceed 600")
         return problems
 
     def require_api_key(self) -> str:
@@ -556,6 +642,12 @@ KNOWN_VARIABLES = frozenset(
         "KITE_MCP_ORDER_POLL_WINDOW",
         "KITE_MCP_ORDER_POLL_DAYS",
         "KITE_MCP_EVENTS_KEEP_DAYS",
+        "KITE_MCP_LOGIN_REMINDER_TIMES",
+        "KITE_MCP_LOGIN_REMINDER_DAYS",
+        "KITE_MCP_LOGIN_REMINDER_SKIP_DATES_FILE",
+        "KITE_MCP_LOGIN_LINK_COMMAND",
+        "KITE_MCP_LOGIN_LINK_ENV_PASS",
+        "KITE_MCP_LOGIN_LINK_TIMEOUT_S",
         "KITE_MCP_LOG_LEVEL",
     }
 )
