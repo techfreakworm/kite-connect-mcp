@@ -30,16 +30,18 @@ every day at 06:00 IST.
 
 Returns `logged_in`, the token's `expires_at` and `minutes_left`, `auth_mode` (managed: this server does the
 daily login; external: another program keeps the token file and this server only reads it),
-`login_managed_here`, the token file path, `minutes_to_token_reset` (to the next 06:00 IST), and a one-line
-`safety` summary (trading mode, read-only). The token itself is never shown.
+`login_managed_here`, the token file path, `minutes_to_token_reset` (to the next 06:00 IST), a one-line
+`safety` summary (trading mode, read-only) and, when the server has a login link command, `login_links`: the
+scheduled times, the next one and the last attempt. The token itself is never shown, nor is a login link.
 
-verify=true also makes one live call to Kite and adds `verify` with the user id or Kite's error. Use it when a
-token that looks valid might have been ended elsewhere (logging in again with the same API key, or a master
-logout on the Kite web, ends the earlier token).
+verify=true also makes one live call to Kite and adds `verify` with the account (its user id, or with the hash
+pin its user_id_sha256_prefix) or Kite's error. Use it when a token that looks valid might have been ended
+elsewhere (logging in again with the same API key, or a master logout on the Kite web, ends the earlier
+token).
 
 | Argument | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `verify` | boolean |  | `false` | also ask Kite once (GET /user/profile) whether it still accepts the token, and report the account's user id or Kite's error |
+| `verify` | boolean |  | `false` | also ask Kite once (GET /user/profile) whether it still accepts the token, and report the account (its user id, or with the hash pin KITE_MCP_ALLOWED_USER_ID_SHA256 its user_id_sha256_prefix) or Kite's error |
 
 ### `login`: Log in to Kite
 
@@ -47,7 +49,8 @@ logout on the Kite web, ends the earlier token).
 
 Start the daily Kite login (managed auth mode): returns a one-time login link for the person to open.
 Show them the `warning` and the link. They log in at Kite themselves (user id, password, 2FA); never ask for
-their credentials and never try to log in for them.
+their credentials and never try to log in for them. With deliver=true the link goes straight to the person
+through the server's link command (KITE_MCP_LOGIN_LINK_COMMAND) and you never see it.
 
 Kite then redirects to the app's registered redirect URL (`redirect_url`). This server completes the login
 when that redirect reaches it; if the redirect page cannot be reached, the person can copy the request_token
@@ -60,6 +63,7 @@ only explains and shows the status.
 | Argument | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `force` | boolean |  | `false` | issue a new link even though a valid token exists (the new login ends the old token); refused when the server turns forcing off (KITE_MCP_LOGIN_ALLOW_FORCE=false) |
+| `deliver` | boolean |  | `false` | send the link to the person through the server's login link command (KITE_MCP_LOGIN_LINK_COMMAND) instead of returning it: the answer then says only whether it was sent and when the link expires, never the link |
 
 ### `complete_login`: Complete the Kite login by hand
 
@@ -1056,7 +1060,8 @@ order_id, the order's last event is seldom the store's last).
 
 The health of the order events: the last postback and how many were refused, the last poll and its error,
 doorbells waiting, each consumer's pending, delayed and failed deliveries, and paused consumers. Only the
-serving process shows its poll settings and the after-close warning.
+serving process shows its poll settings, the after-close warning and the login links, when the server has a
+link command.
 
 ## safety
 

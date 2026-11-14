@@ -115,6 +115,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "safety": rt.pipeline.limits(),
                 "today": rt.audit.usage().as_dict(),
             }
+            if rt.links is not None:  # KITE_MCP_LOGIN_LINK_COMMAND: the times, the next one, the last attempt
+                out["login_links"] = rt.links.status()
             if args.verify:
                 try:
                     profile = await rt.client.get("/user/profile")
@@ -288,6 +290,7 @@ def cmd_events(args: argparse.Namespace) -> int:
         status = asyncio.run(selftest.send(url, payload))
         print(f"selftest: POST {selftest.shown_url(url)} -> HTTP {status}{selftest.explain(status)}")
         return 0 if status == 200 else 1
+    from .auth.reminders import describe_links
     from .events.service import describe_status
     from .timeutil import now_ist
 
@@ -296,7 +299,9 @@ def cmd_events(args: argparse.Namespace) -> int:
         store = _open_store(settings, readonly=True)
         try:
             if action == "status":
-                print(json.dumps(describe_status(store, settings, now_ist(), names), indent=2, default=str))
+                links = describe_links(settings, now_ist()) if settings.login_link_command is not None else None
+                health = describe_status(store, settings, now_ist(), names, links=links)
+                print(json.dumps(health, indent=2, default=str))
             else:
                 for event in store.events(order_id=args.order, limit=args.limit):
                     print(json.dumps(event, ensure_ascii=False))

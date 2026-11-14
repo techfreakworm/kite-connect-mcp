@@ -622,11 +622,14 @@ def describe_status(
     consumer_names: list[str] | None = None,
     *,
     with_poll: bool = True,
+    links: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """What `events status` and `get_event_status` show. No payloads, no ids of orders.
 
     `poll` and `warning` come from the poll settings in `settings`. A process that only reads another's store
-    (with_poll=False) may not share them, so it leaves both out and points to the serving process instead.
+    (with_poll=False) may not share them, so it leaves both out and points to the serving process instead. `links`
+    (auth/reminders.py describe_links, never a link) is shown as `login_links`; a reader leaves it out too, as the
+    links are the serving process's.
 
     `warning` is set while no poll has succeeded after the most recent close of the poll window (meta after_close_ok
     is older than last_closed_poll_day), so a failed Friday close stays visible over the weekend and on Monday until
@@ -656,4 +659,6 @@ def describe_status(
             f"no successful poll after the close on {_WEEKDAYS[due.weekday()]} {due.isoformat()}: "
             "fills after the last poll may be missing"
         )
+    if links is not None:
+        out["login_links"] = dict(links)
     return out

@@ -5,7 +5,9 @@ link, the person logs in at Kite, and Kite's redirect lands on this server's cal
 `_callback_hook`) or the person pastes the request_token into `complete_login`. In `external` auth mode another program
 keeps the token file: only `session_status` and an explanatory `login` exist, and `complete_login` / `logout` are not
 registered at all. `logout` is not offered with KITE_MCP_ALLOW_LOGOUT=false, and with KITE_MCP_LOGIN_ALLOW_FORCE=false
-`login` issues no link while a valid token exists, even with force=true.
+`login` issues no link while a valid token exists, even with force=true. With a login link command
+(KITE_MCP_LOGIN_LINK_COMMAND), `login(deliver=true)` hands the link to that command instead of returning it, and
+`session_status` shows the login links' status (auth/reminders.py).
 
 These tools are kind "auth": they reach /session/token through the login manager (auth/login.py) and never touch the
 write pipeline.
@@ -15,7 +17,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 from mcp.server import MCPServer
 from mcp_types import ToolAnnotations
@@ -28,6 +30,9 @@ from ..config import Settings
 from ..errors import ConfigError, KiteMCPError, SafetyRefusal, ToolInputError
 from ..timeutil import next_token_reset, to_ist
 from ._base import Registrar, Runtime
+
+if TYPE_CHECKING:
+    from ..auth.reminders import Attempt
 
 LOGOUT_DIGEST = hashlib.sha256(b"logout").hexdigest()  # logout takes no arguments: one constant to confirm
 LOGOUT = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True)
@@ -42,6 +47,25 @@ def safety_line(s: Settings) -> str:
     else:
         effect = "writes can only be previewed"
     return f"trading_mode={s.trading_mode}, read_only={str(s.read_only).lower()}: {effect}"
+
+
+def _delivered(attempt: Attempt) -> dict[str, Any]:
+    """The answer of login(deliver=true): whether the link command took the link, and when the link expires. Never
+    the link: it went to the person, not to the model (an Attempt holds none)."""
+    expires = attempt.link_expires_at
+    out: dict[str, Any] = {
+        "delivered": attempt.outcome == "sent",
+        "expires_at": to_ist(expires).isoformat(timespec="seconds") if expires else None,
+    }
+    if attempt.outcome == "sent":
+        out["message"] = (
+            "The login link went to the person through the link command. They log in at Kite; this server completes "
+            "the login when Kite redirects to it. Then call session_status."
+        )
+    else:
+        out["error"] = attempt.error
+        out["message"] = "The link could not be sent. Call login with deliver=true again to retry."
+    return out
 
 
 def _manager(rt: Runtime) -> LoginManager:
@@ -90,7 +114,8 @@ def _register_status_and_login(reg: Registrar) -> None:
             bool,
             Field(
                 description="also ask Kite once (GET /user/profile) whether it still accepts the token, and report "
-                "the account's user id or Kite's error"
+                "the account (its user id, or with the hash pin KITE_MCP_ALLOWED_USER_ID_SHA256 its "
+                "user_id_sha256_prefix) or Kite's error"
             ),
         ] = False,
     ) -> Any:
@@ -99,12 +124,14 @@ def _register_status_and_login(reg: Registrar) -> None:
 
         Returns `logged_in`, the token's `expires_at` and `minutes_left`, `auth_mode` (managed: this server does the
         daily login; external: another program keeps the token file and this server only reads it),
-        `login_managed_here`, the token file path, `minutes_to_token_reset` (to the next 06:00 IST), and a one-line
-        `safety` summary (trading mode, read-only). The token itself is never shown.
+        `login_managed_here`, the token file path, `minutes_to_token_reset` (to the next 06:00 IST), a one-line
+        `safety` summary (trading mode, read-only) and, when the server has a login link command, `login_links`: the
+        scheduled times, the next one and the last attempt. The token itself is never shown, nor is a login link.
 
-        verify=true also makes one live call to Kite and adds `verify` with the user id or Kite's error. Use it when a
-        token that looks valid might have been ended elsewhere (logging in again with the same API key, or a master
-        logout on the Kite web, ends the earlier token)."""
+        verify=true also makes one live call to Kite and adds `verify` with the account (its user id, or with the hash
+        pin its user_id_sha256_prefix) or Kite's error. Use it when a token that looks valid might have been ended
+        elsewhere (logging in again with the same API key, or a master logout on the Kite web, ends the earlier
+        token)."""
         check = await verify_with_kite() if verify else None
         now = rt.clock()
         reset = next_token_reset(now)
@@ -127,6 +154,8 @@ def _register_status_and_login(reg: Registrar) -> None:
             )
         if managed and settings.access_token:
             out["note"] = "KITE_ACCESS_TOKEN is set and takes precedence over the token file; unset it to use logins"
+        if rt.links is not None:
+            out["login_links"] = rt.links.status()
         return out
 
     @reg.tool("login", title="Log in to Kite", toolset="session", kind="auth")
@@ -138,10 +167,19 @@ def _register_status_and_login(reg: Registrar) -> None:
                 "refused when the server turns forcing off (KITE_MCP_LOGIN_ALLOW_FORCE=false)"
             ),
         ] = False,
+        deliver: Annotated[
+            bool,
+            Field(
+                description="send the link to the person through the server's login link command "
+                "(KITE_MCP_LOGIN_LINK_COMMAND) instead of returning it: the answer then says only whether it was sent "
+                "and when the link expires, never the link"
+            ),
+        ] = False,
     ) -> Any:
         """Start the daily Kite login (managed auth mode): returns a one-time login link for the person to open.
         Show them the `warning` and the link. They log in at Kite themselves (user id, password, 2FA); never ask for
-        their credentials and never try to log in for them.
+        their credentials and never try to log in for them. With deliver=true the link goes straight to the person
+        through the server's link command (KITE_MCP_LOGIN_LINK_COMMAND) and you never see it.
 
         Kite then redirects to the app's registered redirect URL (`redirect_url`). This server completes the login
         when that redirect reaches it; if the redirect page cannot be reached, the person can copy the request_token
@@ -160,6 +198,11 @@ def _register_status_and_login(reg: Registrar) -> None:
                 "session": status,
                 "token_file": str(settings.token_file),
             }
+        if deliver and rt.links is None:
+            raise ToolInputError(
+                "deliver=true needs a login link command (KITE_MCP_LOGIN_LINK_COMMAND); without one, call login "
+                "without deliver to get the link"
+            )
         if status.get("logged_in") and not force:
             if settings.login_allow_force:
                 advice = (
@@ -176,6 +219,9 @@ def _register_status_and_login(reg: Registrar) -> None:
                 "session": status,
                 "message": f"Already logged in with a valid token. {advice}",
             }
+        if deliver:  # forcing off with a valid token: issue_link refuses (audited) and nothing is sent
+            assert rt.links is not None  # checked above
+            return _delivered(await rt.links.send("requested"))
         manager = _manager(rt)
         url, expires_at = await manager.issue_link()  # refuses (audited) while forcing is off and the token is valid
         redirect = manager.redirect_url()

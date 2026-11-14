@@ -2,9 +2,10 @@
 
 In the serving process (KITE_MCP_EVENTS=true) the tools read the service's own store. Any other MCP process (a stdio
 client, say) can read the same store read-only by naming it in KITE_MCP_EVENTS_DB; that store is opened once, when the
-tools are registered, and closed with the runtime. Such a reader shows no poll status: that comes from the serving
-process's settings. Without a store the tools are hidden, and say why; a store that is missing or cannot be opened
-hides these two tools, never the server. They only read a local file: they never call Kite and never change anything."""
+tools are registered, and closed with the runtime. Such a reader shows no poll status and no login links: they come
+from the serving process's settings. Without a store the tools are hidden, and say why; a store that is missing or
+cannot be opened hides these two tools, never the server. They only read a local file: they never call Kite and never
+change anything."""
 
 from __future__ import annotations
 
@@ -73,7 +74,14 @@ def register(reg: Registrar) -> None:
     async def get_event_status() -> Any:
         """The health of the order events: the last postback and how many were refused, the last poll and its error,
         doorbells waiting, each consumer's pending, delayed and failed deliveries, and paused consumers. Only the
-        serving process shows its poll settings and the after-close warning."""
-        if rt.events is None:  # a reader: the poll settings that matter are the serving process's
+        serving process shows its poll settings, the after-close warning and the login links, when the server has a
+        link command."""
+        if rt.events is None:  # a reader: the poll settings and the links that matter are the serving process's
             return describe_status(store, rt.settings, rt.clock(), with_poll=False)
-        return describe_status(store, rt.settings, rt.clock(), [c.name for c in rt.events.config.consumers])
+        return describe_status(
+            store,
+            rt.settings,
+            rt.clock(),
+            [c.name for c in rt.events.config.consumers],
+            links=rt.links.status() if rt.links is not None else None,
+        )
