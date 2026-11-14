@@ -50,7 +50,7 @@ path = "src/kite_connect_mcp/__init__.py"
 packages = ["src/kite_connect_mcp"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/kite_connect_mcp", "tests", "docs", "deploy", "README.md", "LICENSE", "CHANGELOG.md", ".env.example"]
+include = ["src/kite_connect_mcp", "tests", "docs", "deploy", "examples", "README.md", "LICENSE", "CHANGELOG.md", ".env.example"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

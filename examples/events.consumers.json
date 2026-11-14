@@ -1,0 +1,21 @@
+{
+  "tag_labels": {"mytag": "my strategy"},
+  "consumers": [
+    {
+      "name": "telegram",
+      "command": ["/usr/bin/python3", "/opt/kite-connect-mcp/examples/consumers/telegram_notify.py"],
+      "match": {
+        "kinds": ["order", "session", "router", "selftest"],
+        "changes": ["filled", "partial_fill", "cancelled", "rejected", "seen_final"]
+      },
+      "timeout_s": 20,
+      "env_pass": ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+    },
+    {
+      "name": "log",
+      "command": ["/usr/bin/python3", "/opt/kite-connect-mcp/examples/consumers/log_to_file.py"],
+      "match": {"kinds": ["order", "session", "router", "selftest"]},
+      "env_pass": ["EVENT_LOG_FILE"]
+    }
+  ]
+}
