@@ -296,6 +296,7 @@ def test_the_selftest_hides_a_password_in_the_url(capsys, monkeypatch, base_env)
         ("a:b@kite.example.com/postback", "[redacted]@kite.example.com/postback"),
         ("https://kite.example.com/a@b", "https://kite.example.com/a@b"),
         ("https://kite.example.com/?to=a@b", "https://kite.example.com/?to=a@b"),
+        ("https://user:p@ss@kite.example.com/postback", "https://[redacted]@kite.example.com/postback"),
     ],
 )
 def test_a_url_is_shown_without_its_user_and_password(url, shown):
@@ -310,6 +311,34 @@ async def test_an_unreachable_url_is_reported_without_its_password():
             transport=httpx2.MockTransport(_unreachable),
         )
     assert "pw-ABCD" not in str(error.value) and "[redacted]@kite.example.com" in str(error.value)
+
+
+async def test_an_error_that_echoes_the_url_hides_a_password_with_an_at():
+    url = "https://someone:pw@ABCD@kite.example.com/postback"
+
+    def echo(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError(f"cannot reach {url}", request=request)
+
+    with pytest.raises(KiteMCPError) as error:
+        await selftest.send(url, selftest.build_payload(API_SECRET), transport=httpx2.MockTransport(echo))
+    message = str(error.value)
+    assert "someone" not in message and "pw@" not in message and "ABCD@" not in message
+    assert message.count("https://[redacted]@kite.example.com/postback") == 2
+
+
+async def test_hiding_a_short_user_name_leaves_the_error_readable():
+    def failed(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.ConnectError("All connection attempts failed", request=request)
+
+    with pytest.raises(KiteMCPError) as error:
+        await selftest.send(
+            "http://a@127.0.0.1:8765/postback",
+            selftest.build_payload(API_SECRET),
+            transport=httpx2.MockTransport(failed),
+        )
+    assert str(error.value) == (
+        "selftest: cannot post to http://[redacted]@127.0.0.1:8765/postback: All connection attempts failed"
+    )
 
 
 def test_the_selftest_fails_on_a_refusal(capsys, monkeypatch, base_env):

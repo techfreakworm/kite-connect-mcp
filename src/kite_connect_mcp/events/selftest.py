@@ -49,8 +49,9 @@ def default_url(settings: Settings) -> str:
     return f"http://{host}:{settings.port}{settings.postback_path}"
 
 
-# the user name and password of a URL: what comes before the first "@" ahead of any "/", "?" or "#", after the scheme
-_USERINFO = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)?(?P<userinfo>[^/?#@]*)@")
+# the user name and password of a URL: after the scheme, what comes before the last "@" ahead of any "/", "?" or "#"
+# (a password may hold an "@"; httpx2 and urlsplit take the host from after the last one, so this hides all of it)
+_USERINFO = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)?(?P<userinfo>[^/?#]*)@")
 
 
 def shown_url(url: str) -> str:
@@ -77,7 +78,9 @@ async def send(url: str, payload: dict[str, Any], *, transport: httpx2.AsyncBase
     it (shown_url) and what went wrong (no payload, no response body).
 
     The proxy settings of the environment (HTTPS_PROXY, ALL_PROXY, ...) are used, except for a loopback URL (the
-    default one): a proxy cannot reach this host's loopback, and a NO_PROXY entry for it is easy to miss."""
+    default one): a proxy cannot reach this host's loopback, and a NO_PROXY entry for it is easy to miss. For a loopback
+    URL httpx2 then also ignores SSL_CERT_FILE and SSL_CERT_DIR, which matters only for an https:// loopback URL whose
+    certificate comes from a private CA (the default URL is plain http://)."""
     try:
         async with httpx2.AsyncClient(
             transport=transport, timeout=15.0, follow_redirects=False, trust_env=not is_loopback(url)
@@ -87,8 +90,10 @@ async def send(url: str, payload: dict[str, Any], *, transport: httpx2.AsyncBase
             )
     except (httpx2.HTTPError, httpx2.InvalidURL) as exc:
         detail = str(exc) or type(exc).__name__
+        # hide the user name and password where the error echoes the URL; replacing a bare user name such as "a"
+        # everywhere would garble the message's own words
         if (found := _USERINFO.match(url)) and found["userinfo"]:
-            detail = detail.replace(found["userinfo"], "[redacted]")
+            detail = detail.replace(f"{found['userinfo']}@", "[redacted]@")
         raise KiteMCPError(f"selftest: cannot post to {shown_url(url)}: {detail}") from None
     return response.status_code
 
