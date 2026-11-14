@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import httpx2
 import pytest
 from mcp import Client
 
-from conftest import ACCESS_TOKEN, API_KEY, FIXED_NOW, tool_json, tool_text
+from conftest import ACCESS_TOKEN, API_KEY, FIXED_NOW, tool_json, tool_text, write_token_file
 from kite_connect_mcp import server as server_module
 from kite_connect_mcp.auth.login import cli_login, cli_logout
 from kite_connect_mcp.cli import main
@@ -18,7 +19,8 @@ from kite_connect_mcp.config import unknown_variables
 from kite_connect_mcp.errors import ConfigError
 from kite_connect_mcp.safety.audit import AuditLog
 from kite_connect_mcp.server import build_runtime, build_server
-from kite_login import NEW_TOKEN, REQUEST_TOKEN, USER_ID, KiteSession
+from kite_connect_mcp.timeutil import now_ist
+from kite_login import NEW_TOKEN, REQUEST_TOKEN, USER_ID, KiteSession, callback_params, state_of
 
 LOGOUT_OFF = {"KITE_MCP_ALLOW_LOGOUT": "false"}
 FORCE_OFF = {"KITE_MCP_LOGIN_ALLOW_FORCE": "false"}
@@ -353,6 +355,151 @@ def test_the_login_command_help_says_when_it_exits_2(capsys):
         main(["login", "--help"])
     text = " ".join(capsys.readouterr().out.split())
     assert "exits 2" in text and "KITE_MCP_LOGIN_ALLOW_FORCE=false" in text and "still accepts" in text
+
+
+# --- forcing off covers a request token pasted without a state ------------------------------------------------------
+
+PASTE_REFUSED = (
+    "forcing a new login is off (KITE_MCP_LOGIN_ALLOW_FORCE=false): a request token pasted without the state of a "
+    "login link is not exchanged until the token expires or Kite rejects it"
+)
+PASTED = {  # what a person may paste: the bare token, or a redirect URL that carries no state of a link of ours
+    "bare-token": REQUEST_TOKEN,
+    "url-without-state": f"https://kite.example.com/callback?action=login&status=success&request_token={REQUEST_TOKEN}",
+}
+
+
+def refused_paste_audited(line: dict, source: str) -> None:
+    assert (line["event"], line["source"], line["reason"]) == ("login_link_refused", source, "token_valid")
+    assert ACCESS_TOKEN not in json.dumps(line) and REQUEST_TOKEN not in json.dumps(line)
+
+
+@pytest.mark.parametrize("pasted", PASTED.values(), ids=PASTED.keys())
+async def test_forcing_off_refuses_a_request_token_pasted_without_a_state(mcp_factory, kite, fake_kite, pasted):
+    # the login behind it would replace the working token just as a forced link's would, and no link of ours vouches
+    # for it: refused before Kite is asked anything
+    server, _, rt = mcp_factory(**FORCE_OFF)
+    before = rt.settings.token_file.read_text()
+    result = await call(server, "complete_login", {"request_token": pasted})
+    text = " ".join(tool_text(result).split())
+    assert result.is_error and PASTE_REFUSED in text and "exists until 2026-11-05 06:00 IST and" in text
+    assert "session_status with verify=true" in text
+    assert kite.exchanges == [] and fake_kite.requests == []
+    assert rt.settings.token_file.read_text() == before and rt.tokens.current().access_token == ACCESS_TOKEN
+    refused_paste_audited(rt.audit.read()[-1], "tool")
+    assert ACCESS_TOKEN not in text and REQUEST_TOKEN not in text
+
+
+async def test_an_agent_can_paste_once_session_status_verify_finds_the_token_rejected(mcp_factory, kite, fake_kite):
+    kite_rejects_the_token(fake_kite)  # the way out the refusal names for an agent
+    server, _, rt = mcp_factory(**FORCE_OFF)
+    assert tool_json(await call(server, "session_status", {"verify": True}))["logged_in"] is False
+    assert tool_json(await call(server, "complete_login", {"request_token": REQUEST_TOKEN}))["logged_in"] is True
+    assert rt.tokens.current().access_token == NEW_TOKEN and len(kite.exchanges) == 1
+
+
+async def test_forcing_off_the_login_command_refuses_a_pasted_request_token(settings_factory, fake_kite, kite, capsys):
+    settings = settings_factory(**FORCE_OFF)
+    before = settings.token_file.read_text()
+    with pytest.raises(ConfigError) as refused:  # main() makes it exit 2
+        await cli_login(
+            settings,
+            request_token=REQUEST_TOKEN,
+            listen=False,
+            transport=fake_kite.transport(),
+            clock=lambda: FIXED_NOW,
+        )
+    message = " ".join(str(refused.value).split())
+    assert PASTE_REFUSED in message and "without --request-token" in message and "session_status" not in message
+    assert kite.exchanges == [] and fake_kite.requests == []  # not even the login command's question to Kite
+    assert settings.token_file.read_text() == before
+    refused_paste_audited(last_audit_line(settings), "cli")
+    out, err = capsys.readouterr()
+    assert out == "" and ASKING not in err
+    assert ACCESS_TOKEN not in message + err and REQUEST_TOKEN not in message + err
+
+
+def test_forcing_off_main_exits_2_on_a_pasted_request_token(cli_env, monkeypatch, capsys, fake_kite):
+    kite = KiteSession(fake_kite)
+    real_build = server_module.build_runtime
+    monkeypatch.setattr(
+        server_module,
+        "build_runtime",
+        lambda settings, **kw: real_build(settings, **{**kw, "transport": fake_kite.transport()}),
+    )
+    token_file = write_token_file(
+        Path(cli_env["KITE_TOKEN_FILE"]), logged_in_at=now_ist()
+    )  # main() runs on the real clock
+    before = token_file.read_text()
+    monkeypatch.setenv("KITE_MCP_LOGIN_ALLOW_FORCE", "false")
+    assert main(["login", "--request-token", REQUEST_TOKEN]) == 2
+    out, err = capsys.readouterr()
+    assert out == "" and PASTE_REFUSED in " ".join(err.split())
+    assert kite.exchanges == [] and fake_kite.requests == [] and token_file.read_text() == before
+    assert REQUEST_TOKEN not in err and ACCESS_TOKEN not in err
+
+
+def _no_valid_token(settings, case: str) -> None:
+    if case == "expired":
+        write_token_file(settings.token_file, logged_in_at=FIXED_NOW - dt.timedelta(days=1))  # past its 06:00 reset
+    elif case == "missing":
+        settings.token_file.unlink()
+
+
+PASTE_CASES = {
+    "forcing-on": {},
+    "forcing-off-expired": FORCE_OFF,
+    "forcing-off-missing": FORCE_OFF,
+}
+
+
+@pytest.mark.parametrize(("case", "env"), PASTE_CASES.items(), ids=PASTE_CASES.keys())
+async def test_a_pasted_request_token_works_as_before_with_forcing_on_or_no_valid_token(
+    settings_factory, fake_kite, kite, case, env
+):
+    settings = settings_factory(**env)
+    _no_valid_token(settings, case.rpartition("-")[2])
+    rt = build_runtime(settings, transport=fake_kite.transport(), clock=lambda: FIXED_NOW)
+    try:
+        server, _ = build_server(rt)
+        answer = tool_json(await call(server, "complete_login", {"request_token": REQUEST_TOKEN}))
+        assert answer["logged_in"] is True and rt.tokens.current().access_token == NEW_TOKEN
+    finally:
+        await rt.aclose()
+    assert len(kite.exchanges) == 1
+
+
+@pytest.mark.parametrize(("case", "env"), PASTE_CASES.items(), ids=PASTE_CASES.keys())
+async def test_the_login_command_exchanges_a_pasted_request_token_as_before(
+    settings_factory, fake_kite, kite, capsys, case, env
+):
+    settings = settings_factory(**env)
+    _no_valid_token(settings, case.rpartition("-")[2])
+    code = await cli_login(
+        settings, request_token=REQUEST_TOKEN, listen=False, transport=fake_kite.transport(), clock=lambda: FIXED_NOW
+    )
+    assert code == 0 and NEW_TOKEN in settings.token_file.read_text() and len(kite.exchanges) == 1
+    assert capsys.readouterr().out.startswith("Logged in as AB1234.")
+
+
+@pytest.mark.parametrize("how", ["paste", "callback"])
+async def test_forcing_off_lets_a_login_from_a_link_of_ours_through(mcp_factory, kite, how):
+    # a link issued under the rule (no valid token then); a token stored since does not undo it
+    server, _, rt = mcp_factory(**FORCE_OFF)
+    token_file = rt.settings.token_file
+    token_file.unlink()
+    url, _ = await rt.login.issue_link()
+    write_token_file(token_file)
+    assert rt.tokens.current().access_token == ACCESS_TOKEN
+    if how == "paste":
+        answer = tool_json(
+            await call(server, "complete_login", {"request_token": REQUEST_TOKEN, "state": state_of(url)})
+        )
+        assert answer["logged_in"] is True
+    else:
+        assert (await rt.login.handle_callback(callback_params(state_of(url)))).ok
+    assert rt.tokens.current().access_token == NEW_TOKEN and len(kite.exchanges) == 1
+    assert "login_link_refused" not in [line["event"] for line in rt.audit.read()]
 
 
 async def test_login_json_prints_the_link_and_its_expiry_as_one_json_line(settings_factory, fake_kite, capsys):

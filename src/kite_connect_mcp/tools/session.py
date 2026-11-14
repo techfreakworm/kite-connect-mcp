@@ -313,7 +313,8 @@ def _register_managed(reg: Registrar) -> None:
         (use it when the redirect page could not be reached). Exchanges the token with Kite and stores the access
         token for every client of this server. Request tokens are single use and last only a few minutes. With an
         account pin set (KITE_MCP_ALLOWED_USER_ID or KITE_MCP_ALLOWED_USER_ID_SHA256), a login by any other Kite
-        account is ended and refused."""
+        account is ended and refused. With forcing off on the server (KITE_MCP_LOGIN_ALLOW_FORCE=false), a request
+        token without the state of a login link is refused while a valid token exists: pass the whole URL."""
         token, linked_state = unpack_redirect(request_token, state)
         result = await _manager(rt).complete(token, linked_state, source="tool")
         if not result.ok:

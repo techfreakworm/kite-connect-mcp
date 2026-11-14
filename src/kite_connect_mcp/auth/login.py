@@ -14,11 +14,14 @@ not a logout and stays.
 A login from a new link ends the token in use at Kite. With KITE_MCP_LOGIN_ALLOW_FORCE=false, issue_link() refuses (a
 `login_link_refused` audit line) while a valid token exists, whoever asks: the token then lives until 06:00 IST or until
 Kite rejects it. The login command asks Kite once (GET /user/profile) before it refuses: with the events off it would
-not otherwise learn of a rejection the serving process met. An agent asks with session_status(verify=true).
+not otherwise learn of a rejection the serving process met. An agent asks with session_status(verify=true). A request
+token pasted without a state is refused the same way (its login would replace the token too), before any Kite call; a
+paste with a state of ours, and the callback, come from a link issued under the rule and go through.
 
 The exchange, for a callback or a pasted token (`_finish`), one at a time per process:
 
-    reserve the state (if any)  ->  POST /session/token  ->  account pin  ->  write the token file  ->  commit
+    forcing off (a paste without a state)  ->  reserve the state (if any)  ->  POST /session/token  ->  account pin
+        ->  write the token file  ->  commit
 
 A state is reserved for one exchange and committed only once the token is on disk, which also closes every other open
 link. Whatever fails before that releases the state, so the same link can be tried again with a fresh Kite login. If
@@ -276,11 +279,41 @@ class LoginManager:
                 ". session_status with verify=true asks Kite whether it still accepts the token; a token Kite rejects "
                 "no longer blocks a new link"
             )
+        raise self._forcing_off(record, source, "no login link is issued", after)
+
+    def _refuse_paste_while_valid(self, source: str) -> None:
+        """With forcing off, no exchange of a request token pasted without a state while a valid token exists: the
+        login behind it would replace that token, and no link of ours (issued under the rule) vouches for it. Asks Kite
+        nothing. ConfigError, audited as a refused link."""
+        record = self.tokens.current()
+        if self.settings.login_allow_force or record is None:
+            return
+        if source == "cli":
+            ask = (
+                "the login command without --request-token asks Kite whether it still accepts the token, and prints a "
+                "link if Kite rejected it"
+            )
+        else:
+            ask = (
+                "session_status with verify=true asks Kite whether it still accepts the token; a token Kite rejects no "
+                "longer blocks a pasted request token"
+            )
+        raise self._forcing_off(
+            record,
+            source,
+            "a request token pasted without the state of a login link is not exchanged",
+            ". The whole URL Kite redirected to after a login from a link of this server carries that state and goes "
+            f"through; {ask}",
+        )
+
+    def _forcing_off(self, record: TokenRecord, source: str, refused: str, after: str) -> ConfigError:
+        """The refusal of forcing off, audited (`login_link_refused`, reason token_valid): what is `refused` while the
+        token is valid, then `after`, the way out."""
         self._audit("login_link_refused", source=source, reason="token_valid")
         until = f" until {to_ist(record.expires_at):%Y-%m-%d %H:%M} IST" if record.expires_at else ""
-        raise ConfigError(
-            f"a valid Kite token exists{until} and forcing a new login is off (KITE_MCP_LOGIN_ALLOW_FORCE=false): no "
-            f"login link is issued until the token expires or Kite rejects it{after}"
+        return ConfigError(
+            f"a valid Kite token exists{until} and forcing a new login is off (KITE_MCP_LOGIN_ALLOW_FORCE=false): "
+            f"{refused} until the token expires or Kite rejects it{after}"
         )
 
     async def _ask_kite_about_the_token(self) -> str:
@@ -322,7 +355,9 @@ class LoginManager:
 
     async def complete(self, request_token: str, state: str | None = None, *, source: str = "tool") -> LoginResult:
         """Exchange a request_token a person pasted. The state is optional, but if given it must be valid (and is used
-        up like any other)."""
+        up like any other). Without one, forcing off (KITE_MCP_LOGIN_ALLOW_FORCE=false) refuses while a valid token
+        exists, before Kite is asked anything: ConfigError, and a `login_link_refused` audit line. A state of ours says
+        the link was issued under that rule, so a paste with one goes through, as the callback does."""
         self._require_managed()
         token = request_token.strip()
         if not REQUEST_TOKEN_RE.fullmatch(token):
@@ -336,6 +371,9 @@ class LoginManager:
 
     async def _finish(self, request_token: str, state: str | None, source: str, client: str | None) -> LoginResult:
         async with self._flow_lock:
+            if state is None:  # a request token pasted without a state (complete(); the callback always has one),
+                # judged under the lock: a token another exchange stored while this one waited counts too
+                self._refuse_paste_while_valid(source)
             reservation: Reservation | None = None
             if state is not None:
                 reservation = await asyncio.to_thread(self.states.reserve, state, to_ist(self.clock()))
@@ -641,7 +679,8 @@ async def cli_login(
     until one login completes or LISTEN_TIMEOUT_S passes. With `as_json`: the link is printed as one JSON line
     {"url", "expires_at"}. `transport` and `clock` exist for tests. Exit codes: 0 done, 1 the login did not happen, 2
     not possible in this configuration (a ConfigError, such as forcing off while Kite still accepts the stored token,
-    leaves this function and main() turns it into 2). With forcing off and a valid token, Kite is asked once first."""
+    leaves this function and main() turns it into 2). With forcing off and a valid token, a link is refused once Kite,
+    asked first, still accepts the token, and a request token without a state is refused without asking Kite."""
     if settings.auth_mode != "managed":
         _note(
             "login is managed by another program (KITE_MCP_AUTH_MODE=external); this server does not log in. "

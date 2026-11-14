@@ -1,5 +1,6 @@
 """Kite's rejection of a token, kept by fingerprint: in memory by default, in the event store's meta table with the
-events on (a restart remembers it), read by the commands beside the service, and cleared by a new token."""
+events on in managed mode (a restart remembers it), read by the commands beside the service, and cleared by a new
+token. External mode keeps them in memory, as 0.2.0 did."""
 
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from kite_connect_mcp.events import rejections
 from kite_connect_mcp.events.model import token_fingerprint
 from kite_connect_mcp.events.rejections import KEY, MAX_KEPT, SnapshotRejections, StoredRejections
 from kite_connect_mcp.events.store import EventStore
+from kite_connect_mcp.server import build_runtime
 from kite_connect_mcp.timeutil import now_ist
 
 EVENTS = {"KITE_MCP_EVENTS": "true", "KITE_MCP_TRANSPORT": "http", "KITE_MCP_BEARER_TOKEN": BEARER}
@@ -55,6 +57,53 @@ async def test_a_tool_call_that_kite_refuses_marks_the_token_in_the_store(runtim
     assert json.loads(rt.events.store.meta(KEY)) == [token_fingerprint(ACCESS_TOKEN)]
     rt.tokens.accept(ACCESS_TOKEN)  # what a login of this token does
     assert json.loads(rt.events.store.meta(KEY)) == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "serving", "beside"),
+    [("managed", StoredRejections, SnapshotRejections), ("external", MemoryRejections, MemoryRejections)],
+)
+async def test_the_marks_are_kept_in_the_store_in_managed_mode_only(
+    settings_factory, runtime_factory, fake_kite, mode, serving, beside
+):
+    # external mode: another program logs in, so nothing here could clear a stored mark; memory, as in 0.2.0
+    settings = settings_factory(**EVENTS, KITE_MCP_AUTH_MODE=mode)
+    service = runtime_factory(settings)
+    command = build_runtime(settings, transport=fake_kite.transport(), clock=lambda: FIXED_NOW, with_events=False)
+    try:
+        assert service.events is not None and type(service.tokens.rejections) is serving
+        assert type(command.tokens.rejections) is beside
+    finally:
+        await command.aclose()
+
+
+async def test_in_external_mode_a_rejection_is_kept_in_memory_and_a_restart_forgets_it(runtime_factory, fake_kite):
+    fake_kite.on("GET", "/user/profile", status=403, error_type="TokenException", message="Incorrect token")
+    external = {**EVENTS, "KITE_MCP_AUTH_MODE": "external"}
+    first = runtime_factory(**external)
+    with pytest.raises(TokenError):
+        await first.client.get("/user/profile")
+    assert first.tokens.current() is None and first.tokens.rejections.fingerprints() == [
+        token_fingerprint(ACCESS_TOKEN)
+    ]
+    assert [e["session"] for e in first.events.store.events()] == ["token_rejected"]  # the event, as in managed mode
+    assert first.events.store.meta(KEY) is None  # never in the store
+    await first.aclose()
+    second = runtime_factory(**external)  # the same state folder: the same store
+    assert second.tokens.current().access_token == ACCESS_TOKEN  # forgotten, as in 0.2.0
+
+
+def test_the_status_command_in_external_mode_does_not_read_marks_from_the_store(cli_env, monkeypatch, capsys):
+    write_token_file(Path(cli_env["KITE_TOKEN_FILE"]), logged_in_at=now_ist())  # valid on the real clock main() uses
+    store = EventStore(Path(cli_env["KITE_MCP_STATE_DIR"]) / "events.sqlite3")
+    try:
+        StoredRejections(store).add(token_fingerprint(ACCESS_TOKEN))  # a mark some managed-mode server kept here
+    finally:
+        store.close()
+    for key, value in {**EVENTS, "KITE_MCP_AUTH_MODE": "external"}.items():
+        monkeypatch.setenv(key, value)
+    assert main(["status"]) == 0
+    assert json.loads(capsys.readouterr().out)["session"]["logged_in"] is True
 
 
 def test_the_stored_marks_are_bounded_newest_last(tmp_path):

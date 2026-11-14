@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 import uvicorn
+from mcp import Client
 from uvicorn.lifespan.on import LifespanOn
 
 from conftest import ACCESS_TOKEN, BEARER, close_runtimes, write_token_file
@@ -480,6 +481,27 @@ async def test_a_rejected_token_brings_one_link_every_two_hours_at_most(links):
     rt.links.token_rejected()
     await rt.links.tick()
     assert json.loads(out.read_text())["reason"] == "token_rejected"
+
+
+async def test_a_tool_call_kite_refuses_brings_exactly_one_token_rejected_link(links, fake_kite):
+    """End to end: a tool call is the first to meet Kite's rejection of the stored token (the events on, a link
+    command set): the client marks it, the service raises token_rejected, and the links' next tick sends one link."""
+    make, out = links
+    clock = Clock(at(2, 12, 0))  # more than 3 hours after 08:30: no slot to catch up
+    rt = make(clock, **EVENTS)
+    write_token_file(rt.settings.token_file, logged_in_at=at(2, 7, 35))
+    fake_kite.on("GET", "/user/profile", status=403, error_type="TokenException", message="Incorrect token")
+    server, _ = build_server(rt)
+    async with Client(server) as client:
+        assert (await client.call_tool("get_profile", {})).is_error
+        assert (await client.call_tool("get_profile", {})).is_error  # refused here: the token is marked
+    assert len(fake_kite.calls("GET", "/user/profile")) == 1
+    assert [e["session"] for e in rt.events.store.events()] == ["token_rejected"]
+    assert not out.exists()  # nothing is sent from the tool call itself: the links' loop sends
+    await rt.links.tick()
+    await rt.links.tick()
+    assert json.loads(out.read_text())["reason"] == "token_rejected"
+    assert issued(rt) == ["token_rejected"]
 
 
 async def test_no_link_for_a_rejected_token_once_a_new_login_came(links):

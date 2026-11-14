@@ -664,7 +664,12 @@ async def test_a_login_beside_the_service_that_kite_answers_with_the_rejected_to
     # mark only in its own memory, and writes the file as the login does (a new file in its place)
     TokenFile(rt.settings.token_file, writable=True).write(TokenRecord.new(ACCESS_TOKEN, logged_in_at))
     await poller.tick()
-    marks = json.loads(rt.events.store.meta("rejected_tokens"))
+    stored = rt.events.store.meta("rejected_tokens")
+    marks = rt.tokens.rejections.fingerprints()
+    if mode == "managed":
+        assert json.loads(stored) == marks  # the store holds the marks
+    else:
+        assert stored is None  # in memory only, as in 0.2.0: nothing in external mode could clear a stored one
     if cleared:
         assert rt.tokens.current().access_token == ACCESS_TOKEN and marks == []
         assert [e["session"] for e in rt.events.store.events()] == ["token_rejected", "login"]

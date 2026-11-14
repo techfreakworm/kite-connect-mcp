@@ -11,12 +11,16 @@ is 0.x, minor releases may change tool arguments.
   upper case, so the plain ID need not be in any file. With it, the server's own output (the audit log, the session
   tools, `kite-connect-mcp status --verify` and the `login` command) names the account by the first 12 hex digits of
   the digest instead of its user ID. With both pins set they must name the same account. Every account check (the
-  login and the postback route) compares SHA-256 digests in constant time.
+  login and the postback route) compares SHA-256 digests in constant time, and still ignores case and surrounding
+  spaces in the user ID Kite returns, as 0.2.0 did.
 - **Logout off.** With `KITE_MCP_ALLOW_LOGOUT=false` the `logout` tool is not offered and the logout command refuses
   (exit 2). Ending a refused account's fresh session still happens.
 - **Forcing off.** With `KITE_MCP_LOGIN_ALLOW_FORCE=false` no login link is issued while a valid token exists, whoever
   asks (the `login` tool, even with force=true, and the `login` command, which first asks Kite once with a read-only
-  GET /user/profile and issues the link if Kite rejected the token).
+  GET /user/profile and issues the link if Kite rejected the token). Nor is a request token pasted without the state
+  of a login link exchanged (`complete_login`, `kite-connect-mcp login --request-token`, which exits 2), before Kite
+  is asked anything; the whole URL Kite redirected to after a login from this server's link carries that state and
+  goes through.
 - **Session events** `login` (a new token was stored), `login_refused` (another account's login was refused by the
   pin) and `login_failed` (a login on a link of this server's did not complete; `reason` is `exchange_failed` or
   `token_not_stored`), each raised once, with the order events on ([docs/EVENTS.md](docs/EVENTS.md)).
@@ -47,9 +51,15 @@ What a 0.2.0 setup sees without changing a setting:
   (0.2.0: only the poll and the doorbell). It is still raised once per token, and never by a logout.
 - With the order events on, in managed mode, a token that another process stores beside the serving process
   (`kite-connect-mcp login` run by hand, say) raises `login`, seen by the poll within seconds.
-- With the order events on, a token Kite rejected stays rejected across a restart: the rejection is kept by the
-  token's fingerprint in the event store (0.2.0 forgot it). A new login that Kite answers with the same token string
-  clears it.
+- With the order events on, in managed mode, a token Kite rejected stays rejected across a restart: the rejection is
+  kept by the token's fingerprint in the event store (0.2.0 forgot it). A new login that Kite answers with the same
+  token string clears it. External mode keeps the rejections in memory, as 0.2.0 did.
+- With the order events on, in managed mode, `kite-connect-mcp status`, `login` and `logout` read those rejections
+  from the event store: `status` shows a token the service saw rejected as not logged in, and a store that exists but
+  cannot be read earns a warning on stderr.
+- The `login` tool's note when no account pin is set now reads "no account pin is set (KITE_MCP_ALLOWED_USER_ID or
+  KITE_MCP_ALLOWED_USER_ID_SHA256): any Kite account that completes this login is accepted" (0.2.0:
+  "KITE_MCP_ALLOWED_USER_ID is not set: ...").
 - The audit log has two new events: `logout_refused` and `login_link_refused`.
 
 ### Fixed

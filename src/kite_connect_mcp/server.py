@@ -48,11 +48,14 @@ def build_runtime(
     KITE_MCP_EVENTS=true: a command that is not the server (`status`, `tools`, `login`, `logout`) must not open, lock
     or create the store the serving process owns. The events tools then read the store read-only, when it exists.
 
-    With the events on, Kite's rejections of tokens are kept in the store (events/rejections.py); a command beside the
-    service reads them read-only when it first asks. With the events on, a rejection of the token in use raises
-    token_rejected whichever call meets it first. With KITE_MCP_LOGIN_LINK_COMMAND the login link service is built
-    too (auth/reminders.py); nothing is read until it is used. With both, the links listen to token_rejected."""
-    token_file = TokenFile(settings.token_file, writable=settings.auth_mode == "managed")
+    With the events on in managed mode, Kite's rejections of tokens are kept in the store (events/rejections.py); a
+    command beside the service reads them read-only when it first asks. In external mode they stay in memory, as in
+    0.2.0: another program logs in there, so nothing in this server could ever clear a mark kept in the store. With
+    the events on, a rejection of the token in use raises token_rejected whichever call meets it first. With
+    KITE_MCP_LOGIN_LINK_COMMAND the login link service is built too (auth/reminders.py); nothing is read until it is
+    used. With both, the links listen to token_rejected."""
+    managed = settings.auth_mode == "managed"
+    token_file = TokenFile(settings.token_file, writable=managed)
     tokens = TokenProvider(token_file=token_file, env_token=settings.access_token, clock=clock)
     client = KiteClient(settings, tokens, transport=transport, limiter=limiter or RateLimiter(sleep=sleep), sleep=sleep)
     audit = AuditLog(settings.audit_dir, clock=clock)
@@ -72,10 +75,11 @@ def build_runtime(
         from .events.service import EventService
 
         rt.events = EventService(settings, client, tokens, clock=clock)
-        tokens.keep_rejections_in(StoredRejections(rt.events.store))
+        if managed:  # external mode: in memory (see above)
+            tokens.keep_rejections_in(StoredRejections(rt.events.store))
         rt.login.session_notes = rt.events  # login, login_refused and login_failed (auth/login.py)
         tokens.on_rejected = rt.events.note_token_rejected  # token_rejected, whichever call meets the rejection first
-    elif settings.events and settings.events_db is not None:
+    elif managed and settings.events and settings.events_db is not None:
         # a command beside the serving process (status, login, logout): the marks the service keeps, read-only
         from .events.rejections import SnapshotRejections
 

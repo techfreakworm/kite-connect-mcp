@@ -235,7 +235,8 @@ class Rejections(Protocol):
 
 
 class MemoryRejections:
-    """The marks in memory: a restart forgets them. The default, and what a server without the order events keeps."""
+    """The marks in memory: a restart forgets them. The default, and what a server keeps without the order events or
+    in external mode."""
 
     def __init__(self, fingerprints: Iterable[str] = ()) -> None:
         self._held: dict[str, None] = dict.fromkeys(fingerprints)  # insertion order: oldest first

@@ -1,5 +1,6 @@
-"""Kite's rejections of tokens, kept in the event store's meta table by a server with the order events on, so that a
-restart does not forget that Kite refused the stored token (auth/tokenstore.py MemoryRejections otherwise).
+"""Kite's rejections of tokens, kept in the event store's meta table by a server with the order events on in managed
+mode, so that a restart does not forget that Kite refused the stored token (auth/tokenstore.py MemoryRejections
+otherwise, and in external mode, where only this server's own login could ever clear a mark: server.py).
 
 Key KEY holds a JSON list of fingerprints (the SHA-256 hex of a token, events/model.py token_fingerprint), oldest
 first, at most MAX_KEPT. Never a token.

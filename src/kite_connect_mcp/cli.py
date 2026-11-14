@@ -394,8 +394,9 @@ def build_parser() -> argparse.ArgumentParser:
     login_with = login.add_mutually_exclusive_group()
     login_with.add_argument(
         "--request-token",
-        help="finish the login with the request_token from the redirect URL's address bar (the whole URL also works; "
-        "put it in quotes)",
+        help="finish the login with the request_token from the redirect URL's address bar (the whole URL also works, "
+        "and carries the login link's state; put it in quotes). With KITE_MCP_LOGIN_ALLOW_FORCE=false and a valid "
+        "stored token, a request token without that state exits 2 without asking Kite",
     )
     login_with.add_argument(
         "--json",

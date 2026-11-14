@@ -359,7 +359,8 @@ A rejected token, once per token:
 
 - **Once.** Each session event's id comes from what it is about (a fingerprint of the token, or a digest of the
   link's state, never the thing itself), so a second report of the same login, refusal, failure or rejection stores
-  nothing new.
+  nothing new. So a `token_rejected` is not always followed by a `login`: a new login that Kite answers with the same
+  token string it rejected raises no second `login`, as that event is seeded by the token.
 - **The poll's `login`** is managed mode only. The token in use when the service starts is not a login, so a restart
   raises none, and nor does a login made while the service was down.
 - **The callback's noise never becomes an event.** A malformed redirect, an unknown, expired, used or replayed state,

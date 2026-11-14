@@ -253,9 +253,10 @@ after a crash means the outcome is unknown: check the order book.
 
 The login and the logout write events of their own, each with its `source` (`tool`, `cli`, `callback`, or for a
 [scheduled link](EVENTS.md#scheduled-login-links) `scheduled` or `token_rejected`): `login_link_issued` (with the
-link's expiry, never the link), `login_link_refused` (forcing off and a valid token), `login_ok` (the account: its
-`user_id`, or with the hash pin its `user_id_sha256_prefix`), `login_refused` (a reason code), `logout_ok`,
-`logout_failed` and `logout_refused` (logout off).
+link's expiry, never the link), `login_link_refused` (forcing off and a valid token: a link, or a request token
+pasted without a link's state), `login_ok` (the account: its `user_id`, or with the hash pin its
+`user_id_sha256_prefix`), `login_refused` (a reason code), `logout_ok`, `logout_failed` and `logout_refused` (logout
+off).
 
 A live send, as it appears in the file (shortened):
 
@@ -294,7 +295,9 @@ Read it with `kite-connect-mcp audit [--date YYYY-MM-DD] [--limit N]`, with the 
   login and logout tools and commands refuse. The server cannot replace or end a session it does not own.
 - **A rejected token is dropped.** If Kite answers `TokenException`, the server stops using that token until a
   different one appears. It remembers the rejection by the token's fingerprint (its SHA-256, never the token): in
-  memory, or with the order events on, in the event store, so a restart does not forget it.
+  memory, or in managed mode with the order events on, in the event store, so a restart does not forget it. In
+  `external` mode the mark stays in memory, as in 0.2.0: only a login through this server clears a mark, and there
+  another program logs in.
 - **The account pin.** `KITE_MCP_ALLOWED_USER_ID` makes managed login refuse any Kite account other than yours: the
   session the other account just opened is ended at once (with that session's own token) and nothing is stored.
   `KITE_MCP_ALLOWED_USER_ID_SHA256` is the same pin given as the SHA-256 of the user ID in upper case, so the plain ID
@@ -311,11 +314,14 @@ Read it with `kite-connect-mcp audit [--date YYYY-MM-DD] [--limit N]`, with the 
   session is not a logout, and still happens.
 - **Forcing a new login can be turned off.** A login from a new link ends the token in use at Kite. With
   `KITE_MCP_LOGIN_ALLOW_FORCE=false` no link is issued while a valid token exists (not expired, and not rejected by
-  Kite), whoever asks: the `login` tool even with force=true or deliver=true, and the `login` command. Each refusal is
-  audited (`login_link_refused`). The token then lives until 06:00 IST or until Kite rejects it; a rejection is
-  remembered as above, so with the events on a restart still knows the token is dead and a new link can be issued. An
-  agent asks Kite with `session_status` and verify=true; the `login` command asks Kite once itself (GET /user/profile,
-  read-only) before it refuses.
+  Kite), whoever asks: the `login` tool even with force=true or deliver=true, and the `login` command. A request token
+  pasted without the state of a login link (`complete_login`, or the `login` command's `--request-token`) is refused
+  the same way, before Kite is asked anything, as its login would replace the token too; the whole URL Kite redirected
+  to after a login from this server's link carries that state and goes through, as the redirect itself does. Each
+  refusal is audited (`login_link_refused`). The token then lives until 06:00 IST or until Kite rejects it; a
+  rejection is remembered as above, so with the events on a restart still knows the token is dead and a new link can
+  be issued. An agent asks Kite with `session_status` and verify=true; the `login` command asks Kite once itself (GET
+  /user/profile, read-only) before it refuses a link.
 - **A login link is a credential.** Whoever holds it can complete one Kite login with it until it expires
   (`KITE_MCP_LOGIN_LINK_TTL_S`, and never past 05:59 IST). The server never stores it (only a digest of its one-time
   state), never logs it and never puts it in an event, a status, an audit line or an error. The `login` tool returns it
@@ -444,7 +450,8 @@ KITE_MCP_LOGIN_ALLOW_FORCE=false
 ```
 
 - Turn logout and forcing off, as above: the agent can then neither end the session nor replace a working one with a
-  login of its own. Give the server a link command
+  login of its own, not even with a request token from a login that no link of this server started. Give the server
+  a link command
   ([CONFIGURATION.md](CONFIGURATION.md#scheduled-login-links)) and have the agent ask with `login(deliver=true)`: the
   link goes straight to you through your own channel, and the agent never holds it. `login` without deliver still
   returns the link to the agent; to rule that out too, hide `login` (`KITE_MCP_EXCLUDED_TOOLS=modify_order,login`) and
