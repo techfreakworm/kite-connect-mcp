@@ -232,8 +232,9 @@ def runtime_factory(fake_kite: FakeKite, settings_factory: Callable[..., Setting
 
 
 def close_runtimes(runtimes: list[Any]) -> None:
-    """runtime_factory's teardown: the store and lock of an event service (KITE_MCP_EVENTS=true), also when a test
-    failed before stop(), and what the tool modules opened (the events tools' read-only store), which only aclose()
+    """runtime_factory's teardown: the store and lock of an event service (KITE_MCP_EVENTS=true) and the lock of the
+    login links' loop (KITE_MCP_LOGIN_LINK_COMMAND), also when a test failed before stop(), and what the tool modules
+    opened (the events tools' read-only store), which only aclose()
     closes otherwise. Like aclose(): the closers newest first, each on its own, so one that fails skips nothing; then
     the first error is raised, so a teardown that failed is not silent."""
     errors: list[Exception] = []
@@ -241,6 +242,8 @@ def close_runtimes(runtimes: list[Any]) -> None:
         steps: list[Callable[[], None]] = []
         if rt.events is not None:
             steps += [rt.events.store.close, rt.events._release_lock]
+        if rt.links is not None:
+            steps.append(rt.links._release_lock)
         steps += reversed(rt.closers)
         for step in steps:
             try:

@@ -13,21 +13,26 @@ login links".
                          LoginLinks.start()
     LoginLinks           the service: send() issues one link and gives it to the command, once, and records the attempt;
                          tick() sends the link after a rejected token and the due slot; start() runs the loop, a task
-                         of the HTTP server's lifespan (server.py), and stop() ends it
+                         of the HTTP server's lifespan (server.py), and stop() ends it; one loop per state folder
     describe_links       the `login_links` status: the times, the days, the next time, the last slot and attempt
 
 The slot rule. A slot is a reminder time on a date. Each tick runs the latest slot at or before now that is on an
 allowed day, at most CATCH_UP_WITHIN (3 hours) old and later than the last slot handled; every scheduled attempt (sent,
-skipped because a valid token exists, or failed) records its slot. So a slot runs at its time; a slot missed while the
-server was down, the loop stalled or the machine slept runs when the loop comes back within 3 hours; only the latest
-missed slot runs, once, and an older one is dropped; and a restart never runs a slot again. The tick reads the clock
-and the state file each time: a first start, a restart and a stalled loop follow the one rule.
+skipped because a valid token exists or because the same tick just sent a link for a rejected token, or failed)
+records its slot. So a slot runs at its time; a slot missed while the server was down, the loop stalled or the machine
+slept runs when the loop comes back within 3 hours; only the latest missed slot runs, once, and an older one is
+dropped; and a restart never runs a slot again. The tick reads the clock and the state file each time: a first start,
+a restart and a stalled loop follow the one rule.
 
     <state_dir>/login_links.json    mode 600, never a link: the last attempt (`last`), the last slot handled
                                     (`last_scheduled_for`, so neither the loop nor a restart runs a slot twice) and the
                                     last link after a rejected token (`token_rejected_link_at`: the two hours start
                                     there). A missing or damaged file reads as nothing, a time in it later than now
                                     is ignored, and what a file that cannot be written misses is held in memory.
+    <state_dir>/login_links.json.lock
+                                    mode 600, held (flock) while the loop runs: one serving process per state folder.
+                                    The state file has no lock of its own, so two loops on one folder would both send
+                                    each slot; a second server on the folder does not come up (ConfigError).
 
 The link is a bearer credential for one Kite login until it expires. It is never stored (auth/loginstate.py keeps only
 its state's digest), never logged, never put in an event, a status or an error. The command's stdout and stderr go to
@@ -39,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import fcntl
 import json
 import logging
 import os
@@ -74,6 +80,7 @@ _OPEN_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
 Spawn = Callable[..., Awaitable[asyncio.subprocess.Process]]
 
 STATE_FILE = "login_links.json"  # under the state folder: the last attempt, the last slot, the last rejected-token link
+LOCK_FILE = STATE_FILE + ".lock"  # beside it: held by the one loop that sends from this state folder
 REJECTED_EVERY = dt.timedelta(hours=2)  # at most one token_rejected link this often
 SOURCES: dict[Reason, str] = {"scheduled": "scheduled", "token_rejected": "token_rejected", "requested": "tool"}
 
@@ -441,6 +448,7 @@ class LoginLinks:
         self._wake = asyncio.Event()
         self._stop: asyncio.Event | None = None
         self._task: asyncio.Task[None] | None = None
+        self._lock_fd: int | None = None  # LOCK_FILE, held from start() to stop()
 
     @property
     def running(self) -> bool:
@@ -556,15 +564,26 @@ class LoginLinks:
         self._wake.set()
 
     async def tick(self) -> None:
-        """One step of the loop: the link after a rejected token, if one waits; then the due slot, if any. With a valid
-        token the slot is recorded as skipped (so it is not caught up later either); otherwise its link is sent. It
-        reads the clock and the state file each time, so a start, a restart and a stalled loop follow the same rule."""
+        """One step of the loop: the link after a rejected token, if one waits; then the due slot, if any. The slot is
+        recorded as skipped (so it is not caught up later either) when this tick's link for the rejected token went
+        out (the operator just got one) or when a valid token exists; otherwise its link is sent, unless a stop was
+        asked for while the rejected token's link ran: then no other command starts, and the slot, not recorded, runs
+        after a restart within CATCH_UP_WITHIN. It reads the clock and the state file each time, so a start, a restart
+        and a stalled loop follow the same rule."""
         now = to_ist(self.clock())
+        rejection: Attempt | None = None
         if self._rejected:
             self._rejected = False
-            await self._after_rejection(now)
+            rejection = await self._after_rejection(now)
+            now = to_ist(self.clock())  # that link's command may have run for minutes (KITE_MCP_LOGIN_LINK_TIMEOUT_S)
         slot = self.due_slot(now)
         if slot is None:
+            return
+        if rejection is not None and rejection.outcome == "sent":
+            log.info("login links: the %s slot is skipped: a link for a rejected token just went out", f"{slot:%H:%M}")
+            self._record(Attempt(now, "scheduled", "skipped"), slot)
+            return
+        if self._stopping():
             return
         if now - slot > LATE_NOTE_AFTER:
             late = int((now - slot).total_seconds() // 60)
@@ -598,20 +617,25 @@ class LoginLinks:
             error = f"an unexpected error ({type(exc).__name__})"
             return self._record(Attempt(self.clock(), reason, "failed", error), slot)
 
-    async def _after_rejection(self, now: dt.datetime) -> None:
-        """The link after a rejected token: none while the last one went out less than REJECTED_EVERY ago (every
-        attempt counts, whatever its outcome; token_rejected_link_at survives a restart), nor once a valid token exists
-        again (a new login came). Neither the days nor the skip dates apply: a token was in use that day."""
+    async def _after_rejection(self, now: dt.datetime) -> Attempt | None:
+        """The link after a rejected token, and its attempt: none (None) while the last attempt was less than
+        REJECTED_EVERY ago (every attempt counts, whatever its outcome; token_rejected_link_at survives a restart), nor
+        once a valid token exists again (a new login came). Neither the days nor the skip dates apply: a token was in
+        use that day. A rejection inside the two hours gets no link later either: the next scheduled time does."""
         last = self.token_rejected_link_at()
         if last is not None and dt.timedelta(0) <= now - last < REJECTED_EVERY:
             log.info(
-                "login links: a link for a rejected token went out at %s; no other within two hours",
+                "login links: the last link attempt for a rejected token was at %s; no other within two hours",
                 to_ist(last).strftime("%H:%M"),
             )
-            return
+            return None
         if self.valid_token():
-            return
-        await self._safe_send("token_rejected")  # _record starts the two hours, whatever the outcome
+            return None
+        return await self._safe_send("token_rejected")  # _record starts the two hours, whatever the outcome
+
+    def _stopping(self) -> bool:
+        """Whether stop() was asked for: the loop then starts no other command."""
+        return self._stop is not None and self._stop.is_set()
 
     def _wait_s(self) -> float:
         """How long the loop waits after a tick: TICK_S at most, less when the next reminder time comes sooner."""
@@ -635,30 +659,83 @@ class LoginLinks:
             await wait_any(wait, self._wake, stop)
 
     async def start(self) -> None:
-        """Check, then run the loop as a task. ConfigError for a server not on the HTTP transport (serving_problem) or a
-        command that cannot be trusted or run (program_problem): the server does not come up. A second call while the
-        loop runs does nothing."""
-        if self._task is not None:
+        """Check, then run the loop as a task. ConfigError for a server not on the HTTP transport (serving_problem), a
+        command that cannot be trusted or run (program_problem) or a state folder whose loop another process runs
+        (LOCK_FILE): the server does not come up. A second call while the loop runs does nothing; a loop that ended
+        (logged as an error, _loop_ended) starts again."""
+        if self.running:
             return
         problem = serving_problem(self.settings)
         if problem is None and (bad := await asyncio.to_thread(program_problem, self.command)) is not None:
             problem = f"KITE_MCP_LOGIN_LINK_COMMAND: {bad}"
         if problem is not None:
             raise ConfigError(problem)
-        self._stop = asyncio.Event()
-        self._task = asyncio.create_task(self.run(self._stop), name="kite-login-links")
+        self._take_lock()
+        stop = self._stop = asyncio.Event()
+        self._task = asyncio.create_task(self.run(stop), name="kite-login-links")
+        self._task.add_done_callback(lambda task: self._loop_ended(task, stop))
         log.info("login links: started (%d time(s) a day)", len(self.settings.login_reminder_times))
 
     async def stop(self) -> None:
-        """Stop the loop. A command still running gets STOP_TIMEOUT_S to finish; then it is killed (run_link_command)
-        and its attempt is not recorded (see send()). Harmless before start() and when called again."""
+        """Stop the loop and let the lock go. A command still running gets STOP_TIMEOUT_S to finish; then it is killed
+        (run_link_command) and its attempt is not recorded (see send()). A stop() that is itself cancelled still
+        cancels the loop and lets the lock go. Harmless before start() and when called again."""
         task, self._task = self._task, None
-        if task is None:
-            return
         if self._stop is not None:
             self._stop.set()
         try:
-            await asyncio.wait({task}, timeout=STOP_TIMEOUT_S)
+            if task is not None:
+                await asyncio.wait({task}, timeout=STOP_TIMEOUT_S)
         finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            try:
+                if task is not None:
+                    task.cancel()  # does nothing to a loop that has ended
+                    await asyncio.gather(task, return_exceptions=True)
+            finally:
+                self._release_lock()
+
+    def _loop_ended(self, task: asyncio.Task[None], stop: asyncio.Event) -> None:
+        """The loop's done-callback: a loop that ends while no stop was asked for (it crashed, or something cancelled
+        it) is an error, as no scheduled link and no link after a rejected token goes out until the server restarts.
+        Ending after stop() is quiet."""
+        if stop.is_set():
+            return
+        down = "no scheduled link and no link after a rejected token goes out until the server restarts"
+        if task.cancelled():
+            log.error("login links: the loop was cancelled while the server was running; %s", down)
+        elif (exc := task.exception()) is not None:
+            log.error("login links: the loop failed while the server was running; %s", down, exc_info=exc)
+        else:
+            log.error("login links: the loop ended while the server was running; %s", down)
+
+    def _take_lock(self) -> None:
+        """Hold LOCK_FILE (flock) while the loop runs: one loop per state folder, as two would both send each slot. The
+        kernel drops the lock when the process ends, however it ends, and the file is not passed to the link command
+        (Python opens it non-inheritable). Kept when already held: a loop that ended and starts again."""
+        if self._lock_fd is not None:
+            return
+        path = self._state_path.with_name(LOCK_FILE)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)  # as write_private_file makes it
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError as exc:
+            raise ConfigError(f"cannot open the lock file {path}: {exc.strerror or type(exc).__name__}") from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if isinstance(exc, BlockingIOError):
+                raise ConfigError(
+                    f"another process is already sending login links from the state folder {path.parent}: run one "
+                    "serving process per state folder (KITE_MCP_STATE_DIR)"
+                ) from None
+            raise ConfigError(f"cannot lock {path}: {exc.strerror or type(exc).__name__}") from None
+        self._lock_fd = fd
+
+    def _release_lock(self) -> None:
+        fd, self._lock_fd = self._lock_fd, None
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)  # closing the file releases the lock too

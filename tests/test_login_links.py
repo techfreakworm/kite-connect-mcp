@@ -492,7 +492,7 @@ async def test_no_link_for_a_rejected_token_once_a_new_login_came(links):
     assert not out.exists()
 
 
-async def test_a_failed_link_for_a_rejected_token_counts_toward_the_two_hours(links, tmp_path):
+async def test_a_failed_link_for_a_rejected_token_counts_toward_the_two_hours(links, tmp_path, caplog):
     make, out = links
     clock = Clock(at(2, 12, 0))
     rt = logged_out(make(clock, command=link_command(tmp_path, "fails", exit_code=3)))
@@ -501,8 +501,11 @@ async def test_a_failed_link_for_a_rejected_token_counts_toward_the_two_hours(li
     assert rt.links.status()["last"]["outcome"] == "failed" and rt.links.token_rejected_link_at() == at(2, 12, 0)
     clock.now = at(2, 13, 0)
     rt.links.token_rejected()
-    await rt.links.tick()
+    with caplog.at_level(logging.INFO):
+        await rt.links.tick()
     assert issued(rt) == ["token_rejected"]  # one link only: no retry within two hours
+    # the log says an attempt, not a link that went out: this one failed
+    assert "the last link attempt for a rejected token was at 12:00; no other within two hours" in caplog.text
 
 
 async def test_a_rejection_waits_for_one_tick_only(links):
@@ -514,6 +517,67 @@ async def test_a_rejection_waits_for_one_tick_only(links):
     clock.now = at(2, 14, 30)  # past the two hours, with no new rejection
     await rt.links.tick()
     assert issued(rt) == ["token_rejected"]
+
+
+@pytest.mark.parametrize("sent", [True, False])
+async def test_a_slot_due_in_the_tick_that_sent_a_rejected_token_link_is_skipped(links, tmp_path, sent):
+    """The operator just got a link: the slot of the same tick is recorded skipped, not sent seconds later. When that
+    link failed, the slot is sent as usual."""
+    make, out = links
+    clock = Clock(SLOT)
+    command = None if sent else link_command(tmp_path, "fails", exit_code=3)
+    rt = logged_out(make(clock, command=command))
+    rt.links.token_rejected()
+    await rt.links.tick()
+    assert rt.links.handled_slot() == SLOT and rt.links.token_rejected_link_at() == SLOT
+    last = rt.links.status()["last"]
+    if sent:
+        assert issued(rt) == ["token_rejected"] and json.loads(out.read_text())["reason"] == "token_rejected"
+        assert (last["reason"], last["outcome"], last["link_expires_at"]) == ("scheduled", "skipped", None)
+    else:
+        assert issued(rt) == ["token_rejected", "scheduled"] and (last["reason"], last["outcome"]) == (
+            "scheduled", "failed",
+        )  # fmt: skip
+    clock.now = at(2, 7, 31)
+    await rt.links.tick()
+    assert len(issued(rt)) == (1 if sent else 2)  # the slot had its attempt either way
+
+
+def _slow_rejected_link(clock, monkeypatch, *, until, outcome):
+    """run_link_command for the first link (the rejected token's): it runs until `until` on `clock`, then ends with
+    `outcome` (None: sent); any later link is sent at once."""
+    runs = []
+
+    async def run(*_, **__):
+        runs.append(clock.now)
+        if len(runs) == 1:
+            clock.now = until
+            return outcome
+        return None
+
+    monkeypatch.setattr(reminders, "run_link_command", run)
+    return runs
+
+
+@pytest.mark.parametrize("outcome", [None, "exit 3"])
+async def test_the_slot_is_judged_by_the_clock_after_the_rejected_token_link(links, monkeypatch, outcome):
+    """The rejected token's link may run for minutes (KITE_MCP_LOGIN_LINK_TIMEOUT_S): the slot after it is judged,
+    and its attempt dated, by the clock once that link is done."""
+    make, _ = links
+    clock = Clock(at(2, 7, 29))  # one minute before the slot
+    rt = logged_out(make(clock))
+    _slow_rejected_link(clock, monkeypatch, until=at(2, 7, 31), outcome=outcome)
+    rt.links.token_rejected()
+    await rt.links.tick()
+    last = rt.links.status()["last"]
+    assert rt.links.handled_slot() == SLOT and (last["reason"], last["at"]) == (
+        "scheduled",
+        "2026-11-02T07:31:00+05:30",
+    )
+    if outcome is None:  # sent: the slot of the same tick is skipped
+        assert issued(rt) == ["token_rejected"] and last["outcome"] == "skipped"
+    else:
+        assert issued(rt) == ["token_rejected", "scheduled"] and last["outcome"] == "sent"
 
 
 async def test_a_state_file_that_cannot_be_written_still_sends_a_slot_once(links, monkeypatch):
@@ -605,6 +669,75 @@ async def test_stop_before_start_and_twice_is_harmless(links):
     assert not rt.links.running
 
 
+async def test_a_stop_asked_for_while_the_rejected_token_link_runs_starts_no_other_command(links, monkeypatch):
+    """The server stops while the rejected token's link is out, with a slot due in the same tick: once that link is
+    done, the tick ends there. The slot is not recorded, so a restart within three hours runs it."""
+    make, _ = links
+    clock = Clock(SLOT)
+    rt = logged_out(make(clock, **HTTP))
+    stopping: list[asyncio.Task[None]] = []
+    runs = []
+
+    async def run(*_, **__):
+        runs.append(clock.now)
+        if not stopping:
+            stopping.append(asyncio.create_task(rt.links.stop()))
+            await asyncio.sleep(0)  # stop() asks the loop to stop at once, then waits for it
+        return "exit 3"  # failed: the slot would otherwise be sent
+
+    monkeypatch.setattr(reminders, "run_link_command", run)
+    rt.links.token_rejected()
+    await rt.links.start()
+    await until(lambda: bool(stopping), "the rejected token's link did not run")
+    await asyncio.wait_for(stopping[0], 10)
+    assert not rt.links.running and len(runs) == 1 and issued(rt) == ["token_rejected"]
+    assert rt.links.handled_slot() is None and rt.links.status()["last"]["reason"] == "token_rejected"
+
+
+async def test_a_loop_that_ends_while_running_is_logged_and_can_start_again(links, monkeypatch, caplog):
+    make, _ = links
+    rt = make(Clock(at(2, 5, 0)), **HTTP)
+
+    async def broken(*_):
+        raise RuntimeError("a bug")
+
+    def logged() -> list[logging.LogRecord]:
+        return [r for r in caplog.records if r.levelno == logging.ERROR and r.name == reminders.__name__]
+
+    with monkeypatch.context() as m:
+        m.setattr(reminders, "wait_any", broken)  # outside the tick: nothing in the loop catches it
+        await rt.links.start()
+        await until(lambda: bool(logged()), "the loop ended without an error in the log")
+    assert not rt.links.running
+    assert "the loop failed" in logged()[0].getMessage() and logged()[0].exc_info is not None
+    await rt.links.start()  # a loop that ended can start again (it still holds its lock)
+    assert rt.links.running
+    await rt.links.stop()
+    assert not rt.links.running and len(logged()) == 1  # a stop asked for is quiet
+
+
+async def test_one_serving_process_per_state_folder(links):
+    make, _ = links
+    clock = Clock(at(2, 5, 0))
+    first, second = make(clock, **HTTP), make(clock, **HTTP)
+    assert first.settings.state_dir == second.settings.state_dir
+    await first.links.start()
+    try:
+        with pytest.raises(ConfigError) as refused:
+            await second.links.start()
+        assert "another process" in str(refused.value) and str(first.settings.state_dir) in str(refused.value)
+        assert not second.links.running
+        lock = first.settings.state_dir / "login_links.json.lock"
+        assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    finally:
+        await first.links.stop()
+    await second.links.start()  # stop() let the lock go
+    assert second.links.running
+    await second.links.stop()
+    await second.links.start()  # and so does every stop(): a second start takes it again
+    await second.links.stop()
+
+
 async def test_a_wake_up_runs_a_tick_at_once(links):
     make, out = links
     rt = logged_out(make(Clock(at(2, 12, 0)), **HTTP))  # no slot due: the loop then waits up to TICK_S
@@ -674,14 +807,29 @@ async def test_the_http_lifespan_starts_the_links_without_the_events(links):
     assert not rt.links.running
 
 
-async def test_a_part_that_fails_to_start_stops_the_parts_started_before_it(links, fake_kite):
+async def test_a_part_that_fails_to_start_stops_the_parts_started_before_it(links, fake_kite, monkeypatch):
     fake_kite.on("GET", "/orders", [])
     make, _ = links
     rt = make(Clock(at(2, 5, 0)), **EVENTS)
     rt.links.command.chmod(0o777)  # the links refuse to start, after the events have started
+    seen = []
+    real_start, real_stop = rt.events.start, rt.events.stop
+
+    async def start():
+        await real_start()
+        seen.append(("started", rt.events.running))
+
+    async def stop():
+        seen.append(("stopping", rt.events.running))
+        await real_stop()
+
+    monkeypatch.setattr(rt.events, "start", start)
+    monkeypatch.setattr(rt.events, "stop", stop)
     lifespan = _lifespan(rt)
     await lifespan.startup()
     assert lifespan.should_exit and lifespan.startup_failed
+    # the events had started and were running when the links failed; then they were stopped
+    assert seen == [("started", True), ("stopping", True)]
     assert not rt.events.running and not rt.links.running
     assert [t for t in asyncio.all_tasks() if t.get_name().startswith("kite-") and not t.done()] == []
 
@@ -705,9 +853,15 @@ async def test_the_links_do_not_start_on_the_stdio_transport(links):
 def test_serve_refuses_the_stdio_transport_with_links(cli_env, monkeypatch, tmp_path, capsys):
     import anyio
 
+    from kite_connect_mcp import server
+
+    def built(*args, **kwargs):
+        raise AssertionError("the runtime was built: the check must come before anything is built")
+
     def served(*args, **kwargs):
         raise AssertionError("the stdio server ran: the check must come first")
 
+    monkeypatch.setattr(server, "build_runtime", built)
     monkeypatch.setattr(anyio, "run", served)
     for key, value in links_env(link_command(tmp_path), **TIMES).items():
         monkeypatch.setenv(key, value)
