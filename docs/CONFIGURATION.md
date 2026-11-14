@@ -12,6 +12,7 @@ default: dry-run trading, a ₹10,000 per-order cap, HTTP on the loopback addres
 - [Safety](#safety)
 - [Tools](#tools)
 - [WebSocket ticker](#websocket-ticker)
+- [Order events](#order-events)
 - [Logging](#logging)
 - [Other variables that matter](#other-variables-that-matter)
 - [Validation rules](#validation-rules)
@@ -83,6 +84,7 @@ What the defaults give you (the kill-switch file has its own setting, under [Saf
 | Token file | `<state dir>/access_token.json` |
 | Audit log | `<state dir>/audit/audit-YYYY-MM-DD.jsonl` (IST day) |
 | Kill switch | `<state dir>/KILL_SWITCH` |
+| Event store (with `KITE_MCP_EVENTS=true`) | `<state dir>/events.sqlite3` |
 | Server install (systemd guide) | state `/var/lib/kite-connect-mcp`, cache `/var/cache/kite-connect-mcp` |
 | Docker image | state `/var/lib/kite-connect-mcp/state`, cache `/var/lib/kite-connect-mcp/cache` |
 
@@ -98,7 +100,7 @@ What the defaults give you (the kill-switch file has its own setting, under [Saf
 | `KITE_MCP_PUBLIC_URL` | unset | The public URL behind a reverse proxy, for example `https://kite.example.com`. | Include the scheme; a trailing slash is removed. Its host and origin are added to the Host and Origin checks. Without a scheme it is silently ignored by those checks. The Kite redirect URL is this plus the callback path. |
 | `KITE_MCP_ALLOWED_HOSTS` | empty | Extra `Host` header values to accept, comma-separated. | An entry without a port also matches any port. `127.0.0.1`, `localhost` and `[::1]` are always accepted, and so is the host of `KITE_MCP_PUBLIC_URL`. A request with another Host gets 421. |
 | `KITE_MCP_CALLBACK_PATH` | `/callback` | Path of the login redirect endpoint (`GET`). | Must start with `/` and must not be under `/mcp`. Your Kite app's redirect URL must be the public URL plus this path. |
-| `KITE_MCP_POSTBACK_PATH` | unset | Turns on the order-postback endpoint at this path (`POST`), for example `/postback`. | Same rules as the callback path. The postback URL in the developer console must match. Without it the endpoint does not exist. |
+| `KITE_MCP_POSTBACK_PATH` | unset | Turns on the order-postback endpoint at this path (`POST`), for example `/postback`. | Same rules as the callback path. The postback URL in the developer console must match. Without it the endpoint does not exist. With `KITE_MCP_EVENTS=true` postbacks feed the [order events](EVENTS.md). |
 
 Fixed paths: `/mcp` (the MCP endpoint, bearer-protected, as is anything below `/mcp`) and `/health` (public; answers
 `{"status":"ok","version":...}`).
@@ -130,7 +132,7 @@ How these behave is explained in [SAFETY.md](SAFETY.md).
 
 | Variable | Default | Meaning | Notes |
 |---|---|---|---|
-| `KITE_MCP_TOOLSETS` | `all` | The tool groups to expose, comma-separated, or `all`. | Known groups: `session`, `account`, `orders`, `gtt`, `alerts`, `portfolio`, `market`, `margins`, `mf`, `ticker`, `safety`. An unknown name is an error. Case-insensitive. |
+| `KITE_MCP_TOOLSETS` | `all` | The tool groups to expose, comma-separated, or `all`. | Known groups: `session`, `account`, `orders`, `gtt`, `alerts`, `portfolio`, `market`, `margins`, `mf`, `ticker`, `events`, `safety`. An unknown name is an error. Case-insensitive. |
 | `KITE_MCP_EXCLUDED_TOOLS` | empty | Individual tool names to hide, comma-separated (for example `modify_order`). | Names are lower-cased; an unknown name is ignored without a warning. |
 
 `kite-connect-mcp tools` lists what your configuration exposes, and what is hidden and why; it is the authoritative list
@@ -148,6 +150,7 @@ for your version, and the full reference with every parameter is `docs/TOOLS.md`
 | `margins` | `get_order_margins`, `get_basket_margins`, `get_order_charges` (calculators: allowed in read-only mode) | none |
 | `mf` | `get_mf_holdings`, `get_mf_orders`, `get_mf_sips`, `search_mf_instruments` | `place_mf_order`, `cancel_mf_order`, `place_mf_sip`, `modify_mf_sip`, `cancel_mf_sip` (only with `KITE_MCP_ALLOW_MF_WRITES=true`) |
 | `ticker` | `ticker_subscribe`, `ticker_unsubscribe`, `ticker_get_ticks`, `ticker_status`, `ticker_order_updates`, `ticker_stop` | none |
+| `events` | `get_order_events`, `get_event_status` (only with an event store: `KITE_MCP_EVENTS=true`, or `KITE_MCP_EVENTS_DB`; see [EVENTS.md](EVENTS.md)) | none |
 | `safety` | `get_safety_status`, `get_audit_log`, `engage_kill_switch` | none |
 
 ## WebSocket ticker
@@ -156,6 +159,24 @@ for your version, and the full reference with every parameter is `docs/TOOLS.md`
 |---|---|---|---|
 | `KITE_MCP_TICKER_ENABLED` | `true` | Allow the WebSocket ticker tools to connect. | Streaming needs the Connect plan. |
 | `KITE_MCP_TICKER_MAX_SUBSCRIPTIONS` | `1000` | The most instruments the ticker will subscribe to. Integer from 1 to 3000. | 3000 is Kite's limit per connection. |
+
+## Order events
+
+Off by default. What they are and how to run them: [EVENTS.md](EVENTS.md).
+
+| Variable | Default | Meaning | Notes |
+|---|---|---|---|
+| `KITE_MCP_EVENTS` | `false` | Run the event service in this server: postbacks as a doorbell, the order-book poll, the event store and the consumers. | Needs the HTTP transport (`KITE_MCP_TRANSPORT=http`, or `serve --transport http`). Read-only: it only reads orders from Kite. |
+| `KITE_MCP_EVENTS_DB` | `<state dir>/events.sqlite3` with `KITE_MCP_EVENTS=true`, else unset | The event store, a SQLite file (mode 600). | `~` is expanded. The server needs it only to move the store. In any other process (a stdio client, the `events` commands) it names the server's store to read; that process must run as a user that can read the file. |
+| `KITE_MCP_EVENTS_CONSUMERS_FILE` | unset | The consumers file (JSON): the commands that get each event. | `~` is expanded. Without it events are recorded and nobody is called. Read when the server starts: a bad file, or one that someone other than the server's user or root could change, stops the server. |
+| `KITE_MCP_ORDER_POLL_INTERVAL_S` | `60` | Seconds between two polls of the order book. Integer, at least 10. | |
+| `KITE_MCP_ORDER_POLL_WINDOW` | `09:00-16:00` | When the poll runs, in IST: `HH:MM-HH:MM`. | The start must be before the end. The poll also runs at start-up, at once after a login, and after the window until one poll succeeds. |
+| `KITE_MCP_ORDER_POLL_DAYS` | `Mon-Fri` | The days the poll runs. | A range (`Mon-Fri`), a list (`mon,wed,fri`), one day (`Tue`) or `*` for every day. A day is three or more letters of its name, in any case. A range runs forward from Monday to Sunday, so `Sat-Mon` is refused: write `sat,sun,mon`. |
+| `KITE_MCP_EVENTS_KEEP_DAYS` | `30` | Days to keep events. Integer from 1 to 3650. | Older events are deleted with their deliveries. |
+
+The postback route is `KITE_MCP_POSTBACK_PATH` (under [Transport and HTTP](#transport-and-http)); without it the poll
+alone feeds the events. With `KITE_MCP_ALLOWED_USER_ID` set, a postback for any other account is refused, and
+`KITE_API_SECRET` is needed to check postbacks at all.
 
 ## Logging
 
@@ -192,6 +213,13 @@ The server checks these at start-up and when you run `check-config`. Each failur
 | Unauthenticated HTTP only on loopback | `KITE_MCP_ALLOW_UNAUTHENTICATED_HTTP=true is only allowed with a loopback KITE_MCP_HOST` |
 | The bearer token is at least 32 characters | `KITE_MCP_BEARER_TOKEN must be at least 32 characters (try: openssl rand -hex 32)` |
 | The log level is known | `KITE_MCP_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR or CRITICAL` |
+| Order events need the HTTP transport | `KITE_MCP_EVENTS=true needs KITE_MCP_TRANSPORT=http` |
+| The poll window is `HH:MM-HH:MM`, the start before the end | `must look like 09:00-16:00` / `the start must be before the end` |
+| The poll days are days, and a range runs forward | `must look like Mon-Fri or mon,wed,fri` / `runs backwards (ranges run forward from Mon to Sun)` |
+| Events are kept 3650 days at most | `KITE_MCP_EVENTS_KEEP_DAYS cannot exceed 3650 (ten years)` |
+
+`check-config` does not read the consumers file: the server checks it when it starts (see
+[EVENTS.md](EVENTS.md#consumers)).
 
 ## Command-line options
 
@@ -205,6 +233,10 @@ The server checks these at start-up and when you run `check-config`. Each failur
 | `audit` | `--date YYYY-MM-DD` (IST day, default today), `--limit N` (default 50) |
 | `login` | `--listen` (wait for the redirect on a local callback), `--request-token TOKEN` (exchange a token you pasted) |
 | `logout` | `--yes` (really log out; managed mode only) |
+| `events status` | none: the health of the order events, as JSON |
+| `events tail` | `--limit N` (the newest N events, 1 to 1000, default 20), `--order ID` (one order's events) |
+| `events pause`, `events resume`, `events retry` | a consumer's name; `resume --skip-backlog` marks its waiting deliveries skipped |
+| `events selftest` | `--url URL` (default: this server's own postback route on loopback) |
 
 ## Example settings files
 

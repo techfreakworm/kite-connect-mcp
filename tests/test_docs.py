@@ -17,6 +17,7 @@ TOOL_WORD = re.compile(
 )
 NOT_TOOLS = {"authorise_url"}  # result fields that happen to look like tool names
 SETTING = re.compile(r"\b(KITE_[A-Z][A-Z0-9_]*[A-Z0-9])\b(?!\.md)")
+NOT_SETTINGS = {"KITE_EVENT_CONSUMER"}  # the server sets it for each consumer command; it reads no such setting
 
 
 @pytest.fixture(scope="module")
@@ -29,15 +30,19 @@ def tool_names(mcp_factory_module):
 def mcp_factory_module(tmp_path_factory):
     from conftest import write_token_file
     from kite_connect_mcp.config import Settings
+    from kite_connect_mcp.events.store import EventStore
     from kite_connect_mcp.server import build_runtime, build_server
 
     tmp = tmp_path_factory.mktemp("docs")
+    store = tmp / "events" / "events.sqlite3"
+    EventStore(store).close()  # a store to read, so the events tools are registered
     env = {
         "KITE_API_KEY": "fakekey0001",
         "KITE_MCP_STATE_DIR": str(tmp / "state"),
         "KITE_MCP_CACHE_DIR": str(tmp / "cache"),
         "KITE_TOKEN_FILE": str(write_token_file(tmp / "state" / "t.json")),
         "KITE_MCP_ALLOW_MF_WRITES": "true",
+        "KITE_MCP_EVENTS_DB": str(store),
     }
     rt = build_runtime(Settings.from_env(env))
     server, reg = build_server(rt)
@@ -53,17 +58,19 @@ def test_tool_names_in_docs_exist(doc, tool_names):
 @pytest.mark.parametrize("doc", DOCS, ids=lambda p: p.name)
 def test_settings_in_docs_exist(doc):
     mentioned = set(SETTING.findall(doc.read_text(encoding="utf-8")))
-    unknown = sorted(m for m in mentioned - KNOWN_VARIABLES - _FILE_VARIANTS if not m.endswith("_FILE"))
+    unknown = sorted(m for m in mentioned - KNOWN_VARIABLES - _FILE_VARIANTS - NOT_SETTINGS if not m.endswith("_FILE"))
     assert not unknown, f"{doc.name} names settings the server does not read"
 
 
 def test_tool_reference_is_current(mcp_factory_module):
-    """docs/TOOLS.md is what `KITE_MCP_ALLOW_MF_WRITES=true kite-connect-mcp tools --markdown` prints today."""
+    """docs/TOOLS.md is what `KITE_MCP_ALLOW_MF_WRITES=true KITE_MCP_EVENTS_DB=<a store> kite-connect-mcp tools
+    --markdown` prints today."""
     from kite_connect_mcp.cli import tools_markdown
 
     server, reg, _ = mcp_factory_module
     generated = tools_markdown(server, reg)
     current = (ROOT / "docs" / "TOOLS.md").read_text(encoding="utf-8")
     assert current.strip() == generated.strip(), (
-        "docs/TOOLS.md is stale: run KITE_MCP_ALLOW_MF_WRITES=true kite-connect-mcp tools --markdown > docs/TOOLS.md"
+        "docs/TOOLS.md is stale: run KITE_MCP_ALLOW_MF_WRITES=true KITE_MCP_EVENTS_DB=<a store> kite-connect-mcp tools "
+        "--markdown > docs/TOOLS.md, with a store made by EventStore(path).close()"
     )

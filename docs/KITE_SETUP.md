@@ -165,12 +165,17 @@ Connect plan read order updates from the WebSocket.
   that setting the endpoint does not exist.
 - The endpoint accepts a postback only if its checksum is right. The checksum is SHA-256 of
   `order_id + order_timestamp + api_secret`; only Kite and you know the secret.
-- Accepted updates go into the same buffer as WebSocket order updates, which `ticker_order_updates` reads.
+- **With `KITE_MCP_EVENTS=true`** the postbacks feed the [order events](EVENTS.md). A postback is only a doorbell: the
+  server reads the order back from Kite and records Kite's answer, then hands the change to the commands you configure.
+  With `KITE_MCP_ALLOWED_USER_ID` set, a postback for any other account is refused.
+- **Without it**, accepted updates go into the same buffer as WebSocket order updates, which `ticker_order_updates`
+  reads, as before.
 - Postbacks are sent only for orders placed with this app's API key. Zerodha recommends WebSocket order updates for
   individual developers, because those cover orders placed anywhere (web, mobile, other apps). Personal apps cannot
-  stream WebSocket data, so there the postback URL is the only way to be told about order changes without polling
-  `get_orders`.
-- Postbacks arrive even when you are not logged in.
+  stream WebSocket data, so there postbacks are the way to be told about this app's orders. The order events add a
+  poll of the order book, which also catches the orders placed elsewhere, within a minute by default.
+- Postbacks arrive even when you are not logged in. The order events then keep the order ids, and read them from Kite
+  right after your next login.
 
 ## 6. Subscription and billing
 

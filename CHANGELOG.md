@@ -3,6 +3,38 @@
 All notable changes are listed here. Versions follow [semantic versioning](https://semver.org); while the version
 is 0.x, minor releases may change tool arguments.
 
+## Unreleased
+
+### Added
+
+- **Order events**, off by default ([docs/EVENTS.md](docs/EVENTS.md)). With `KITE_MCP_EVENTS=true` on the HTTP
+  transport, the server records each change to the orders of its account and hands it to commands you configure.
+  Postbacks are a doorbell: a verified postback makes the server read the order back from Kite, and only Kite's answer
+  is stored. A poll of the order book is the backup, and the only source for orders placed outside the API key. The
+  events are kept in a SQLite store and delivered to the consumer commands as JSON on standard input: one command at a
+  time per consumer, each order's events in order, at least once, with retries and `delivery_delayed` and
+  `delivery_failed` alerts. It only reads orders: it never places or changes one.
+- Settings: `KITE_MCP_EVENTS`, `KITE_MCP_EVENTS_DB`, `KITE_MCP_EVENTS_CONSUMERS_FILE`,
+  `KITE_MCP_ORDER_POLL_INTERVAL_S`, `KITE_MCP_ORDER_POLL_WINDOW`, `KITE_MCP_ORDER_POLL_DAYS` and
+  `KITE_MCP_EVENTS_KEEP_DAYS`.
+- Tools: the `events` toolset, `get_order_events` and `get_event_status`, shown when there is an event store. Another
+  process, a stdio client say, reads the server's store by naming it in `KITE_MCP_EVENTS_DB`.
+- Commands: `kite-connect-mcp events status`, `events tail`, `events pause`, `events resume [--skip-backlog]`,
+  `events retry` and `events selftest [--url]`.
+- Examples: consumers that send a Telegram message, append to a JSON-lines log and post to a webhook, and a sample
+  consumers file ([examples/](examples/README.md)).
+- Deploy samples: a systemd drop-in that turns the order events on for the service
+  (`deploy/systemd/kite-connect-mcp.service.d/events.conf`).
+
+### Changed
+
+- The postback route: with `KITE_MCP_EVENTS=true` it exists whenever `KITE_MCP_POSTBACK_PATH` is set (the ticker on or
+  off), feeds the order events, refuses a postback for any account other than `KITE_MCP_ALLOWED_USER_ID`, answers 200
+  once the postback is on disk and 503 when the store cannot write, and counts its refusals. With `KITE_MCP_EVENTS`
+  off it is unchanged, except that a signed selftest is answered 404 and never reaches the ticker's buffer.
+- The Caddy and nginx samples cap request bodies per path: 1 MB for `/mcp`, 4 KB for `/callback` and `/health`,
+  64 KiB for `/postback` (the server's own cap).
+
 ## 0.1.1 (2026-11-04)
 
 Checked against the live Kite API (read-only): every read tool, the calculators, and the WebSocket ticker across

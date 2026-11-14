@@ -9,7 +9,8 @@
 A self-hostable [Model Context Protocol](https://modelcontextprotocol.io) server for the
 [Zerodha Kite Connect v3 API](https://kite.trade/docs/connect/v3/). Run it on your own machine or server with
 your own Kite Connect app, and let an AI assistant read your account, market data and orders. Every write is a
-**dry run by default**.
+**dry run by default**. Optionally, it also records every change to your orders and hands it to programs you choose
+([order events](docs/EVENTS.md)).
 
 > **Status: beta (0.x).** Every Kite Connect v3 capability is covered and tested offline against a fake Kite. The
 > read tools, the margin and charge calculators and the ticker have also been checked against the live API; live
@@ -109,11 +110,29 @@ login.
 - **`external` mode.** Another program owns the login and writes a token file. This server only reads that file,
   picks up the new token every morning without a restart, and never writes, deletes or logs out that token.
 
+## Order events
+
+Optional, and off by default. With `KITE_MCP_EVENTS=true` on an HTTP server, kite-connect-mcp records each change to
+your orders (placed, partly filled, modified, filled, cancelled, rejected) and hands it to commands you choose: a
+notification on your phone, a trading journal, an automation.
+
+- **Postbacks are a doorbell.** A verified postback makes the server read the order back from Kite, and it records
+  Kite's answer, never the postback.
+- **A poll of the order book**, every minute in market hours, catches a lost postback and the orders placed outside
+  your API key (on Kite's web site or app, or by a GTT).
+- **Each event is stored** in SQLite, then delivered to your commands as JSON on standard input, with retries.
+  `get_order_events` and `get_event_status` read the store; `kite-connect-mcp events status` shows its health.
+- **It only reads.** Nothing in it can place, modify or cancel an order.
+
+Example consumers (Telegram, a JSON-lines log, a webhook) are in [examples/](examples/README.md); the whole story is in
+[docs/EVENTS.md](docs/EVENTS.md).
+
 ## Tools
 
-58 tools in 11 toolsets (53 by default: the mutual-fund writes are opt-in). Tool names follow the official server
-where one exists, so prompts carry over. Pick toolsets with `KITE_MCP_TOOLSETS` and hide single tools with
-`KITE_MCP_EXCLUDED_TOOLS`; `kite-connect-mcp tools` lists what your configuration exposes.
+60 tools in 12 toolsets (53 by default: the mutual-fund writes are opt-in, and the two `events` tools need an event
+store). Tool names follow the official server where one exists, so prompts carry over. Pick toolsets with
+`KITE_MCP_TOOLSETS` and hide single tools with `KITE_MCP_EXCLUDED_TOOLS`; `kite-connect-mcp tools` lists what your
+configuration exposes.
 
 | Toolset | Tools |
 |---|---|
@@ -127,6 +146,7 @@ where one exists, so prompts carry over. Pick toolsets with `KITE_MCP_TOOLSETS` 
 | margins | `get_order_margins`, `get_basket_margins`, `get_order_charges` |
 | mf | `get_mf_holdings`, `get_mf_orders`, `get_mf_sips`, `search_mf_instruments`; opt-in: `place_mf_order`, `cancel_mf_order`, `place_mf_sip`, `modify_mf_sip`, `cancel_mf_sip` |
 | ticker | `ticker_subscribe`, `ticker_unsubscribe`, `ticker_get_ticks`, `ticker_status`, `ticker_order_updates`, `ticker_stop` |
+| events | `get_order_events`, `get_event_status` (with an event store: `KITE_MCP_EVENTS=true`, or `KITE_MCP_EVENTS_DB`) |
 | safety | `get_safety_status`, `get_audit_log`, `engage_kill_switch` |
 
 Every argument of every tool is in [docs/TOOLS.md](docs/TOOLS.md).

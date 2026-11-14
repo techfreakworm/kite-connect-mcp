@@ -86,7 +86,7 @@ What the token guarantees:
   past a cap, a changed allow-list or a newly engaged kill switch.
 
 The token proves that the model saw a preview of this exact request. It does not prove that a human did. See
-[What is not protected](#15-what-is-not-protected).
+[What is not protected](#16-what-is-not-protected).
 
 ## 5. The allowlist confirmation mode
 
@@ -102,7 +102,7 @@ The token proves that the model saw a preview of this exact request. It does not
 
 This mode is for unattended agents. It means the model can send orders in those instruments, within the caps, without
 anyone looking. Use it only with a short list, low caps and tight allow-lists (see
-[Recommended configurations](#16-recommended-configurations)).
+[Recommended configurations](#17-recommended-configurations)).
 
 ## 6. Value rules and caps
 
@@ -293,7 +293,29 @@ Read it with `kite-connect-mcp audit [--date YYYY-MM-DD] [--limit N]`, with the 
   headers, writes no access log, and serves unauthenticated HTTP only on loopback. See
   [SELF_HOSTING.md](SELF_HOSTING.md).
 
-## 15. What is not protected
+## 15. Order events
+
+The optional [order events](EVENTS.md) (off by default, `KITE_MCP_EVENTS`) watch your orders; they never trade.
+
+- **Read-only.** The event service asks Kite for two things only, the order book and one order's history
+  (`GET /orders`, `GET /orders/{order_id}`). It has no way into the write pipeline: whatever arrives, it cannot place,
+  modify or cancel an order.
+- **A postback is only a doorbell.** A postback with the right checksum makes the server read that order back from
+  Kite, and what is recorded is Kite's answer, never the postback. Kite's checksum covers only the order id and its
+  timestamp, so a replayed or altered postback costs one read and changes nothing. Without an API secret the route
+  refuses everything, and with `KITE_MCP_ALLOWED_USER_ID` set it refuses a postback for any other account.
+- **Consumers run commands you configure,** as the server's user, with the event on standard input, no shell and a
+  minimal environment (never a `KITE_*` variable). They run outside this safety layer: as that user a command could
+  read the Kite token and call Kite itself, and the caps and allow-lists cover only what goes through this server's
+  tools. Give a consumer only what it needs, and make one that acts on an event read what it relies on from Kite
+  first.
+- **The consumers file must not be writable by others.** The server refuses to start if anyone but its user or root
+  could change the consumers file, a program it names, or a folder or link on the way to them. A script given to an
+  interpreter as an argument is not checked, so keep it the same way.
+- **A consumer's standard error is not private.** Its end reaches the log, `events status` and the other consumers'
+  `delivery_failed` events: never print a secret there.
+
+## 16. What is not protected
 
 Be clear-eyed about the limits of this layer.
 
@@ -323,7 +345,7 @@ Be clear-eyed about the limits of this layer.
   on Kite's side.
 - **This is alpha software.** Start with the defaults, in dry-run mode, and read the audit log.
 
-## 16. Recommended configurations
+## 17. Recommended configurations
 
 Put the lines in the server's settings file (see [CONFIGURATION.md](CONFIGURATION.md)). Values are examples: size the
 caps to your own account.
@@ -390,7 +412,7 @@ KITE_MCP_ALLOWED_USER_ID=AB1234
 - The bearer token is shared by every client of the server. If the agent runs somewhere you trust less than the server,
   rotate the token when you stop using that agent.
 
-## 17. Checking your setup
+## 18. Checking your setup
 
 1. `kite-connect-mcp check-config` shows the effective settings. Confirm `trading_mode`, `read_only`, the caps, the
    allow-lists and `kill_switch_file`.
