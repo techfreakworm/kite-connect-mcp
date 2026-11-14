@@ -7,6 +7,9 @@
 
 The human always logs in at Kite; nothing here types credentials for them (Zerodha's guidance forbids automating it).
 
+logout() ends the stored session for every client of the token. With KITE_MCP_ALLOW_LOGOUT=false it refuses (the tool
+is not offered and the command exits 2); ending a refused account's fresh session is not a logout and stays.
+
 The exchange, for a callback or a pasted token (`_finish`), one at a time per process:
 
     reserve the state (if any)  ->  POST /session/token  ->  account pin  ->  write the token file  ->  commit
@@ -67,6 +70,10 @@ _USER_ID_RE = re.compile(r"[A-Za-z0-9]{2,32}")
 AI_RISK_WARNING = (
     "WARNING: AI systems are unpredictable and non-deterministic. By continuing, you agree to interact with your "
     "Zerodha account via AI at your own risk."
+)
+LOGOUT_OFF = (
+    "logout is off on this server (KITE_MCP_ALLOW_LOGOUT=false): it never ends the stored Kite session, which lapses "
+    "at 06:00 IST"
 )
 LISTEN_TIMEOUT_S = 600.0  # how long `login --listen` waits for the redirect
 NOISE_BURST = 30  # malformed / unknown-state callbacks written to the audit log per NOISE_PERIOD_S
@@ -384,8 +391,12 @@ class LoginManager:
     async def logout(self, *, source: str = "tool") -> LogoutResult:
         """End the Kite session of the stored token, delete the token file and close every open login link. If Kite
         cannot be reached the file is kept (deleting the only copy of a live token would leave it unrevocable) and an
-        error is raised. A token Kite no longer knows, or one past its expiry, counts as ended."""
+        error is raised. A token Kite no longer knows, or one past its expiry, counts as ended. With
+        KITE_MCP_ALLOW_LOGOUT=false it refuses before reading anything."""
         self._require_managed()
+        if not self.settings.allow_logout:
+            self._audit("logout_refused", source=source, reason="logout_off")
+            raise ConfigError(LOGOUT_OFF)
         async with self._flow_lock:
             record = await asyncio.to_thread(self.tokens.file.read)
             kite = "no_token"  # nothing usable on disk: an unusable file just goes
@@ -655,9 +666,13 @@ async def cli_logout(
     clock: Callable[[], dt.datetime] | None = None,
 ) -> int:
     """`kite-connect-mcp logout --yes`: end the Kite session of the stored token and delete the token file. Exit
-    codes: 0 done, 1 Kite could not be told, 2 not possible in this configuration or not confirmed."""
+    codes: 0 done, 1 Kite could not be told, 2 not possible in this configuration (external auth mode, logout off) or
+    not confirmed."""
     if settings.auth_mode != "managed":
         _note("the token is managed by another program (KITE_MCP_AUTH_MODE=external); this server does not log out.")
+        return 2
+    if not settings.allow_logout:
+        _note(LOGOUT_OFF)
         return 2
     if not yes:
         _note(

@@ -4,7 +4,7 @@ Kite sessions end every day at 06:00 IST. In `managed` auth mode this server own
 link, the person logs in at Kite, and Kite's redirect lands on this server's callback route (added by
 `_callback_hook`) or the person pastes the request_token into `complete_login`. In `external` auth mode another program
 keeps the token file: only `session_status` and an explanatory `login` exist, and `complete_login` / `logout` are not
-registered at all.
+registered at all. `logout` is not offered with KITE_MCP_ALLOW_LOGOUT=false.
 
 These tools are kind "auth": they reach /session/token through the login manager (auth/login.py) and never touch the
 write pipeline.
@@ -206,7 +206,8 @@ def _register_status_and_login(reg: Registrar) -> None:
 
 
 def _register_managed(reg: Registrar) -> None:
-    """complete_login, logout and the HTTP callback route: only where this server owns the login."""
+    """complete_login, logout (unless KITE_MCP_ALLOW_LOGOUT=false) and the HTTP callback route: only where this server
+    owns the login."""
     rt = reg.rt
     settings = rt.settings
     pin = AccountPin.from_settings(settings)
@@ -244,6 +245,20 @@ def _register_managed(reg: Registrar) -> None:
             "message": "Logged in. The token is shared by every client of this server until the 06:00 IST reset.",
         }
 
+    if settings.allow_logout:
+        _register_logout(reg)
+    else:
+        reg.skipped["logout"] = "KITE_MCP_ALLOW_LOGOUT=false"
+
+    if rt.login is not None:
+        rt.extras.setdefault("http_routes", []).append(_callback_hook(rt, rt.login))
+
+
+def _register_logout(reg: Registrar) -> None:
+    """logout, a two-step tool: managed auth mode only, and not with KITE_MCP_ALLOW_LOGOUT=false."""
+    rt = reg.rt
+    settings = rt.settings
+
     @reg.tool("logout", title="Log out of Kite", toolset="session", kind="auth", annotations=LOGOUT)
     async def logout(
         confirmation_token: Annotated[
@@ -279,6 +294,3 @@ def _register_managed(reg: Registrar) -> None:
             "token_file_removed": result.file_removed,
             "next_step": "call login for a new link when a session is needed again",
         }
-
-    if rt.login is not None:
-        rt.extras.setdefault("http_routes", []).append(_callback_hook(rt, rt.login))

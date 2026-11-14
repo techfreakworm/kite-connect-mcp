@@ -256,6 +256,7 @@ class Settings:
     allowed_user_id: str | None = field(default=None, repr=False)  # refuse logins from any other Kite account
     allowed_user_id_sha256: str | None = field(default=None, repr=False)  # the pin as a digest (auth/account.py)
     login_link_ttl_s: int = 3600
+    allow_logout: bool = True  # false: the logout tool and command refuse (auth/login.py)
 
     # --- endpoints ---
     api_base_url: str = DEFAULT_API_BASE_URL
@@ -394,6 +395,7 @@ class Settings:
             allowed_user_id=(env.get("KITE_MCP_ALLOWED_USER_ID", "").strip().upper() or None),
             allowed_user_id_sha256=_sha256(env, "KITE_MCP_ALLOWED_USER_ID_SHA256", problems),
             login_link_ttl_s=_int(env, "KITE_MCP_LOGIN_LINK_TTL_S", 3600, problems, minimum=60),
+            allow_logout=_bool(env, "KITE_MCP_ALLOW_LOGOUT", True, problems),
             api_base_url=env.get("KITE_API_BASE_URL", DEFAULT_API_BASE_URL).strip().rstrip("/") or DEFAULT_API_BASE_URL,
             login_url=env.get("KITE_LOGIN_URL", DEFAULT_LOGIN_URL).strip() or DEFAULT_LOGIN_URL,
             ticker_url=env.get("KITE_TICKER_URL", DEFAULT_TICKER_URL).strip() or DEFAULT_TICKER_URL,
@@ -511,6 +513,7 @@ KNOWN_VARIABLES = frozenset(
         "KITE_MCP_ALLOWED_USER_ID",
         "KITE_MCP_ALLOWED_USER_ID_SHA256",
         "KITE_MCP_LOGIN_LINK_TTL_S",
+        "KITE_MCP_ALLOW_LOGOUT",
         "KITE_MCP_HTTP_TIMEOUT_S",
         "KITE_MCP_STATE_DIR",
         "KITE_MCP_CACHE_DIR",
